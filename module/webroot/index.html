@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>susfs_guard_lkm</title>
+<style>
+  body { font: 16px sans-serif; margin: 16px; color: #222; background: #fafafa; }
+  @media (prefers-color-scheme: dark) { body { color: #ddd; background: #121212; } }
+  label { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid #8884; }
+  small { display: block; opacity: .7; }
+  #msg { margin-top: 16px; min-height: 1.4em; }
+</style>
+</head>
+<body>
+<h1>susfs_guard_lkm</h1>
+<div id="rows"></div>
+<div id="msg"></div>
+<script>
+// One entry per node toggle.sh accepts; the command line is built from these constants only.
+var TOGGLES = [
+  { key: "enable_log", title: "Kernel log", note: "/proc/susfs_enable_log" },
+  { key: "avc_spoof", title: "AVC log spoof", note: "/proc/susfs_avc_spoof" }
+];
+var SCRIPT = "/data/adb/modules/susfs_guard_lkm/toggle.sh";
+var seq = 0;
+
+// ksu.exec reports through a named global callback: (errno, stdout, stderr).
+function run(args) {
+  return new Promise(function (resolve) {
+    var name = "susfs_cb_" + (seq++);
+    window[name] = function (errno, out, err) {
+      delete window[name];
+      resolve({ code: errno, out: String(out || ""), err: String(err || "") });
+    };
+    window.ksu.exec("/system/bin/sh " + SCRIPT + " " + args, "{}", name);
+  });
+}
+
+function say(text) { document.getElementById("msg").textContent = text; }
+
+function parse(out) {
+  var state = {};
+  out.split("\n").forEach(function (line) {
+    var i = line.indexOf("=");
+    if (i > 0) state[line.slice(0, i)] = line.slice(i + 1);
+  });
+  return state;
+}
+
+function render(state) {
+  var rows = document.getElementById("rows");
+  rows.textContent = "";
+  TOGGLES.forEach(function (t) {
+    var value = state[t.key];
+    var label = document.createElement("label");
+    var text = document.createElement("span");
+    text.textContent = t.title;
+    var note = document.createElement("small");
+    note.textContent = value === "unavailable" ? t.note + " (module not loaded)" : t.note;
+    text.appendChild(note);
+    var box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = value === "1";
+    box.disabled = value !== "0" && value !== "1";
+    box.addEventListener("change", function () {
+      var want = box.checked ? "1" : "0";
+      run("set " + t.key + " " + want).then(function (r) {
+        if (r.code !== 0) say(t.title + " not changed: " + (r.err.trim() || "exit " + r.code));
+        else say(t.title + (want === "1" ? " on" : " off") + ", kept across reboots");
+        refresh();
+      });
+    });
+    label.appendChild(text);
+    label.appendChild(box);
+    rows.appendChild(label);
+  });
+}
+
+function refresh() {
+  run("get").then(function (r) { render(parse(r.out)); });
+}
+
+if (window.ksu && window.ksu.exec) refresh();
+else say("Open this page from the KernelSU manager.");
+</script>
+</body>
+</html>

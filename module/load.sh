@@ -141,6 +141,8 @@ dmesg_stop
 rm -f "$TIMEOUT_DMESG_LOG"
 if [ "$rc" = 0 ]; then
   echo "loaded ($MODE)."
+  # The nodes exist now (expose_proc=1); put back what the WebUI saved last boot.
+  /system/bin/sh "$MODDIR/toggle.sh" apply
   if [ "$MODE" = custom ]; then
     set_description "✅ custom load ($KMI) | kernel $REL"
   elif [ "$MODE" = ksud ]; then
