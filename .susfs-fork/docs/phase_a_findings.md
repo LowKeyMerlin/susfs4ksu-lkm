@@ -122,3 +122,17 @@ rcu_barrier because the callback runs kernel code, not module code.
   high one from the private unnamed_dev_ida under a probe, and an LKM loaded after boot cannot fix
   the minors of mounts KernelSU already created. Deferred to the build stage where the get_anon_bdev
   hook can be gated tightly on the ksu domain and stress-tested.
+
+## p1-612 outcome
+
+- mnt_id_unique crafting (done): a marked mount is given a plausible 64-bit unique id
+  (atomic64_read(mnt_id_ctr) + a private counter), the same shape as upstream 7d91da2, so
+  statx(STATX_MNT_ID_UNIQUE) no longer shows the gap.
+- statx mask handling (verified, no change): the two mask bits land different values in the single
+  stx_mnt_id field, and our two mechanisms are complementary. STATX_MNT_ID returns the KSU-range
+  mnt_id, which the statx return-probe maps to the original via sus_mount_shown_for(). STATX_MNT_ID_
+  UNIQUE returns the crafted unique id; sus_mount_shown_for((int)id) finds no map and leaves it
+  intact, so the crafted value stands. Neither clobbers the other.
+- listmount/statmount full enumeration hiding and the 16K fixup fold remain build-gated: the
+  listmount/statmount return-probe lacks the per-mount struct context needed to drop a marked mount
+  from the enumeration, and the 16K fold needs 16K-page handling that cannot be validated blind.
