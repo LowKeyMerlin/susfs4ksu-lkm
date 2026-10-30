@@ -48,6 +48,9 @@ For each feature's supercall and `/proc` write:
   rules across a grow boundary. Under KASAN + PROVE_RCU, the old-table free must not race the
   lock-free reader. Expect zero splats.
 - Delete back below a doubling boundary (table does not shrink) and confirm readers stay correct.
+- No duplicate after a delete: add A, add B, `del A`, add B again. `/proc/susfs_map` must list B
+  once, and after `del B` the mapping must be visible again (before the fix a second copy of B
+  kept it hidden). Repeat with the rule that was added first and the one added last.
 - `clear`, re-add, `rmmod`; table freed via kvfree_rcu after the drain, no splat.
 
 ### 3c. open_redirect (RCU flex-array + index free list, every-open() reader)

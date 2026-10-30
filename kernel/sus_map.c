@@ -72,8 +72,8 @@ static bool sus_map_smap_armed;
 
 
 /* Serialises rule PUBLICATION only; the reader stays lock-free: a slot is published by
- * writing target_dev first and target_ino last with release semantics (0 = free), and nmap
- * only advances under the lock with the appended slot.  Deletion clears target_ino back to 0
+ * writing target_dev first and target_ino last with release semantics (0 = free), and the
+ * table's used count only advances under the lock with the appended slot.  Deletion clears target_ino back to 0
  * (never target_dev), so a reader that saw the old ino also saw its own dev instead of a
  * cleared wildcard.  The lock itself is for concurrent writers, which would otherwise
  * fill one slot and silently drop a rule while both report success. */
@@ -97,7 +97,7 @@ static int sus_map_add_full(unsigned long ino, dev_t dev, bool *added)
 {
     struct sus_map_table *tbl, *spare = NULL;
     unsigned long flags;
-    int i, cur_cap;
+    int i, free_i, cur_cap;
 
     *added = false;
     if (!ino)
@@ -106,15 +106,21 @@ static int sus_map_add_full(unsigned long ino, dev_t dev, bool *added)
     for (;;) {
         spin_lock_irqsave(&map_table_lock, flags);
         tbl = rcu_dereference_protected(map_tbl, lockdep_is_held(&map_table_lock));
+        /* The whole table is checked for the rule before a freed slot is reused: stopping at
+         * the first free slot would store a second copy of a rule that sits after it, and a
+         * delete removes only one copy, so the path would stay hidden after "del". */
+        free_i = -1;
         for (i = 0; i < tbl->n; i++) {
             if (tbl->e[i].target_ino == ino && tbl->e[i].target_dev == dev) {
                 spin_unlock_irqrestore(&map_table_lock, flags);
                 kvfree(spare);
                 return 0;
             }
-            if (tbl->e[i].target_ino)
-                continue;
-            sus_map_fill(tbl, i, ino, dev);
+            if (free_i < 0 && !tbl->e[i].target_ino)
+                free_i = i;
+        }
+        if (free_i >= 0) {
+            sus_map_fill(tbl, free_i, ino, dev);
             *added = true;
             spin_unlock_irqrestore(&map_table_lock, flags);
             kvfree(spare);
@@ -154,7 +160,7 @@ static int sus_map_add_full(unsigned long ino, dev_t dev, bool *added)
 }
 
 /* A deleted rule leaves a zero inode behind; add_full() reuses that slot, so a script
- * that adds and removes paths does not exhaust the 64 entries. */
+ * that adds and removes paths does not keep growing the table. */
 static int sus_map_del_full(unsigned long ino, dev_t dev)
 {
     struct sus_map_table *tbl;
