@@ -9,7 +9,7 @@ them.
 | --- | --- | --- | --- |
 | `main` | Yes, identical to the parent's `main` | Upstream as it is | `susfs-sync` only, never by hand |
 | `susfs-main` | Yes, rebased on `main` | Files only added: `.susfs-fork/`, workflows, and numbered patches in `.susfs-fork/patches/` for upstream files | Pull requests and `test/` branches squashed in |
-| `susfs-dev` | No, after one initial sync | A copy of `susfs-main` that may edit `kernel/` directly | Pull requests and `test/` branches squashed in |
+| `susfs-dev` | No, after one initial sync | Starts as `main`, then gets the CI files it needs. May edit `kernel/` directly | Pull requests and `test/` branches squashed in |
 | `test/<item>` | No | Throwaway, one change under test | The author, deleted after the squash |
 
 `susfs-main` keeps upstream conflicts at zero: it never edits a file the parent owns, so a sync
