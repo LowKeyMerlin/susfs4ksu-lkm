@@ -1,0 +1,28 @@
+name: android-setup
+description: Install the Cuttlefish host tools and fetch the newest Android release build. Sets CF.
+
+runs:
+  using: composite
+  steps:
+    - name: Install the Cuttlefish host tools
+      shell: bash
+      run: |
+        sudo mkdir -p /usr/share/keyrings
+        curl -fsSL https://us-apt.pkg.dev/doc/repo-signing-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/android-cuttlefish.gpg
+        echo "deb [signed-by=/usr/share/keyrings/android-cuttlefish.gpg] https://us-apt.pkg.dev/projects/android-cuttlefish-artifacts android-cuttlefish main" | sudo tee /etc/apt/sources.list.d/android-cuttlefish.list
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq cuttlefish-base libpulse0 > /dev/null
+        sudo modprobe vhost_vsock || true
+        sudo modprobe vhost_net || true
+        sudo usermod -aG kvm,cvdnetwork,render "$USER"
+        sudo chmod 666 /dev/kvm
+
+    - name: Fetch the Android build
+      shell: bash
+      run: |
+        mkdir -p "$RUNNER_TEMP/cf" && cd "$RUNNER_TEMP/cf"
+        build=aosp-android-latest-release
+        cvd fetch --default_build=$build/aosp_cf_arm64_only_phone-userdebug \
+          --host_package_build=$build/aosp_cf_x86_64_only_phone-userdebug 2>&1 | tail -n 3
+        echo "CF=$PWD" >> "$GITHUB_ENV"
+        chmod -R a+rX "$PWD"

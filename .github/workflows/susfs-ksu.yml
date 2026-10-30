@@ -1,0 +1,358 @@
+name: susfs-ksu
+run-name: "susfs-ksu: ${{ inputs.title || (github.event_name == 'schedule' && 'scheduled') || (github.event_name == 'workflow_dispatch' && format('manual, {0} forks, build {1}', inputs.channel, inputs.run || 'latest')) || 'manual' }}"
+
+# Boot every kernel of the module zip with KernelSU loaded first, as on a device: KernelSU runs
+# the module's scripts and the module hooks into it. Each fork of ksud_forks.json is tested in
+# two channels:
+#
+#   stable  newest release of each fork, built at its tag, release and debug configuration. Debug
+#           lets the test name the manager app and exercise a root profile. This channel gates the
+#           module release.
+#   tip     branch head of each fork, release configuration. Never gates, warns before a fork's
+#           next release breaks the module.
+#
+# The full pipeline runs stable, and so does a weekly run since forks release on their own
+# schedule. Tip runs weekly.
+#
+# A fork with no stable release, or one that cannot build as a loadable module, is listed in the
+# summary and not tested. Every kernel of every tested fork must pass. A boot with no verdict is
+# retried once, then counts as failed. The scripts under test come from the zip the build
+# produced, the ones in this repository only drive the VM.
+#
+# susfs-pipeline.yml calls this with the run of its build. A schedule or a dispatch without a run
+# tests the newest pipeline build of the default branch.
+on:
+  workflow_call:
+    inputs:
+      run:
+        description: Run whose module zip is tested
+        type: string
+        required: true
+  schedule:
+    # A scheduled run's channel comes from its cron line, see the channel step.
+    - cron: "41 5 * * 2"
+    - cron: "41 5 * * 4"
+  workflow_dispatch:
+    inputs:
+      title:
+        description: Name for this run in the workflow list, a default is used when empty
+        required: false
+      run:
+        description: Build run to test, the latest successful build when empty
+        required: false
+      channel:
+        description: Which build of the forks to test
+        type: choice
+        options: [stable, tip]
+        default: stable
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      run: ${{ steps.run.outputs.run }}
+      channel: ${{ steps.channel.outputs.channel }}
+      builds: ${{ steps.matrix.outputs.builds }}
+      boots: ${{ steps.matrix.outputs.boots }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Pick the channel
+        id: channel
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          # The Tuesday run is the tip one.
+          [ -n "$CHANNEL" ] || { [ "$SCHEDULE" = "41 5 * * 2" ] && CHANNEL=tip || CHANNEL=stable; }
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+
+      - name: Pick the build
+        id: run
+        env:
+          INPUT_RUN: ${{ inputs.run }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          run="$INPUT_RUN"
+          [ -n "$run" ] || run="$(gh run list --workflow susfs-pipeline.yml --branch "$BRANCH" --event push \
+            --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+          [ -n "$run" ] || { echo "::error::there is no successful build to test"; exit 1; }
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+      - name: Plan the builds and the boots
+        id: matrix
+        env:
+          RUN: ${{ steps.run.outputs.run }}
+          CHANNEL: ${{ steps.channel.outputs.channel }}
+        run: |
+          set -euo pipefail
+          module="$RUNNER_TEMP/module"
+          smoke=.susfs-fork/smoke
+          bash $smoke/retry.sh gh run download "$RUN" --pattern 'ksu_susfs_lkm-module-*' --dir "$module"
+          ddk="$(python3 $smoke/plan.py "$module")"
+          mapfile -t kmis < <(jq -r '.include[].variant' <<< "$ddk")
+          bash $smoke/retry.sh python3 $smoke/gki_latest.py "${kmis[@]}" > "$RUNNER_TEMP/gki.json"
+          kernels="$(python3 $smoke/plan.py "$module" "$RUNNER_TEMP/gki.json")"
+
+          bash $smoke/retry.sh python3 .susfs-fork/ksu_release.py --channel "$CHANNEL" > "$RUNNER_TEMP/forks.json"
+          {
+            echo "### KernelSU, $CHANNEL channel"
+            echo
+            echo "| fork | build | commit | manager | note |"
+            echo "| --- | --- | --- | --- | --- |"
+            jq -r '.[] | "| \(.name) | \(.version // "none") | \((.commit // "")[0:10]) | \(.manager.name // .manager.kind) | \(if .lkm then (.note // "") else "not a loadable module" end) |"' "$RUNNER_TEMP/forks.json"
+          } >> "$GITHUB_STEP_SUMMARY"
+          forks="$(jq -c '[.[] | select(.lkm and .commit != null)]' "$RUNNER_TEMP/forks.json")"
+          [ "$(jq length <<< "$forks")" -gt 0 ] || { echo "::error::no fork has a build to test"; exit 1; }
+
+          # Each kernel runs in the image of its ddk entry, the one the module was built in.
+          builds="$(jq -c --argjson forks "$forks" '{include: [.include[] | select(.source == "ddk") as $k | $forks[] as $f | {fork: $f.name, repo: $f.repo, commit: $f.commit, version: $f.version, kmi: $k.variant, image: $k.kernel}]}' <<< "$kernels")"
+          if [ "$CHANNEL" = stable ]; then cfgs='["release", "debug"]'; else cfgs='["release"]'; fi
+          boots="$(jq -c --argjson forks "$forks" --argjson cfgs "$cfgs" '{include: [.include[] as $k | $forks[] as $f | $cfgs[] as $c | $k + {fork: $f.name, cfg: $c, id: ($f.name + "-" + $k.key + "-" + $c)}]}' <<< "$kernels")"
+          echo "builds=$builds" >> "$GITHUB_OUTPUT"
+          echo "boots=$boots" >> "$GITHUB_OUTPUT"
+
+  # Network downloads for the VMs are fetched once, see susfs-smoke.yml. The kernel jobs must run on
+  # the same image as this one.
+  tools:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download QEMU and busybox, build the probes
+        run: |
+          set -euo pipefail
+          bash .susfs-fork/smoke/qemu_debs.sh "$RUNNER_TEMP/tools/debs"
+          bash .susfs-fork/smoke/busybox.sh "$RUNNER_TEMP/tools/busybox"
+          bash .susfs-fork/smoke/probes.sh "$RUNNER_TEMP/tools/probes"
+
+      - name: Hand them to the kernel jobs
+        uses: actions/upload-artifact@v7
+        with:
+          name: vm-tools-ksu
+          path: ${{ runner.temp }}/tools
+          retention-days: 1
+          if-no-files-found: error
+
+  build:
+    name: build (${{ matrix.fork }} ${{ matrix.kmi }})
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.builds) }}
+    container:
+      image: ${{ matrix.image }}
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ matrix.repo }}
+          ref: ${{ matrix.commit }}
+
+      - uses: actions/checkout@v5
+        with:
+          path: harness
+
+      - name: Build kernelsu.ko
+        env:
+          COMMIT: ${{ matrix.commit }}
+          VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          [ "$(git rev-parse HEAD)" = "$COMMIT" ] || { echo "::error::checked out the wrong commit"; exit 1; }
+          echo "$COMMIT" > "$GITHUB_WORKSPACE/ksu-commit"
+          echo "$VERSION" > "$GITHUB_WORKSPACE/ksu-version"
+          grep -q 'tristate "KernelSU' kernel/Kconfig
+          # The fork's own workflow says how to build the module, options differ per fork.
+          wf=
+          for f in .github/workflows/ddk-lkm.yml .github/workflows/ddk-lkm-ksu.yml; do
+            [ -f "$f" ] && { wf="$f"; break; }
+          done
+          [ -n "$wf" ] || { echo "::error::the fork has no module build workflow"; exit 1; }
+          flags="$(sed -n 's/^[[:space:]]*\(CONFIG_KSU=m.*\)[[:space:]]CC=clang make.*$/\1/p' "$wf" | head -n 1)"
+          [ -n "$flags" ] || { echo "::error::no module build line in $wf"; exit 1; }
+          echo "building with: $flags"
+          echo "$flags" > "$GITHUB_WORKSPACE/ksu-flags"
+          # The debug build lets the test name the manager app. A fork whose out-of-tree build ignores the
+          # make variable still gets the define through KCFLAGS, and one whose debug code includes a header
+          # relative to kernel/ (backslashxx) needs that directory on the include path.
+          cd kernel
+          for cfg in release debug; do
+            if [ "$cfg" = debug ]; then
+              env $flags CONFIG_KSU_DEBUG=y "KCFLAGS=-DCONFIG_KSU_DEBUG=1 -I$PWD" CC=clang make
+            else
+              env $flags CC=clang make
+            fi
+            llvm-strip -d kernelsu.ko
+            cp kernelsu.ko "$GITHUB_WORKSPACE/kernelsu-$cfg.ko"
+            git clean -fdxq .
+          done
+
+      - name: Build ksuctl against the uapi of the fork
+        run: |
+          set -euo pipefail
+          smoke=harness/.susfs-fork/smoke
+          clang --target=aarch64-linux-gnu -O2 -Wall -Werror -nostdlib -static -fno-stack-protector \
+            -fno-builtin -fuse-ld=lld -Wl,-e,_start -I "$smoke/shim" -I "$GITHUB_WORKSPACE" \
+            -o ksuctl "$smoke/ksuctl.c"
+          ls -l ksuctl
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ksu-${{ matrix.fork }}-${{ matrix.kmi }}
+          path: |
+            kernelsu-release.ko
+            kernelsu-debug.ko
+            ksuctl
+            ksu-commit
+            ksu-version
+            ksu-flags
+          if-no-files-found: error
+
+  boot:
+    name: boot (${{ matrix.id }})
+    needs: [plan, tools, build]
+    # A fork that failed to build fails its boots with the reason, they are not skipped.
+    if: always() && needs.plan.result == 'success' && needs.tools.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.boots) }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RUN: ${{ needs.plan.outputs.run }}
+      KEY: ${{ matrix.key }}
+      ID: ${{ matrix.id }}
+      FORK: ${{ matrix.fork }}
+      CFG: ${{ matrix.cfg }}
+      VARIANT: ${{ matrix.variant }}
+      SOURCE: ${{ matrix.source }}
+      KERNEL: ${{ matrix.kernel }}
+      RELEASE: ${{ matrix.ref }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Get the module zip of the build
+        run: |
+          set -euo pipefail
+          bash .susfs-fork/smoke/retry.sh gh run download "$RUN" \
+            --pattern 'ksu_susfs_lkm-module-*' --dir "$RUNNER_TEMP/download"
+          prov="$(find "$RUNNER_TEMP/download" -name provenance.json | head -n 1)"
+          echo "MODULE=$(dirname "$prov")" >> "$GITHUB_ENV"
+
+      - name: Get kernelsu.ko
+        run: |
+          set -euo pipefail
+          bash .susfs-fork/smoke/retry.sh gh run download "$GITHUB_RUN_ID" --name "ksu-$FORK-$VARIANT" --dir "$RUNNER_TEMP/ksu"
+          echo "KernelSU $FORK $(cat "$RUNNER_TEMP/ksu/ksu-version") at $(cat "$RUNNER_TEMP/ksu/ksu-commit")" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Get the kernel of the Google release
+        if: matrix.source == 'gki'
+        run: |
+          curl -fsSL --connect-timeout 10 --max-time 300 --speed-limit 50000 --speed-time 15 \
+            --retry 3 --retry-delay 10 --retry-all-errors -o "$RUNNER_TEMP/Image" "$KERNEL"
+
+      # dpkg, not apt: apt still re-downloads every package from the archive, which is the stall to avoid.
+      - name: Install QEMU and the policy compiler
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          bash .susfs-fork/smoke/retry.sh gh run download "$GITHUB_RUN_ID" --name vm-tools-ksu --dir "$RUNNER_TEMP/tools"
+          sudo DEBIAN_FRONTEND=noninteractive dpkg -i --skip-same-version "$RUNNER_TEMP"/tools/debs/*.deb
+          for tool in qemu-system-aarch64 cpio secilc; do
+            command -v "$tool" > /dev/null || { echo "::error::$tool is missing after the install"; exit 1; }
+          done
+
+      # The policy gives KernelSU's root domain the access the module's hooks check for.
+      - name: Compile the SELinux policy
+        run: secilc -c 30 -o "$RUNNER_TEMP/policy.bin" -f /dev/null .susfs-fork/smoke/ksu_policy.cil
+
+      # A boot with no verdict is retried once, usually a slow or stalled runner. A failed boot is not
+      # retried, the module did something wrong.
+      - name: Boot the kernel and judge the console
+        id: judge
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/out"
+          kernel="$KERNEL"
+          [ "$SOURCE" = ddk ] || kernel="$RUNNER_TEMP/Image"
+          for attempt in 1 2; do
+            bash .susfs-fork/smoke/boot.sh "$kernel" "$VARIANT" "$MODULE" "$out" "$RUNNER_TEMP/tools/busybox" \
+              "$RUNNER_TEMP/ksu/kernelsu-$CFG.ko" "$RUNNER_TEMP/policy.bin" "$RUNNER_TEMP/ksu/ksuctl"
+            rc=0
+            python3 .susfs-fork/smoke/check.py "$out/console.log" --variant "$KEY" \
+              --qemu-rc "$(cat "$out/qemu.rc")" --ksu-cfg "$CFG" > "$out/report.md" || rc=$?
+            [ "$rc" = 3 ] || break
+            echo "::notice title=$ID::no verdict on attempt $attempt"
+          done
+          case "$rc" in
+            0) verdict=pass ;;
+            1) verdict=fail ;;
+            3) verdict=inconclusive ;;
+            *) verdict=error ;;
+          esac
+          echo "$verdict" > "$out/verdict"
+          [ -z "$RELEASE" ] || echo "Kernel: Google release \`$RELEASE\`" >> "$GITHUB_STEP_SUMMARY"
+          cat "$out/report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the console and the verdict
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: boot-${{ matrix.id }}
+          path: ${{ runner.temp }}/out
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Fail unless the kernel passed
+        if: always() && steps.judge.conclusion == 'success'
+        run: |
+          verdict="$(cat "$RUNNER_TEMP/out/verdict")"
+          [ "$verdict" = pass ] || { echo "::error::$ID: $verdict, the console is in the boot-$ID artifact"; exit 1; }
+
+  # Every boot job fails unless its verdict is pass, so the matrix result is the run's verdict.
+  # The verdict files only fill the table, a failed download here costs the table, not the result.
+  report:
+    needs: [plan, build, boot]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      IDS: ${{ join(fromJSON(needs.plan.outputs.boots).include.*.id, ' ') }}
+      BUILD_RESULT: ${{ needs.build.result }}
+      BOOT_RESULT: ${{ needs.boot.result }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Tabulate the verdicts and fail unless every boot passed
+        run: |
+          set -euo pipefail
+          bash .susfs-fork/smoke/retry.sh gh run download "$GITHUB_RUN_ID" --pattern 'boot-*' \
+            --dir "$RUNNER_TEMP/verdicts" || echo "::warning::the verdicts could not be downloaded, the table is incomplete"
+          {
+            echo "| boot | verdict |"
+            echo "| --- | --- |"
+            for id in $IDS; do
+              file="$(find "$RUNNER_TEMP/verdicts" -path "*/boot-$id/verdict" 2> /dev/null | head -n 1)"
+              echo "| $id | $([ -n "$file" ] && cat "$file" || echo "no verdict") |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "$BUILD_RESULT" = success ] || { echo "::error::a KernelSU did not build, the build job is $BUILD_RESULT"; exit 1; }
+          [ "$BOOT_RESULT" = success ] || { echo "::error::not every boot passed, the boot job is $BOOT_RESULT"; exit 1; }

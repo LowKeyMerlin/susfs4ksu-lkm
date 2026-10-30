@@ -1,0 +1,7 @@
+{
+  "about": "Differences between upstream and kernel/susfs_abi.h that were looked at and do not matter. abi_drift.py leaves these out of its report. Each needs the reason.",
+  "struct_fields": {
+    "st_susfs_sus_kstat.is_statically": "upstream made it bool on 2026-09-26. The next member is an unsigned long, so the field occupies the same bytes either way, and the module chooses between add and add statically by the command number and never reads it."
+  },
+  "defines": {}
+}

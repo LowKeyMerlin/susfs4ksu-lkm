@@ -1,0 +1,75 @@
+name: susfs-drift
+run-name: "susfs-drift: ${{ inputs.title || (github.event_name == 'schedule' && 'scheduled') || 'manual' }}"
+
+# Compare upstream SUSFS with this module and keep one open issue listing the differences: the ABI
+# in kernel/susfs_abi.h (commands, struct fields and types, constants), the upstream kernel patch
+# hook sites against .susfs-fork/parity.json, and upstream commits to kernel_patches/ since the
+# last review. The issue closes when nothing is left. While there is a gap the upstream sources
+# are uploaded as port-kit. Reports only, never fails a build.
+on:
+  schedule:
+    - cron: "47 3 * * *"
+  workflow_dispatch:
+    inputs:
+      title:
+        description: Name for this run in the workflow list, a default is used when empty
+        required: false
+
+concurrency:
+  group: susfs-drift
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      UPSTREAM: https://gitlab.com/simonpunk/susfs4ksu.git
+    steps:
+      - uses: actions/checkout@v5
+
+      # The ABI that counts is the one the build compiles, with this fork's patches applied.
+      - name: Apply the patches
+        run: sh .susfs-fork/apply_patches.sh
+
+      - name: Compare with upstream
+        run: |
+          git clone --quiet --no-single-branch --filter=blob:none --no-checkout \
+            "$UPSTREAM" "$RUNNER_TEMP/upstream"
+          python3 .susfs-fork/abi_drift.py "$RUNNER_TEMP/upstream" --kit "$RUNNER_TEMP/kit" > "$RUNNER_TEMP/drift.md"
+
+      - name: Keep the upstream sources
+        uses: actions/upload-artifact@v7
+        with:
+          name: port-kit
+          path: ${{ runner.temp }}/kit
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Update the issue
+        run: |
+          set -euo pipefail
+          label=susfs-drift
+          title="SUSFS differs from upstream"
+          kit="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/workflows/susfs-drift.yml"
+          gh label create "$label" --description "Upstream SUSFS has changes the module lacks" --force
+          num="$(gh issue list --label "$label" --state open --json number --jq '.[0].number // empty')"
+          if [ -s "$RUNNER_TEMP/drift.md" ]; then
+            { echo "Where upstream SUSFS and the module differ."
+              echo
+              echo "The upstream sources to port from are in the port-kit artifact of the latest run: $kit"
+              echo
+              cat "$RUNNER_TEMP/drift.md"; } > "$RUNNER_TEMP/body.md"
+            if [ -n "$num" ]; then
+              gh issue edit "$num" --title "$title" --body-file "$RUNNER_TEMP/body.md"
+            else
+              gh issue create --title "$title" --label "$label" --body-file "$RUNNER_TEMP/body.md"
+            fi
+          elif [ -n "$num" ]; then
+            gh issue close "$num" --comment "The module now matches upstream."
+          fi

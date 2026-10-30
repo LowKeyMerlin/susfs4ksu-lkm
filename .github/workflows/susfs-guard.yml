@@ -1,0 +1,71 @@
+name: susfs-guard
+run-name: "susfs-guard: ${{ inputs.title || (github.event_name == 'pull_request' && format('PR #{0} {1}', github.event.pull_request.number, github.event.pull_request.title)) || format('{0} on {1}', github.event_name, github.ref_name) }}"
+
+# susfs-main may only add files. Editing or deleting an upstream file there would make syncing
+# conflict. susfs-dev may edit kernel/, so it skips that check. susfs-build.yml must match what the generator produces from this tree, and the
+# bootloop guard must pass its host test.
+on:
+  push:
+    branches:
+      - susfs-main
+      - susfs-dev
+  pull_request:
+    branches:
+      - susfs-main
+      - susfs-dev
+  workflow_dispatch:
+    inputs:
+      title:
+        description: Name for this run in the workflow list, a default is used when empty
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  additive-only:
+    if: (github.base_ref || github.ref_name) != 'susfs-dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Check that no upstream file is changed
+        run: |
+          changed="$(git diff --no-renames --name-only --diff-filter=MDT origin/main...HEAD)"
+          if [ -n "$changed" ]; then
+            echo "::error::susfs-main must only add files, these files from main are changed:"
+            echo "$changed"
+            exit 1
+          fi
+
+  build-is-current:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check susfs-build.yml against the generator
+        run: python3 .susfs-fork/gen_build.py --check
+
+  bootloop-guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install busybox and mksh
+        run: sudo apt-get install -y --no-install-recommends busybox-static mksh
+
+      # Android's shell is mksh, so test with it as well as dash, busybox ash and bash.
+      - name: Test the guard under each shell
+        run: |
+          mkdir /tmp/bb
+          ln -s /bin/busybox /tmp/bb/sh
+          rc=0
+          for shell in dash /tmp/bb/sh bash mksh; do
+            sh .susfs-fork/module/guard_test.sh "$shell" || rc=1
+          done
+          exit "$rc"

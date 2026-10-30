@@ -1,0 +1,339 @@
+name: susfs-android
+run-name: "susfs-android: ${{ inputs.title || (inputs.run && format('manual, run {0}', inputs.run)) || 'manual' }}"
+
+# Run the module on an Android guest (Cuttlefish, newest AOSP release build, arm64 under QEMU) with
+# a device's SELinux policy and app uids. Two jobs, each on a fresh guest:
+#
+#   guard  only when dispatched with guard=true. The module's bootloop guard test under Android's own shell, then a boot cut short with
+#          a reboot: the next boot must trip the guard and disable the modules it is told to.
+#   prio   KernelSU and the module loaded in the guest, then the priority uid filter against real
+#          packages: hidden and visible callers, owner and root, refused input, and the refresh
+#          after packages.list changes.
+#
+# The module zip and the KernelSU modules come from one pipeline run, its build and its susfs-ksu
+# job. The scripts under test come from the zip, the ones in this repository only drive the guest.
+#
+# susfs-pipeline.yml calls this with its own run. A dispatch without a run tests the newest
+# pipeline run of the default branch.
+on:
+  workflow_call:
+    inputs:
+      run:
+        description: Pipeline run with the module zip and the KernelSU builds
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      title:
+        description: Name for this run in the workflow list, a default is used when empty
+        required: false
+      run:
+        description: Pipeline run to test, the newest successful one of the default branch when empty
+        required: false
+      guard:
+        description: Also run the guard job, which takes about an hour on the emulated guest
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      ksu: ${{ steps.pick.outputs.run }}
+      build: ${{ steps.pick.outputs.run }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Pick the run
+        id: pick
+        env:
+          INPUT_RUN: ${{ inputs.run }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          run="$INPUT_RUN"
+          [ -n "$run" ] || run="$(gh run list --workflow susfs-pipeline.yml --branch "$BRANCH" --event push \
+            --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+          [ -n "$run" ] || { echo "::error::there is no pipeline run to test"; exit 1; }
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "pipeline run $run" >> "$GITHUB_STEP_SUMMARY"
+
+  guard:
+    needs: plan
+    # Off unless asked for. It passed on an Android guest with the redesigned guard, the host tests
+    # cover it under four shells on every change, and a run costs an hour on the emulated guest.
+    # Dispatch with guard=true after changing guard.sh.
+    if: needs.plan.outputs.build != '' && inputs.guard == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      BUILD_RUN: ${{ needs.plan.outputs.build }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.susfs-fork/android/setup
+      - name: Fetch the module zip
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download "$BUILD_RUN" -R "$GITHUB_REPOSITORY" --pattern 'ksu_susfs_lkm-module-*' -D "$RUNNER_TEMP/mod"
+          ls "$RUNNER_TEMP/mod"/*
+      - name: Boot
+        run: |
+          source .susfs-fork/android/lib.sh
+          t0=$(date +%s)
+          start_device /tmp/create.out
+          wait_boot "$t0" 2400 || { tail -n 20 /tmp/create.out; exit 1; }
+      - name: Run the guard test under Android's shell
+        run: |
+          source .susfs-fork/android/lib.sh
+          "$ADB" -s "$SERIAL" root
+          sleep 3
+          "$ADB" connect "$SERIAL" > /dev/null 2>&1 || true
+          "$ADB" -s "$SERIAL" shell 'rm -rf /data/local/tmp/gt; mkdir -p /data/local/tmp/gt/.susfs-fork/module /data/local/tmp/gt/module'
+          "$ADB" -s "$SERIAL" push .susfs-fork/module/. /data/local/tmp/gt/.susfs-fork/module/ > /dev/null
+          "$ADB" -s "$SERIAL" push module/kmi.sh /data/local/tmp/gt/module/ > /dev/null
+          "$ADB" -s "$SERIAL" shell 'TMPDIR=/data/local/tmp GUARD_TEST_QUICK=1 sh /data/local/tmp/gt/.susfs-fork/module/guard_test.sh /system/bin/sh' 2>&1 | tr -d '\r' | tee /tmp/guard-test.out
+          grep -q ' 0 failed' /tmp/guard-test.out
+      - name: Arm the guard, then cut the boot short
+        run: |
+          source .susfs-fork/android/lib.sh
+          mod=$(find "$RUNNER_TEMP/mod" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          "$ADB" -s "$SERIAL" shell 'rm -rf /data/local/tmp/mod; mkdir -p /data/local/tmp/mod'
+          "$ADB" -s "$SERIAL" push "$mod/." /data/local/tmp/mod/ > /dev/null
+          "$ADB" -s "$SERIAL" push .susfs-fork/android/guard-guest.sh /data/local/tmp/guard-guest.sh > /dev/null
+          "$ADB" -s "$SERIAL" shell sh /data/local/tmp/guard-guest.sh pre 2>&1 | tr -d '\r' | tee /tmp/guard-pre.out
+          "$ADB" -s "$SERIAL" shell sync
+          old=$(sed -n 's/^ANDROID boot_id=//p' /tmp/guard-pre.out)
+          echo "OLD_BOOT=$old" >> "$GITHUB_ENV"
+          "$ADB" -s "$SERIAL" reboot
+      - name: Wait for the next boot
+        run: |
+          source .susfs-fork/android/lib.sh
+          t0=$(date +%s)
+          sleep 20
+          while [ $(( $(date +%s) - t0 )) -lt 1500 ]; do
+            "$ADB" connect "$SERIAL" > /dev/null 2>&1 || true
+            now=$("$ADB" -s "$SERIAL" shell cat /proc/sys/kernel/random/boot_id 2>/dev/null | tr -d '\r' || true)
+            done=$("$ADB" -s "$SERIAL" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
+            if [ -n "$now" ] && [ "$now" != "$OLD_BOOT" ] && [ "$done" = 1 ]; then
+              echo "rebooted after $(( $(date +%s) - t0 )) s"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "the guest did not come back"
+          exit 1
+      - name: Check what the guard did on the next boot
+        run: |
+          source .susfs-fork/android/lib.sh
+          "$ADB" -s "$SERIAL" root
+          sleep 3
+          "$ADB" connect "$SERIAL" > /dev/null 2>&1 || true
+          "$ADB" -s "$SERIAL" shell sh /data/local/tmp/guard-guest.sh post 2>&1 | tr -d '\r' | tee /tmp/guard-post.out
+          bad=0
+          want() {
+            got=$(sed -n "s/^ANDROID $2=//p" "$1")
+            if [ "$got" = "$3" ]; then echo "ok   $2=$got"; else echo "DIFF $2: wanted '$3', got '$got'"; bad=1; fi
+          }
+          want /tmp/guard-pre.out load_rc 0
+          want /tmp/guard-pre.out tripped no
+          want /tmp/guard-pre.out disabled no
+          want /tmp/guard-pre.out armed "$OLD_BOOT"
+          want /tmp/guard-post.out marker_survived "$OLD_BOOT"
+          want /tmp/guard-post.out first_tripped no
+          want /tmp/guard-post.out first_fails ""
+          want /tmp/guard-post.out cut_tripped no
+          want /tmp/guard-post.out cut_fails 1
+          want /tmp/guard-post.out tripped yes
+          want /tmp/guard-post.out disabled yes
+          want /tmp/guard-post.out armed_after no
+          want /tmp/guard-post.out other_a_disabled yes
+          want /tmp/guard-post.out other_b_listed no
+          want /tmp/guard-post.out listed "other_a,"
+          want /tmp/guard-post.out restart_tripped no
+          want /tmp/guard-post.out settled_armed no
+          new=$(sed -n 's/^ANDROID new_boot_id=//p' /tmp/guard-post.out)
+          want /tmp/guard-post.out restart_armed "$new"
+          want /tmp/guard-post.out first_armed "$new"
+          exit $bad
+      - name: Collect the guest logs
+        if: always()
+        run: |
+          source .susfs-fork/android/lib.sh
+          "$ADB" -s "$SERIAL" shell dmesg 2>/dev/null | tail -n 1500 > /tmp/guest-dmesg.txt || true
+          "$ADB" -s "$SERIAL" logcat -d -b all 2>/dev/null | tail -n 2000 > /tmp/guest-logcat.txt || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: android-guard-logs
+          retention-days: 14
+          path: |
+            /tmp/guard-test.out
+            /tmp/guard-pre.out
+            /tmp/guard-post.out
+            /tmp/guest-dmesg.txt
+            /tmp/guest-logcat.txt
+            /tmp/create.out
+      - name: Stop the device
+        if: always()
+        run: |
+          source .susfs-fork/android/lib.sh
+          stop_device
+
+  prio:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      BUILD_RUN: ${{ needs.plan.outputs.build }}
+      KSU_RUN: ${{ needs.plan.outputs.ksu }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.susfs-fork/android/setup
+      - name: Fetch KernelSU and the module, build the probe
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download "$KSU_RUN" -R "$GITHUB_REPOSITORY" -n ksu-KernelSU-Next-android16-6.12 -D "$RUNNER_TEMP/ksu"
+          gh run download "$BUILD_RUN" -R "$GITHUB_REPOSITORY" --pattern 'ksu_susfs_lkm-module-*' -D "$RUNNER_TEMP/mod"
+          ls "$RUNNER_TEMP/ksu" "$RUNNER_TEMP/mod"/*
+          clang --target=aarch64-linux-gnu -O2 -Wall -Werror -nostdlib -static-pie -fno-stack-protector \
+            -fno-builtin -fuse-ld=lld -Wl,-e,_start -o "$RUNNER_TEMP/prio_probe" .susfs-fork/smoke/prio_probe.c
+          clang --target=aarch64-linux-gnu -O2 -Wall -Werror -nostdlib -static-pie -fno-stack-protector \
+            -fno-builtin -fuse-ld=lld -Wl,-e,_start -o "$RUNNER_TEMP/kstat_probe" .susfs-fork/smoke/kstat_probe.c
+          file "$RUNNER_TEMP/prio_probe" "$RUNNER_TEMP/kstat_probe"
+      - name: Boot
+        run: |
+          source .susfs-fork/android/lib.sh
+          t0=$(date +%s)
+          start_device /tmp/create.out
+          wait_boot "$t0" 2400 || { tail -n 20 /tmp/create.out; exit 1; }
+      - name: Load KernelSU and the module in the guest
+        run: |
+          source .susfs-fork/android/lib.sh
+          mod=$(find "$RUNNER_TEMP/mod" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          "$ADB" -s "$SERIAL" root
+          sleep 3
+          "$ADB" connect "$SERIAL" > /dev/null 2>&1 || true
+          for d in ksu mod; do "$ADB" -s "$SERIAL" shell "rm -rf /data/local/tmp/$d; mkdir -p /data/local/tmp/$d"; done
+          "$ADB" -s "$SERIAL" push "$RUNNER_TEMP/ksu/." /data/local/tmp/ksu/ > /dev/null
+          "$ADB" -s "$SERIAL" push "$mod/." /data/local/tmp/mod/ > /dev/null
+          "$ADB" -s "$SERIAL" push .susfs-fork/android/guest-test.sh /data/local/tmp/guest-test.sh > /dev/null
+          "$ADB" -s "$SERIAL" shell sh /data/local/tmp/guest-test.sh 2>&1 | tr -d '\r' | tee /tmp/guest.out
+          grep -q '^ANDROID susfs_loaded=yes' /tmp/guest.out
+          grep -q '^ANDROID ksu_loaded=yes' /tmp/guest.out
+      - name: Run the priority filter in the guest
+        run: |
+          source .susfs-fork/android/lib.sh
+          "$ADB" -s "$SERIAL" push "$RUNNER_TEMP/prio_probe" /data/local/tmp/prio_probe > /dev/null
+          "$ADB" -s "$SERIAL" push .susfs-fork/android/prio-guest.sh /data/local/tmp/prio-guest.sh > /dev/null
+          "$ADB" -s "$SERIAL" shell sh /data/local/tmp/prio-guest.sh 2>&1 | tr -d '\r' | tee /tmp/guest-prio.out
+      - name: Run a sus_kstat rule in the guest
+        run: |
+          source .susfs-fork/android/lib.sh
+          "$ADB" -s "$SERIAL" push "$RUNNER_TEMP/kstat_probe" /data/local/tmp/kstat_probe > /dev/null
+          "$ADB" -s "$SERIAL" push .susfs-fork/android/kstat-guest.sh /data/local/tmp/kstat-guest.sh > /dev/null
+          "$ADB" -s "$SERIAL" shell sh /data/local/tmp/kstat-guest.sh 2>&1 | tr -d '\r' | tee /tmp/guest-kstat.out
+          bad=0
+          expect() {
+            got=$(sed -n "s/^ANDROID $1=//p" /tmp/guest-kstat.out)
+            if [ "$got" = "$2" ]; then echo "ok   $1=$got"; else echo "DIFF $1: wanted '$2', got '$got'"; bad=1; fi
+          }
+          expect add_err 0
+          expect mounts_differ yes
+          expect before_update_app covered
+          expect update_err 0
+          expect statfs_app real
+          expect fstatfs_app real
+          expect statfs_root covered
+          expect cleared_app covered
+          expect avc_probe 0
+          exit $bad
+      - name: Run /proc/susfs_map in the guest
+        run: |
+          source .susfs-fork/android/lib.sh
+          "$ADB" -s "$SERIAL" push .susfs-fork/android/map-guest.sh /data/local/tmp/map-guest.sh > /dev/null
+          "$ADB" -s "$SERIAL" shell sh /data/local/tmp/map-guest.sh 2>&1 | tr -d '\r' | tee /tmp/guest-map.out
+          bad=0
+          expect() {
+            got=$(sed -n "s/^ANDROID $1=//p" /tmp/guest-map.out)
+            if [ "$got" = "$2" ]; then echo "ok   $1=$got"; else echo "DIFF $1: wanted '$2', got '$got'"; bad=1; fi
+          }
+          expect start 0
+          expect sees_before yes
+          expect add yes/1
+          expect listed 1
+          expect sees_hidden no
+          expect root_sees yes
+          expect app_write no
+          expect count_after_app 1
+          expect del yes/0
+          expect sees_after_del yes
+          expect missing no
+          exit $bad
+      - name: Check the result
+        run: |
+          bad=0
+          expect() {
+            got=$(sed -n "s/^ANDROID $1=//p" /tmp/guest-prio.out)
+            if [ "$got" = "$2" ]; then echo "ok   $1=$got"; else echo "DIFF $1: wanted '$2', got '$got'"; bad=1; fi
+          }
+          truth="ok,-1,ok,-1,-22"
+          hidden="-3,-3,-3,-3,-22"
+          own="ok,ok,ok,ok,-22"
+          expect selinux Enforcing
+          expect layer 4
+          expect layer_failed 0
+          expect packages 3
+          expect owner_a yes
+          expect owner_b yes
+          expect caller_uid "$(sed -n 's/^ANDROID pkg_a=.* uid_c=//p' /tmp/guest-prio.out)"
+          expect before "$truth"
+          expect set_a "0,0"
+          expect hidden_a "$hidden"
+          expect visible_b "$truth"
+          expect own_a "$own"
+          expect root_a "$own"
+          expect missing "0,-2"
+          expect kept_after_refused "$hidden/$truth"
+          expect set_both "0,0"
+          expect both_hidden "$hidden/$hidden"
+          expect set_b "0,0"
+          expect replaced "$truth/$hidden"
+          expect refresh_stale "$hidden/$truth"
+          expect refresh_followed "$truth/$hidden"
+          expect avc_probe 0
+          exit $bad
+      - name: Collect the guest logs
+        if: always()
+        run: |
+          source .susfs-fork/android/lib.sh
+          "$ADB" -s "$SERIAL" shell dmesg 2>/dev/null | tail -n 2000 > /tmp/guest-dmesg.txt || true
+          "$ADB" -s "$SERIAL" logcat -d -b all 2>/dev/null | tail -n 3000 > /tmp/guest-logcat.txt || true
+          "$ADB" -s "$SERIAL" shell cat /data/adb/modules/susfs_guard_lkm/guard.log 2>/dev/null > /tmp/guest-guard.log || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: android-prio-logs
+          retention-days: 14
+          path: |
+            /tmp/guest-guard.log
+            /tmp/guest.out
+            /tmp/guest-prio.out
+            /tmp/guest-kstat.out
+            /tmp/guest-map.out
+            /tmp/guest-dmesg.txt
+            /tmp/guest-logcat.txt
+            /tmp/create.out
+      - name: Stop the device
+        if: always()
+        run: |
+          source .susfs-fork/android/lib.sh
+          stop_device

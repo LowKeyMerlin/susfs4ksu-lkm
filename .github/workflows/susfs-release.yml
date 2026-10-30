@@ -1,0 +1,62 @@
+name: susfs-release
+run-name: "susfs-release: ${{ inputs.title || inputs.tag || github.event.release.tag_name }}"
+
+# Attach the module zip to a release. It is the zip the pipeline of the tagged commit built and
+# tested, not rebuilt or repacked. A tag whose commit has no successful full pipeline is an error.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      title:
+        description: Name for this run in the workflow list, a default is used when empty
+        required: false
+      tag:
+        description: Release tag to attach the module zip to
+        required: true
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  attach:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - name: Find the build of the tag
+        id: build
+        run: |
+          set -euo pipefail
+          sha="$(gh api "repos/$REPO/commits/$TAG" --jq .sha)"
+          # Push runs only, a pull request run builds a merge commit, not the tagged one.
+          run="$(gh run list --repo "$REPO" --workflow susfs-pipeline.yml --event push --commit "$sha" \
+                   --limit 50 --json databaseId,conclusion \
+                   --jq '[.[] | select(.conclusion == "success")][0].databaseId')"
+          if [ -z "$run" ] || [ "$run" = "null" ]; then
+            echo "::error::no successful susfs-pipeline.yml push run for $TAG ($sha)"
+            exit 1
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+      - name: Download the module zip
+        run: |
+          set -euo pipefail
+          mapfile -t found < <(gh api "repos/$REPO/actions/runs/${{ steps.build.outputs.run }}/artifacts" \
+            --jq '.artifacts[] | select(.name | test("^ksu_susfs_lkm-module-.*-arm64[.]zip$")) | [.id, .name, .digest] | @tsv')
+          [ "${#found[@]}" -eq 1 ] || { echo "::error::expected one module zip, found ${#found[@]}"; exit 1; }
+          IFS=$'\t' read -r id name digest <<< "${found[0]}"
+          # This endpoint returns the artifact zip as uploaded.
+          mkdir dist
+          gh api "repos/$REPO/actions/artifacts/$id/zip" > "dist/$name"
+          echo "${digest#sha256:}  dist/$name" | sha256sum --check
+
+      - name: Attach to the release
+        run: gh release upload "$TAG" dist/*.zip --repo "$REPO" --clobber
