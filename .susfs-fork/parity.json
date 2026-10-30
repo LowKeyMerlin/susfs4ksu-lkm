@@ -47,5 +47,17 @@
     {"upstream": "drivers/input/input.c ksu_handle_input_handle_event, fs/read_write.c ksu_handle_sys_read (KernelSU manual hooks)", "ours": "KernelSU side", "status": "ksu-side", "evidence": "static"},
     {"upstream": "fs/Makefile (builds susfs.o into the kernel)", "ours": "", "status": "not-applicable", "evidence": "static"},
     {"upstream": "fs/super.c susfs_is_current_ksu_domain", "ours": "sus_mount.c (generic_shutdown_super)", "status": "lkm-different", "evidence": "static"}
+  ],
+  "refactors": [
+    {
+      "commit": "ed8a832 Refactor spoofing logic of SUS_MOUNT, SUS_KSTAT and OPEN_REDIRECT",
+      "scope": "on gki-android14-6.1 only (33 commits deep); NOT in the 6.12 tip or the other stable branches, which still gate SUS_KSTAT/SUS_MAP/OPEN_REDIRECT on susfs_is_current_proc_umounted_app()",
+      "parts": {
+        "kstat-gate-widening": "6.1 adds a (uid % 100000) >= 10000 predicate and uses it for SUS_KSTAT only (SUS_MAP and OPEN_REDIRECT keep umounted_app). NOT adopted: adopting it universally would diverge from the 6.12+ tips (7 of 8 KMIs) and widen kstat spoofing toward the manager and su-granted apps. Our gate stays susfs_is_current_proc_umounted_app(), matching 6.12+.",
+        "hlist-bucket-and-layout": "not applicable: upstream grows SUS_KSTAT_HLIST/OPEN_REDIRECT_HLIST to 14-bit buckets and reorders struct fields for cache locality. We store rules in arrays, not hlists.",
+        "feature-independence": "already satisfied: SUS_MOUNT, SUS_KSTAT and OPEN_REDIRECT are separate tables with separate gates here, so they already work independently and can combine.",
+        "add-update-size-refresh": "deliberate divergence: ed8a832 refreshes spoofed_size to the current inode size on update (is_update). Our update keeps the add-time snapshot by design (documented at the top of susfs_kstat.c): update re-points target_ino/target_dev and, for _full_clone, also spoofs the add-time nlink/size, so an app keeps seeing the ORIGINAL stat after the path is overlaid - which is the hiding behaviour the feature exists for. The default (non-full-clone) path never reads spoofed_size (SIZE not in KSTAT_AUTO_SPOOF), so the two agree there. Confirm the intended app-visible size with a behavioural test."
+      }
+    }
   ]
 }
