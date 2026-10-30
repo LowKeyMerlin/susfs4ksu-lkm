@@ -1,14 +1,14 @@
 {
   "about": "Every place the upstream kernel patch calls into SUSFS, and what this module does about it. Sites come from kernel_patches/50_add_susfs_in_gki-*.patch on the stable branches. They are identical on all seven except where a row names a branch. status: implemented, lkm-different (same effect through a hook an LKM can have), missing, unreviewed (not checked yet). evidence: static (read from the sources, no test yet) or tested.",
   "reviewed": {
-    "level": "hook sites and ABI only, commit contents are not reviewed yet",
-    "gki-android12-5.10": "5419f4ee",
-    "gki-android13-5.10": "6343de00",
-    "gki-android13-5.15": "0b5f9671",
-    "gki-android14-5.15": "195d1c10",
-    "gki-android14-6.1": "27e0a0e4",
-    "gki-android15-6.6": "c51cd8aa",
-    "gki-android16-6.12": "3ff9fd3f"
+    "level": "hook sites and ABI, plus the kernel_patches commits listed under triaged; older commit contents are not reviewed",
+    "gki-android12-5.10": "8930474a",
+    "gki-android13-5.10": "cfa82d53",
+    "gki-android13-5.15": "e30f1502",
+    "gki-android14-5.15": "251a2ec4",
+    "gki-android14-6.1": "ee155a1a",
+    "gki-android15-6.6": "93114563",
+    "gki-android16-6.12": "6b60a305"
   },
   "sites": [
     {"upstream": "block/ioprio.c susfs_is_priority_uid_filtered", "ours": "patch 0004 priority filter (ioprio_get/ioprio_set)", "status": "implemented", "evidence": "tested"},
@@ -47,6 +47,16 @@
     {"upstream": "drivers/input/input.c ksu_handle_input_handle_event, fs/read_write.c ksu_handle_sys_read (KernelSU manual hooks)", "ours": "KernelSU side", "status": "ksu-side", "evidence": "static"},
     {"upstream": "fs/Makefile (builds susfs.o into the kernel)", "ours": "", "status": "not-applicable", "evidence": "static"},
     {"upstream": "fs/super.c susfs_is_current_ksu_domain", "ours": "sus_mount.c (generic_shutdown_super)", "status": "lkm-different", "evidence": "static"}
+  ],
+  "triaged": [
+    {
+      "commit": "KernelSU: Fix compiler error (8930474 on 12-5.10 through 6b60a30 on 6.12)",
+      "result": "not applicable: touches only kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch (a ksu_close_fd call in the KernelSU patch). The module does not apply that patch."
+    },
+    {
+      "commit": "kernel & Kernel: priority uid filter: Fix UAF bugs and worker not able to run (eb95da0 on 12-5.10 through 519c86c on 6.12)",
+      "result": "not applicable, covered by design. Upstream keeps the uid bitmap and the app-strings list as two objects and was missing a synchronize_rcu() before freeing each. Here the bitmap is the only RCU-read object, published with rcu_assign_pointer() and freed with kfree_rcu() in prio_swap(); the list text is read only under prio_lock, so no reader can hold either past a free. The second half moves the refresh worker to run after KernelSU's track_throne(). The module has no such call to order against: prio_refresh() is queued by a kprobe on the packages.list rename, after PRIO_REFRESH_DELAY, and re-resolves the stored list itself."
+    }
   ],
   "refactors": [
     {
