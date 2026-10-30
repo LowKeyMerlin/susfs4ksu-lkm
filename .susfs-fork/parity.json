@@ -58,6 +58,25 @@
       "result": "not applicable, covered by design. Upstream keeps the uid bitmap and the app-strings list as two objects and was missing a synchronize_rcu() before freeing each. Here the bitmap is the only RCU-read object, published with rcu_assign_pointer() and freed with kfree_rcu() in prio_swap(); the list text is read only under prio_lock, so no reader can hold either past a free. The second half moves the refresh worker to run after KernelSU's track_throne(). The module has no such call to order against: prio_refresh() is queued by a kprobe on the packages.list rename, after PRIO_REFRESH_DELAY, and re-resolves the stored list itself."
     }
   ],
+  "audits": [
+    {
+      "target": "linux 6.18 internals used by sus_mount.c (mnt_id_xa, __xa_alloc, __xa_erase)",
+      "source": "our own 6.18 branches read for consistency; the DDK and GKI builds of every KMI, 6.18 included, are what validate them against the real kernel",
+      "checked": [
+        "every id taken with __xa_alloc is released exactly once: by the kernel's own erase when a marked mount is freed, or by sus_mount_ida_release() for an unused or orphaned id",
+        "alloc and release use the same xarray and the same lock call, and both run in process context",
+        "a missing mnt_id_xa, __xa_alloc or __xa_erase leaves marking off and logs the name, so the feature does nothing instead of guessing",
+        "kallsyms and the loader's own extern are cross-checked and a mismatch is logged",
+        "the 6.12+ mnt_id_ctr and namespace_sem lookups are compiled for 6.18 too"
+      ],
+      "build-gated": [
+        "which lock flavour mnt_id_xa uses: xa_lock() is right only if the array is not declared XA_FLAGS_LOCK_IRQ or LOCK_BH, and the 6.18 System.map and a PROVE_LOCKING boot are what settle it",
+        "that __xa_alloc() with a NULL entry keeps the slot allocated (it is meant to store a reserved entry), which the first marked mount in the 6.18 smoke run shows",
+        "that mnt_id_xa is not static in 6.18 fs/namespace.c, which the System.map gate already checks at build time",
+        "whether 6.18 changed mnt_id_ctr or the mnt_id_unique rules the craft in sus_mount_craft_unique() relies on"
+      ]
+    }
+  ],
   "refactors": [
     {
       "commit": "ed8a832 Refactor spoofing logic of SUS_MOUNT, SUS_KSTAT and OPEN_REDIRECT",
