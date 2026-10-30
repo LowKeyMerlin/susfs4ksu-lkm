@@ -105,3 +105,20 @@ dynamic rewrite of its fixed 2D name arrays would add risk for no practical gain
 
 Unload frees follow the existing priority-filter reasoning: a kernel-owned kvfree_rcu needs no
 rcu_barrier because the callback runs kernel code, not module code.
+
+## p1-race outcome
+
+- 273ae36 (clone_mnt race): not applicable. Upstream's race is in its own clone_mnt patch, between
+  the VFSMOUNT_MNT_FLAGS_KSU_UNSHARED_MNT flag and the susfs_is_sdcard_android_data_not_decrypted
+  static key flipping mid-clone, which could free a mismatched id from mnt_id_ida. This LKM patches
+  none of those: it marks mounts by taking a REAL id from mnt_id_ida/mnt_id_xa and, under
+  namespace_sem, releases the orphaned original id and any unused batch id exactly once each while
+  the kernel frees the new id on umount. No flippable key gates the free, so the window cannot open.
+
+- 8879282 (mount minor-dev gap): a real detection vector (JingMatrix Demo) that upstream closes by
+  allocating ksu-domain anon-bdev minors from a high range (DEFAULT_KSU_MNT_MINOR_DEV = 1 << 12) in
+  get_anon_bdev(). Not implemented: we do not hook get_anon_bdev, the hook would fire for every anon
+  mount on the system (tmpfs, overlayfs, ...) and would have to free the low minor and re-allocate a
+  high one from the private unnamed_dev_ida under a probe, and an LKM loaded after boot cannot fix
+  the minors of mounts KernelSU already created. Deferred to the build stage where the get_anon_bdev
+  hook can be gated tightly on the ksu domain and stress-tested.
