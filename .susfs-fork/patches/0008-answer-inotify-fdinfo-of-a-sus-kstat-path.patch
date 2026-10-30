@@ -1,0 +1,166 @@
+Answer inotify fdinfo of a sus_kstat path with the inode and device of the rule
+
+Upstream rewrites the ino and sdev of an inotify watch in fs/notify/fdinfo.c for an app, so a watch
+on a path whose stat() lies does not show the real inode and device beside it.
+
+The line is already in the text the fdinfo hook of 0006 sees at the return of seq_show(), so it is
+rewritten there and no probe is added: inotify_fdinfo() is static and reached through a function
+pointer, which LTO may specialize and inline away. The inode and raw s_dev are on the line itself,
+so the rule is matched on them without looking up a file.
+
+Only what the rule spoofs is replaced, as stat() does, and the device is decoded from its stat()
+form to the raw form the line prints; upstream prints the stored value as it is and the spoofed
+inode and device unconditionally. The fhandle that follows carries the real inode and is left alone,
+as upstream leaves it.
+
+Upstream's second change in that function, for a process whose mounts were unmounted, re-resolves
+the path by name with kern_path() to print the inode behind a KSU mount. That sleeps, which a probe
+cannot, and is reachable only through a descriptor opened before the unmount; it is left out and
+recorded as such in parity.json.
+
+diff --git a/kernel/susfs_kstat.c b/kernel/susfs_kstat.c
+index fcad89a..4eae651 100644
+--- a/kernel/susfs_kstat.c
++++ b/kernel/susfs_kstat.c
+@@ -648,43 +648,124 @@ static bool kstat_fdinfo_target(struct seq_file *m, unsigned long *ino, dev_t *d
+ 	return ok;
+ }
+ 
+-static int kstat_fdinfo_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
++/* The mnt_id and ino lines every fdinfo starts with, for the file the descriptor is. */
++static void kstat_fdinfo_self(struct seq_file *m)
+ {
+-	struct seq_file *m = *(struct seq_file **)ri->data;
+ 	unsigned long ino, mnt, new_ino, file_ino;
+ 	unsigned int new_mnt_id;
+-	dev_t dev;
+-	struct dentry *d;
+ 	char head[160], old[64], new[64];
+ 	const char *p;
+ 	int old_len, new_len;
+ 	size_t n;
+-
+-	if (susfs_kstat_table_empty() || (long)regs_return_value(regs))
+-		return 0;
+-	if (!susfs_ptr_plausible(m) || !m->buf || !m->count || !m->file)
+-		return 0;
+-	d = m->file->f_path.dentry;
+-	if (!d || !d->d_parent || strcmp(d->d_parent->d_name.name, "fdinfo"))
+-		return 0;
+-	if (!susfs_kstat_gate_ok())
+-		return 0;
++	dev_t dev;
+ 
+ 	n = min(m->count, sizeof(head) - 1);
+ 	memcpy(head, m->buf, n);
+ 	head[n] = 0;
+ 	p = kstat_fdinfo_num(head, "mnt_id:\t", &mnt);
+ 	if (!p || !kstat_fdinfo_num(p, "ino:\t", &ino))
+-		return 0;
++		return;
+ 	/* the descriptor may have been closed or replaced since the text was written */
+ 	if (!kstat_fdinfo_target(m, &file_ino, &dev) || file_ino != ino)
+-		return 0;
++		return;
+ 	if (!susfs_kstat_lookup_fdinfo(ino, dev, &new_ino, &new_mnt_id))
+-		return 0;
++		return;
+ 
+ 	old_len = scnprintf(old, sizeof(old), "mnt_id:\t%lu\nino:\t%lu\n", mnt, ino);
+ 	new_len = scnprintf(new, sizeof(new), "mnt_id:\t%u\nino:\t%lu\n", new_mnt_id, new_ino);
+ 	kstat_buf_replace(m, old, old_len, new, new_len);
++}
++
++/* An inotify descriptor lists each watch as
++ *   inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:0 fhandle-bytes:...
++ * with the watched inode and its raw s_dev, which is all a rule is matched on, so no file is looked
++ * up. Upstream rewrites ino and sdev here for an app; so does this, for the parts the rule spoofs,
++ * the device decoded from its stat() form as the maps hook does. The fhandle that follows holds
++ * the real inode number in a filesystem-specific form and is left as it is, as upstream leaves it. */
++static bool kstat_fdinfo_hex(const char **p, const char *end, unsigned long *val)
++{
++	unsigned long v = 0;
++	const char *s = *p;
++
++	for (; s < end; s++) {
++		int c = *s;
++
++		if (c >= '0' && c <= '9')
++			c -= '0';
++		else if (c >= 'a' && c <= 'f')
++			c -= 'a' - 10;
++		else
++			break;
++		v = (v << 4) | (unsigned long)c;
++	}
++	if (s == *p)
++		return false;
++	*val = v;
++	*p = s;
++	return true;
++}
++
++static void kstat_fdinfo_inotify(struct seq_file *m)
++{
++	static const char tag[] = "inotify wd:";
++	size_t pos = 0;
++
++	while (pos < m->count) {
++		const char *line = m->buf + pos, *end, *p;
++		size_t left = m->count - pos, len;
++		unsigned long wd, ino, sdev, new_ino;
++		unsigned int new_dev;
++		struct sus_kstat_snapshot snap;
++		char old[80], new[80];
++		int old_len, new_len;
++
++		end = memchr(line, '\n', left);
++		len = end ? (size_t)(end - line) + 1 : left;
++		end = line + len;
++		pos += len;
++		if (len <= sizeof(tag) || memcmp(line, tag, sizeof(tag) - 1))
++			continue;
++
++		p = line + sizeof(tag) - 1;
++		if (!kstat_fdinfo_hex(&p, end, &wd) || end - p < 5 || memcmp(p, " ino:", 5))
++			continue;
++		p += 5;
++		if (!kstat_fdinfo_hex(&p, end, &ino) || end - p < 6 || memcmp(p, " sdev:", 6))
++			continue;
++		p += 6;
++		if (!kstat_fdinfo_hex(&p, end, &sdev))
++			continue;
++		if (!susfs_kstat_lookup(ino, new_encode_dev((dev_t)sdev), &snap) ||
++		    !(snap.flags & (KSTAT_SPOOF_INO | KSTAT_SPOOF_DEV)))
++			continue;
++
++		new_ino = (snap.flags & KSTAT_SPOOF_INO) ? snap.spoofed_ino : ino;
++		new_dev = (snap.flags & KSTAT_SPOOF_DEV)
++			  ? (unsigned int)new_decode_dev((u32)snap.spoofed_dev) : (unsigned int)sdev;
++		old_len = scnprintf(old, sizeof(old), "wd:%lx ino:%lx sdev:%x", wd, ino, (unsigned int)sdev);
++		new_len = scnprintf(new, sizeof(new), "wd:%lx ino:%lx sdev:%x", wd, new_ino, new_dev);
++		if (kstat_buf_replace(m, old, old_len, new, new_len))
++			pos += new_len - old_len;
++	}
++}
++
++static int kstat_fdinfo_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
++{
++	struct seq_file *m = *(struct seq_file **)ri->data;
++	struct dentry *d;
++
++	if (susfs_kstat_table_empty() || (long)regs_return_value(regs))
++		return 0;
++	if (!susfs_ptr_plausible(m) || !m->buf || !m->count || !m->file)
++		return 0;
++	d = m->file->f_path.dentry;
++	if (!d || !d->d_parent || strcmp(d->d_parent->d_name.name, "fdinfo"))
++		return 0;
++	if (!susfs_kstat_gate_ok())
++		return 0;
++
++	kstat_fdinfo_self(m);
++	kstat_fdinfo_inotify(m);
+ 	return 0;
+ }
+ 

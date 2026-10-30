@@ -1,0 +1,306 @@
+Answer fdinfo of a sus_kstat path with the mount id and inode of the rule
+
+Upstream rewrites the mnt_id and ino lines of /proc/<pid>/fdinfo/N for an app's fd on a sus_kstat
+path, in fs/proc/fd.c's seq_show(). stat() already answers from the rule, and without this an app
+could read the two side by side and see the real file behind a path whose stat() lies.
+
+A module cannot patch seq_show(), so the two numbers are replaced in the formatted text at its
+return. The text has no device, so the rule is matched on the file itself, found the way seq_show()
+finds it: the fdinfo inode names a task and a descriptor, and the descriptor table gives the
+file. A probe cannot sleep, so the table is read under rcu and the task lock, which keeps
+exit_files() from freeing it, without taking a reference. The match is on inode and device as in
+upstream, so a bind mount of the path is answered as well, and the text's inode is checked against
+the file's in case the descriptor was replaced in between.
+
+Where upstream prints the rule's spoofed inode unconditionally, this prints it only when the rule
+spoofs the inode, as stat() does; otherwise a rule without it would show inode 0 in fdinfo beside
+the real one in stat(). The mount id is the one the path had when the rule was added.
+
+seq_show has no table that holds its address and, above 5.15, no name unique to the file
+reading it (four symbols named seq_show on 6.1 and 6.6), so every match is probed, up to 32, and the
+handler tells its own file apart by the "fdinfo" directory its dentry sits under, the same approach
+susfs_open_redirect.c already uses for one line of the same file. Armed with the first kstat rule,
+removed at unload. Needs fs/proc/internal.h for struct proc_inode, reached like fs/mount.h through
+the -I$(srctree)/fs the build already has.
+
+diff --git a/kernel/susfs_kstat.c b/kernel/susfs_kstat.c
+index 7c3dc88..fcad89a 100644
+--- a/kernel/susfs_kstat.c
++++ b/kernel/susfs_kstat.c
+@@ -63,6 +63,13 @@
+ #include <linux/slab.h>
+ #include "susfs_kprobe.h"
+ #include "symbol_resolver.h"	/* find_kernel_symbol_exact */
++#include "mount.h"		/* fs/mount.h: real_mount() -> the mnt_id fdinfo prints */
++#include "proc/internal.h"	/* fs/proc/internal.h: PROC_I(), the task and fd an fdinfo inode names */
++#include <linux/fdtable.h>
++#include <linux/magic.h>
++#include <linux/nospec.h>
++#include <linux/pid.h>
++#include <linux/sched/task.h>
+ 
+ /* KSTAT_SPOOF_* bits live in susfs_abi.h (upstream declares them in susfs.h next to struct
+  * st_susfs_sus_kstat).  KSTAT_AUTO_SPOOF* below are /proc-interface masks, not supercall ABI. */
+@@ -99,6 +106,9 @@ struct sus_kstat_entry {
+ 	/* What statfs of the path answered when the rule was added, for an app to be given later. */
+ 	struct kstatfs statfs;
+ 	bool has_statfs;
++	/* The mount id fdinfo printed for the path when the rule was added, which is what an app is
++	 * given. Not re-read by update, as upstream keeps it. */
++	unsigned int spoofed_mnt_id;
+ };
+ 
+ static struct sus_kstat_entry kstat_entries[SUS_KSTAT_MAX];
+@@ -263,6 +273,31 @@ static __nocfi noinline int kstat_statfs_snapshot(const struct path *path, struc
+ 	return kstat_vfs_statfs_fn(path, out);
+ }
+ 
++/* What fdinfo prints for a rule's target: the mount id the path had when the rule was added and,
++ * if the rule spoofs it, the inode. Found by inode and device like the stat family, so a bind mount
++ * of the same filesystem is answered too, as upstream answers it. */
++static bool susfs_kstat_lookup_fdinfo(unsigned long ino, dev_t dev,
++				      unsigned long *new_ino, unsigned int *new_mnt_id)
++{
++	unsigned long flags;
++	bool found = false;
++	int i;
++
++	spin_lock_irqsave(&kstat_table_lock, flags);
++	for (i = 0; i < nkstat; i++) {
++		const struct sus_kstat_entry *e = &kstat_entries[i];
++
++		if (e->target_ino != ino || e->target_dev != dev)
++			continue;
++		*new_ino = (e->flags & KSTAT_SPOOF_INO) ? e->spoofed_ino : ino;
++		*new_mnt_id = e->spoofed_mnt_id;
++		found = true;
++		break;
++	}
++	spin_unlock_irqrestore(&kstat_table_lock, flags);
++	return found;
++}
++
+ /* Writer-side lookup by path: safe without the spinlock, since every caller holds kstat_lock. */
+ static struct sus_kstat_entry *susfs_kstat_find_by_path(const char *path)
+ {
+@@ -537,6 +572,180 @@ static void kstat_maps_disarm(void)
+ 	mutex_unlock(&kstat_maps_ctl_lock);
+ }
+ 
++/* ---- /proc/<pid>/fdinfo/<fd> coverage ----
++ *
++ * Upstream's seq_show() in fs/proc/fd.c prints the rule's mount id and inode itself, where the
++ * file is at hand. Here it is not (seq_show() is static and the file a local of it), so the two
++ * numbers are read back from the formatted text at the return and replaced, as the maps hook does.
++ * The text has no device, so the rule is matched on the file itself, found the way seq_show() finds
++ * it, see kstat_fdinfo_target().
++ *
++ * Above 5.15 the name is not unique (four symbols on 6.1 and 6.6), and the kernel keeps no table
++ * that holds the address of this one, so every match is probed and the handler tells fdinfo's own
++ * file by the name of its directory. Armed with the first rule, removed when the module unloads. */
++#define KSTAT_FDINFO_MAX 32
++
++static int kstat_fdinfo_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
++{
++	*(struct seq_file **)ri->data = (struct seq_file *)regs->regs[0];
++	return 0;
++}
++
++/* The decimal that follows label in text, and where it ends; NULL when there is none. */
++static const char *kstat_fdinfo_num(const char *text, const char *label, unsigned long *val)
++{
++	const char *p = strstr(text, label);
++	unsigned long v = 0;
++
++	if (!p)
++		return NULL;
++	p += strlen(label);
++	if (*p < '0' || *p > '9')
++		return NULL;
++	for (; *p >= '0' && *p <= '9'; p++)
++		v = v * 10 + (unsigned long)(*p - '0');
++	*val = v;
++	return p;
++}
++
++/* The inode and encoded device of the file an fdinfo entry describes. seq_show() takes them from
++ * the descriptor the fdinfo inode names (task and fd number, set when the entry was looked up),
++ * and so does this. A probe cannot sleep, so it reads the descriptor table under rcu and the task
++ * lock: the lock keeps exit_files() from freeing the table, rcu keeps the file and the table's
++ * array alive, and nothing is taken a reference on or written. */
++static bool kstat_fdinfo_target(struct seq_file *m, unsigned long *ino, dev_t *dev)
++{
++	struct inode *pi = m->private;	/* single_open(file, seq_show, inode) */
++	struct task_struct *task;
++	struct fdtable *fdt;
++	struct file *f;
++	unsigned int fd;
++	bool ok = false;
++
++	if (!susfs_ptr_plausible(pi) || pi != file_inode(m->file) ||
++	    pi->i_sb->s_magic != PROC_SUPER_MAGIC)
++		return false;
++	fd = PROC_I(pi)->fd;
++
++	rcu_read_lock();
++	task = pid_task(PROC_I(pi)->pid, PIDTYPE_PID);
++	if (task) {
++		task_lock(task);
++		if (task->files) {
++			fdt = rcu_dereference(task->files->fdt);
++			if (fdt && fd < fdt->max_fds) {
++				f = rcu_dereference(fdt->fd[array_index_nospec(fd, fdt->max_fds)]);
++				if (f && file_inode(f)) {
++					*ino = file_inode(f)->i_ino;
++					*dev = new_encode_dev(file_inode(f)->i_sb->s_dev);
++					ok = true;
++				}
++			}
++		}
++		task_unlock(task);
++	}
++	rcu_read_unlock();
++	return ok;
++}
++
++static int kstat_fdinfo_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
++{
++	struct seq_file *m = *(struct seq_file **)ri->data;
++	unsigned long ino, mnt, new_ino, file_ino;
++	unsigned int new_mnt_id;
++	dev_t dev;
++	struct dentry *d;
++	char head[160], old[64], new[64];
++	const char *p;
++	int old_len, new_len;
++	size_t n;
++
++	if (susfs_kstat_table_empty() || (long)regs_return_value(regs))
++		return 0;
++	if (!susfs_ptr_plausible(m) || !m->buf || !m->count || !m->file)
++		return 0;
++	d = m->file->f_path.dentry;
++	if (!d || !d->d_parent || strcmp(d->d_parent->d_name.name, "fdinfo"))
++		return 0;
++	if (!susfs_kstat_gate_ok())
++		return 0;
++
++	n = min(m->count, sizeof(head) - 1);
++	memcpy(head, m->buf, n);
++	head[n] = 0;
++	p = kstat_fdinfo_num(head, "mnt_id:\t", &mnt);
++	if (!p || !kstat_fdinfo_num(p, "ino:\t", &ino))
++		return 0;
++	/* the descriptor may have been closed or replaced since the text was written */
++	if (!kstat_fdinfo_target(m, &file_ino, &dev) || file_ino != ino)
++		return 0;
++	if (!susfs_kstat_lookup_fdinfo(ino, dev, &new_ino, &new_mnt_id))
++		return 0;
++
++	old_len = scnprintf(old, sizeof(old), "mnt_id:\t%lu\nino:\t%lu\n", mnt, ino);
++	new_len = scnprintf(new, sizeof(new), "mnt_id:\t%u\nino:\t%lu\n", new_mnt_id, new_ino);
++	kstat_buf_replace(m, old, old_len, new, new_len);
++	return 0;
++}
++
++static struct kretprobe krp_kstat_fdinfo[KSTAT_FDINFO_MAX];
++static int n_kstat_fdinfo;
++
++/* Under the lock and exiting flag of the maps hook: the same callers arm both. */
++static void kstat_fdinfo_arm(void)
++{
++	unsigned long addrs[KSTAT_FDINFO_MAX];
++	int i, n, rc;
++
++	mutex_lock(&kstat_maps_ctl_lock);
++	if (kstat_maps_exiting || n_kstat_fdinfo) {
++		mutex_unlock(&kstat_maps_ctl_lock);
++		return;
++	}
++	n = ksu_find_symbol_all("seq_show", addrs, KSTAT_FDINFO_MAX);
++	if (n <= 0)
++		pr_warn("susfs_kstat: seq_show not found - fdinfo prints the real mount id and inode\n");
++	else if (n == KSTAT_FDINFO_MAX)
++		pr_warn("susfs_kstat: %d seq_show symbols or more, fdinfo's may not be among them\n", n);
++	for (i = 0; i < n; i++) {
++		struct kretprobe *kr = &krp_kstat_fdinfo[i];
++
++		kr->kp.addr = (void *)addrs[i];
++		kr->entry_handler = kstat_fdinfo_entry;
++		kr->handler = kstat_fdinfo_ret;
++		kr->data_size = sizeof(struct seq_file *);
++		kr->maxactive = 16;
++		rc = register_kretprobe(kr);
++		if (rc) {
++			susfs_krp_forget_addr(kr);
++			pr_warn("susfs_kstat: register_kretprobe(seq_show @%px) failed %d\n",
++				(void *)addrs[i], rc);
++			continue;
++		}
++		n_kstat_fdinfo++;
++	}
++	if (n_kstat_fdinfo)
++		SUSFS_LOGI("susfs_kstat: fdinfo hook armed (seq_show on %d/%d symbols)\n",
++			   n_kstat_fdinfo, n);
++	mutex_unlock(&kstat_maps_ctl_lock);
++}
++
++/* After kstat_maps_disarm(), which stops later arms. */
++static void kstat_fdinfo_disarm(void)
++{
++	int i;
++
++	mutex_lock(&kstat_maps_ctl_lock);
++	for (i = 0; i < KSTAT_FDINFO_MAX; i++) {
++		if (!krp_kstat_fdinfo[i].kp.addr)
++			continue;
++		unregister_kretprobe(&krp_kstat_fdinfo[i]);
++		susfs_krp_forget_addr(&krp_kstat_fdinfo[i]);
++	}
++	n_kstat_fdinfo = 0;
++	mutex_unlock(&kstat_maps_ctl_lock);
++}
++
+ /* Why the vfs_getattr fallback is not here any more (it stood exactly where these counters now
+  * live): it was a second hook, one layer lower - it rewrote struct kstat BEFORE cp_new_stat()/
+  * cp_compat_stat()/cp_statx() copied it out - so it was the one place that also covered what the
+@@ -2081,6 +2290,7 @@ static int susfs_kstat_fill_from_path(struct sus_kstat_entry *e, const char *pat
+ 
+ 	e->target_ino = inode->i_ino;
+ 	e->target_dev = new_encode_dev(inode->i_sb->s_dev);
++	e->spoofed_mnt_id = real_mount(p.mnt)->mnt_id;
+ 	e->spoofed_ino = inode->i_ino;
+ 	e->spoofed_dev = new_encode_dev(inode->i_sb->s_dev);
+ 	e->spoofed_nlink = inode->i_nlink;
+@@ -2322,8 +2532,10 @@ void susfs_kstat_supercall(unsigned int cmd, void __user **arg)
+ 	mutex_unlock(&kstat_lock);
+ 	info.err = err;
+ 	/* Armed outside the lock and only after a rule actually landed: a hook that can never fire is worse than no hook. */
+-	if (!err)
++	if (!err) {
+ 		kstat_maps_arm();
++		kstat_fdinfo_arm();
++	}
+ out:
+ 	/* Upstream (fs/susfs.c susfs_add_sus_kstat) writes back ONLY the err field for this
+ 	 * input-type command, never the whole struct: copying the full struct back would overrun a
+@@ -2421,6 +2633,7 @@ void susfs_kstat_exit(void)
+ 	int i;
+ 
+ 	kstat_maps_disarm();
++	kstat_fdinfo_disarm();
+ 
+ 	/* Every entry is restored first and the drain runs after all of them: restoring stops new
+ 	 * callers, and susfs_fp_drain() is what covers a task that already picked one of our wrappers
+@@ -2582,8 +2795,10 @@ static ssize_t kstat_proc_write(struct file *file, const char __user *buf,
+ 
+ 	mutex_unlock(&kstat_lock);
+ 
+-	if (!err)
++	if (!err) {
+ 		kstat_maps_arm();
++		kstat_fdinfo_arm();
++	}
+ 
+ 	if (err) {
+ 		pr_warn("kstat proc write '%s' -> err %d\n", argv[0], err);

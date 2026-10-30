@@ -1,0 +1,370 @@
+Answer statfs of a sus_kstat path with the numbers it had when the rule was added
+
+Upstream branches inside vfs_statfs() for an app that asks about a path with a sus_kstat rule and
+answers from a kstatfs saved with the rule, so a bind mount or overlay on the path does not show
+in f_blocks, f_type or f_flags. The module only rewrote the stat family.
+
+The snapshot is taken with vfs_statfs() when the rule is added or replaced and kept by update, which
+only re-targets the rule, so it holds what the path showed before the mount. A probe on vfs_statfs()
+was tried first and never fires where LTO inlines it into its callers, which is all of 6.1 and
+statfs on 6.12 and 6.18. The table entries of statfs, fstatfs and the AArch32 statfs, fstatfs,
+statfs64 and fstatfs64 are wrapped instead, like the stat family. Gated like the stat layer on
+KernelSU's umount decision for the caller.
+
+For a caller the rules apply to, the wrapper answers the call itself: it resolves the argument
+once, takes vfs_statfs() of it, swaps in the snapshot of that inode if a rule holds one and fills
+the buffer in the layout of the entry, with the checks of fs/statfs.c (EINVAL for a wrong
+statfs64 size, ESTALE retry, EOVERFLOW for a field the 32-bit layout cannot hold, EFAULT).
+Patching up the buffer after the original needed a second lookup of a user string or descriptor
+that another thread can swap in between, and then the real numbers of a hidden path reach the
+caller. It also walked the path twice and copied it into a PATH_MAX buffer. Every other caller,
+and every call while no rule exists, goes to the original.
+
+diff --git a/kernel/susfs_kstat.c b/kernel/susfs_kstat.c
+index 97b08ea..7c3dc88 100644
+--- a/kernel/susfs_kstat.c
++++ b/kernel/susfs_kstat.c
+@@ -20,7 +20,8 @@
+  * cp_new_stat, so VFS-layer kprobes miss): the reliable hook is the RETURN of the stat syscall,
+  * where the user statbuf is fully written - so this layer replaces the sys_call_table entries of
+  * the numbers below and rewrites the requested fields of the user buffer in the wrapper's tail,
+- * once the original has returned (see kstat_hooks[] and susfs_kstat_post()).  Native:
++ * once the original has returned (see kstat_hooks[] and susfs_kstat_post()).  statfs and fstatfs,
++ * native and AArch32, are answered from a snapshot kept with the rule (susfs_kstatfs_post()).  Native:
+  * newfstatat(79), fstat(80), statx(291).
+  * AArch32: fstatat64(327), stat64(195), lstat64(196), fstat64(197) -> struct stat64; stat(106),
+  * lstat(107), fstat(108) -> struct compat_stat; statx(397) -> the SAME struct statx as native
+@@ -56,7 +57,12 @@
+ #include "susfs_fp_hook.h"	/* struct susfs_fp_hook + install/remove/drain: the table entries */
+ #include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
+ #include "ksu_allow_gate.h"	/* the control-node gate is su's own */
++#include <linux/statfs.h>
++#include <asm/statfs.h>
++#include <linux/file.h>
++#include <linux/slab.h>
+ #include "susfs_kprobe.h"
++#include "symbol_resolver.h"	/* find_kernel_symbol_exact */
+ 
+ /* KSTAT_SPOOF_* bits live in susfs_abi.h (upstream declares them in susfs.h next to struct
+  * st_susfs_sus_kstat).  KSTAT_AUTO_SPOOF* below are /proc-interface masks, not supercall ABI. */
+@@ -90,6 +96,9 @@ struct sus_kstat_entry {
+ 	long long spoofed_blocks;
+ 	long spoofed_blksize;
+ 	unsigned int flags;
++	/* What statfs of the path answered when the rule was added, for an app to be given later. */
++	struct kstatfs statfs;
++	bool has_statfs;
+ };
+ 
+ static struct sus_kstat_entry kstat_entries[SUS_KSTAT_MAX];
+@@ -222,6 +231,38 @@ static bool susfs_kstat_lookup(unsigned long ino, dev_t dev,
+ 	return found;
+ }
+ 
++/* The statfs snapshot of a rule, copied out the same way. */
++static bool susfs_kstat_lookup_statfs(unsigned long ino, dev_t dev, struct kstatfs *out)
++{
++	unsigned long flags;
++	bool found = false;
++	int i;
++
++	spin_lock_irqsave(&kstat_table_lock, flags);
++	for (i = 0; i < nkstat; i++) {
++		if (kstat_entries[i].target_ino == ino &&
++		    kstat_entries[i].target_dev == dev &&
++		    kstat_entries[i].has_statfs) {
++			*out = kstat_entries[i].statfs;
++			found = true;
++			break;
++		}
++	}
++	spin_unlock_irqrestore(&kstat_table_lock, flags);
++	return found;
++}
++
++/* The snapshot is taken with the kernel's vfs_statfs(), resolved by name. A checked indirect call
++ * to a kernel symbol is a CFI panic, so the call sits in its own __nocfi function. */
++static int (*kstat_vfs_statfs_fn)(const struct path *path, struct kstatfs *buf);
++
++static __nocfi noinline int kstat_statfs_snapshot(const struct path *path, struct kstatfs *out)
++{
++	if (!kstat_vfs_statfs_fn)
++		return -EOPNOTSUPP;
++	return kstat_vfs_statfs_fn(path, out);
++}
++
+ /* Writer-side lookup by path: safe without the spinlock, since every caller holds kstat_lock. */
+ static struct sus_kstat_entry *susfs_kstat_find_by_path(const char *path)
+ {
+@@ -849,6 +890,10 @@ static_assert(sizeof(((struct compat_stat *)0)->st_atime_nsec) == 4, "compat_sta
+  * fs/stat.c has no COMPAT_SYSCALL_DEFINE for statx on arm64 - filling the same 256-byte
+  * struct statx at a zero-extended 32-bit pointer.  statbuf is args[4] and the requested mask
+  * args[3], exactly as in the native case; only the counter differs (see KSTAT_COUNTERS above). */
++#define COMPAT_STATFS_NR	99	/* statfs(path, struct compat_statfs *) */
++#define COMPAT_FSTATFS_NR	100	/* fstatfs(fd, struct compat_statfs *) */
++#define COMPAT_STATFS64_NR	266	/* statfs64(path, size, struct compat_statfs64 *) */
++#define COMPAT_FSTATFS64_NR	267	/* fstatfs64(fd, size, struct compat_statfs64 *) */
+ #define COMPAT_STATX_NR		397	/* statx(dfd, path, flags, mask, struct statx *) */
+ 
+ struct kstat_nr_entry {
+@@ -1386,7 +1431,7 @@ static bool susfs_kstat_spoof_statx(struct kstat_call_state *st, unsigned long s
+  * syscall_get_nr() and the two classifiers below were paid on all of them - measured at ~28 ns per
+  * syscall when the stat family moved onto it (getpid 113 -> 141 ns), and re-measured at the time of
+  * this change as 126 ns without the tracepoint vs 151 ns with it (three runs each, +25..31 ns), on
+- * the same device the module ships to.  As a wrapper tail it runs only for the thirteen numbers in
++ * the same device the module ships to.  As a wrapper tail it runs only for the numbers in
+  * kstat_hooks[], and both the "which ABI" and the "which syscall" questions are answered by which
+  * table entry was called rather than by a test that every syscall has to pay for.  Nothing is lost:
+  * the arguments arrive from the wrapper, which copies them out of regs BEFORE calling the original
+@@ -1601,7 +1646,7 @@ static __nocfi void susfs_kstat_post(long nr, bool compat, const unsigned long *
+  *     everything armed                        151 / 150 / 151 ns   <- tracepoint registered
+  *
+  * i.e. +25..31 ns per syscall, on every syscall, whether or not it is one this module cares about.
+- * Now only these thirteen numbers pay anything, and both classifiers went away with the tracepoint.
++ * Now only these numbers pay anything, and both classifiers went away with the tracepoint.
+  *
+  * Arguments are copied out of regs BEFORE the original runs: a syscall's return value is written
+  * into regs->regs[0] (arch/arm64/kernel/syscall.c, and the compat entry point does the same), so
+@@ -1619,6 +1664,12 @@ static __nocfi void susfs_kstat_post(long nr, bool compat, const unsigned long *
+  * by name - so one that does not match what this kernel calls the entry shows up as "no symbol"
+  * there and changes nothing about the hook itself.
+  */
++static susfs_syscall_fn_t kstat_orig_statfs;
++static susfs_syscall_fn_t kstat_orig_fstatfs;
++static susfs_syscall_fn_t kstat_orig_compat_statfs;
++static susfs_syscall_fn_t kstat_orig_compat_fstatfs;
++static susfs_syscall_fn_t kstat_orig_compat_statfs64;
++static susfs_syscall_fn_t kstat_orig_compat_fstatfs64;
+ static susfs_syscall_fn_t kstat_orig_nfstatat;
+ static susfs_syscall_fn_t kstat_orig_fstat;
+ static susfs_syscall_fn_t kstat_orig_statx;
+@@ -1634,6 +1685,184 @@ static susfs_syscall_fn_t kstat_orig_compat_statx;
+ static susfs_syscall_fn_t kstat_orig_compat_getdents64;
+ static susfs_syscall_fn_t kstat_orig_compat_getdents;
+ 
++/* ---- statfs and fstatfs ----
++ * Upstream answers an app with the numbers a sus_kstat path had when the rule was added, by
++ * branching inside vfs_statfs(). That function is inlined into its callers on some kernels (all of
++ * 6.1, and 6.12 and 6.18 for statfs), so a probe on it never fires there, the same way the stat
++ * chain is out of reach. The wrappers below answer on the return of the syscall instead, like the
++ * stat family, but for a caller the rules apply to the original does not run at all: the wrapper
++ * resolves the argument once, takes vfs_statfs() of it, swaps in the snapshot of that inode if a
++ * rule holds one, and fills the caller's buffer in the layout of the entry, as fs/statfs.c does.
++ * One resolution is what makes it safe. Answering after the original needs a second lookup of a
++ * user string or descriptor that another thread can swap in between, and then the real numbers of
++ * a hidden path reach the caller whichever of the two lookups sees which path. Any other caller,
++ * and every call while no rule exists, goes to the original untouched. */
++enum kstatfs_layout { KSTATFS_NATIVE, KSTATFS_COMPAT, KSTATFS_COMPAT64 };
++
++/* vfs_statfs() of a resolved path, and the snapshot a rule holds for its inode if there is one. */
++static int kstatfs_of_path(const struct path *p, struct kstatfs *st, struct kstatfs *snap,
++			   bool *hit)
++{
++	struct inode *inode = d_backing_inode(p->dentry);
++	int err = kstat_statfs_snapshot(p, st);
++
++	*hit = !err && inode &&
++	       susfs_kstat_lookup_statfs(inode->i_ino, new_encode_dev(inode->i_sb->s_dev), snap);
++	return err;
++}
++
++/* The check put_compat_statfs() makes: a field the 32-bit layout cannot hold fails the call with
++ * EOVERFLOW. A snapshot can hold one the live numbers did not (a smaller mount went on top). */
++static bool kstatfs_fits32(const struct kstatfs *k)
++{
++	const u64 hi = 0xffffffff00000000ULL;
++
++	if ((k->f_blocks | k->f_bfree | k->f_bavail | k->f_bsize | k->f_frsize) & hi)
++		return false;
++	if (k->f_files != ~0ULL && (k->f_files & hi))
++		return false;
++	return k->f_ffree == ~0ULL || !(k->f_ffree & hi);
++}
++
++static long kstatfs_put(enum kstatfs_layout layout, void __user *ubuf, const struct kstatfs *k)
++{
++	switch (layout) {
++	case KSTATFS_NATIVE: {
++		struct statfs b;
++
++		memset(&b, 0, sizeof(b));
++		b.f_type = k->f_type;
++		b.f_bsize = k->f_bsize;
++		b.f_blocks = k->f_blocks;
++		b.f_bfree = k->f_bfree;
++		b.f_bavail = k->f_bavail;
++		b.f_files = k->f_files;
++		b.f_ffree = k->f_ffree;
++		b.f_fsid = k->f_fsid;
++		b.f_namelen = k->f_namelen;
++		b.f_frsize = k->f_frsize;
++		b.f_flags = k->f_flags;
++		if (copy_to_user(ubuf, &b, sizeof(b)))
++			return -EFAULT;
++		return 0;
++	}
++	case KSTATFS_COMPAT: {
++		struct compat_statfs b;
++
++		if (!kstatfs_fits32(k))
++			return -EOVERFLOW;
++		memset(&b, 0, sizeof(b));
++		b.f_type = k->f_type;
++		b.f_bsize = k->f_bsize;
++		b.f_blocks = k->f_blocks;
++		b.f_bfree = k->f_bfree;
++		b.f_bavail = k->f_bavail;
++		b.f_files = k->f_files;
++		b.f_ffree = k->f_ffree;
++		b.f_fsid.val[0] = k->f_fsid.val[0];
++		b.f_fsid.val[1] = k->f_fsid.val[1];
++		b.f_namelen = k->f_namelen;
++		b.f_frsize = k->f_frsize;
++		b.f_flags = k->f_flags;
++		if (copy_to_user(ubuf, &b, sizeof(b)))
++			return -EFAULT;
++		return 0;
++	}
++	case KSTATFS_COMPAT64: {
++		struct compat_statfs64 b;
++
++		memset(&b, 0, sizeof(b));
++		b.f_type = k->f_type;
++		b.f_bsize = k->f_bsize;
++		b.f_blocks = k->f_blocks;
++		b.f_bfree = k->f_bfree;
++		b.f_bavail = k->f_bavail;
++		b.f_files = k->f_files;
++		b.f_ffree = k->f_ffree;
++		b.f_fsid.val[0] = k->f_fsid.val[0];
++		b.f_fsid.val[1] = k->f_fsid.val[1];
++		b.f_namelen = k->f_namelen;
++		b.f_frsize = k->f_frsize;
++		b.f_flags = k->f_flags;
++		if (copy_to_user(ubuf, &b, sizeof(b)))
++			return -EFAULT;
++		return 0;
++	}
++	}
++	return 0;
++}
++
++static atomic_t n_kstat_statfs_hits = ATOMIC_INIT(0);
++
++/* What fs/statfs.c does for the six entries, with the snapshot swapped in. a[0] is the path or the
++ * descriptor and the buffer follows it, after the size of the 64-bit AArch32 calls (which must be
++ * exactly the struct, as there). The caller's ABI is known from which entry was called. */
++static __nocfi long susfs_kstatfs_answer(enum kstatfs_layout layout, bool by_fd, bool compat,
++					 const unsigned long *a)
++{
++	unsigned int lookup = LOOKUP_FOLLOW | LOOKUP_AUTOMOUNT;
++	unsigned long ubuf = layout == KSTATFS_COMPAT64 ? a[2] : a[1];
++	unsigned long uarg = compat ? (u32)a[0] : a[0];
++	struct kstatfs st, snap;
++	struct path p;
++	bool hit;
++	int err;
++
++	if (layout == KSTATFS_COMPAT64 && (u32)a[1] != sizeof(struct compat_statfs64))
++		return -EINVAL;
++	if (compat)
++		ubuf = (unsigned long)compat_ptr((u32)ubuf);
++
++	if (by_fd) {
++		struct file *f = fget((unsigned int)uarg);
++
++		if (!f)
++			return -EBADF;
++		err = kstatfs_of_path(&f->f_path, &st, &snap, &hit);
++		fput(f);
++	} else {
++retry:
++		err = user_path_at(AT_FDCWD, (const char __user *)uarg, lookup, &p);
++		if (err)
++			return err;
++		err = kstatfs_of_path(&p, &st, &snap, &hit);
++		path_put(&p);
++		if (err == -ESTALE && !(lookup & LOOKUP_REVAL)) {
++			lookup |= LOOKUP_REVAL;
++			goto retry;
++		}
++	}
++	if (err)
++		return err;
++	if (hit) {
++		atomic_inc(&n_kstat_statfs_hits);
++		st = snap;
++	}
++	return kstatfs_put(layout, (void __user *)ubuf, &st);
++}
++
++#define SUSFS_KSTATFS_WRAPPER(fn, slot, layout, by_fd, combat)		\
++	static __nocfi long fn(const struct pt_regs *regs)		\
++	{								\
++		susfs_syscall_fn_t orig = READ_ONCE(slot);		\
++		unsigned long a[6];					\
++									\
++		if (!orig)						\
++			return -ENOSYS;					\
++		if (!kstat_vfs_statfs_fn || susfs_kstat_table_empty() ||	\
++		    !susfs_kstat_gate_ok())				\
++			return orig(regs);				\
++		syscall_get_arguments(current, (struct pt_regs *)regs, a);	\
++		return susfs_kstatfs_answer(layout, by_fd, combat, a);	\
++	}
++
++SUSFS_KSTATFS_WRAPPER(kstat_wrap_statfs, kstat_orig_statfs, KSTATFS_NATIVE, false, false)
++SUSFS_KSTATFS_WRAPPER(kstat_wrap_fstatfs, kstat_orig_fstatfs, KSTATFS_NATIVE, true, false)
++SUSFS_KSTATFS_WRAPPER(kstat_wrap_compat_statfs, kstat_orig_compat_statfs, KSTATFS_COMPAT, false, true)
++SUSFS_KSTATFS_WRAPPER(kstat_wrap_compat_fstatfs, kstat_orig_compat_fstatfs, KSTATFS_COMPAT, true, true)
++SUSFS_KSTATFS_WRAPPER(kstat_wrap_compat_statfs64, kstat_orig_compat_statfs64, KSTATFS_COMPAT64, false, true)
++SUSFS_KSTATFS_WRAPPER(kstat_wrap_compat_fstatfs64, kstat_orig_compat_fstatfs64, KSTATFS_COMPAT64, true, true)
++
+ #define SUSFS_KSTAT_WRAPPER(fn, slot, nrval, combat)			\
+ 	static __nocfi long fn(const struct pt_regs *regs)		\
+ 	{								\
+@@ -1720,6 +1949,25 @@ static __nocfi long kstat_wrap_compat_getdents(const struct pt_regs *regs)
+ }
+ 
+ static struct susfs_fp_hook kstat_hooks[] = {
++	{ .nr = __NR_statfs, .nr_compat = 0, .name = "kstat/statfs",
++	  .sym = "__arm64_sys_statfs",
++	  .wrapper = kstat_wrap_statfs, .orig_slot = &kstat_orig_statfs },
++	{ .nr = __NR_fstatfs, .nr_compat = 0, .name = "kstat/fstatfs",
++	  .sym = "__arm64_sys_fstatfs",
++	  .wrapper = kstat_wrap_fstatfs, .orig_slot = &kstat_orig_fstatfs },
++	{ .nr = -1, .nr_compat = COMPAT_STATFS_NR, .name = "kstat/compat statfs",
++	  .sym = "__arm64_compat_sys_statfs",
++	  .wrapper = kstat_wrap_compat_statfs, .orig_slot_compat = &kstat_orig_compat_statfs },
++	{ .nr = -1, .nr_compat = COMPAT_FSTATFS_NR, .name = "kstat/compat fstatfs",
++	  .sym = "__arm64_compat_sys_fstatfs",
++	  .wrapper = kstat_wrap_compat_fstatfs, .orig_slot_compat = &kstat_orig_compat_fstatfs },
++	{ .nr = -1, .nr_compat = COMPAT_STATFS64_NR, .name = "kstat/compat statfs64",
++	  .sym = "__arm64_compat_sys_statfs64",
++	  .wrapper = kstat_wrap_compat_statfs64, .orig_slot_compat = &kstat_orig_compat_statfs64 },
++	{ .nr = -1, .nr_compat = COMPAT_FSTATFS64_NR, .name = "kstat/compat fstatfs64",
++	  .sym = "__arm64_compat_sys_fstatfs64",
++	  .wrapper = kstat_wrap_compat_fstatfs64, .orig_slot_compat = &kstat_orig_compat_fstatfs64 },
++
+ 	{ .nr = __NR_newfstatat, .nr_compat = 0, .name = "kstat/newfstatat",
+ 	  .sym = "__arm64_sys_newfstatat",
+ 	  .wrapper = kstat_wrap_nfstatat, .orig_slot = &kstat_orig_nfstatat },
+@@ -1857,6 +2105,7 @@ static int susfs_kstat_fill_from_path(struct sus_kstat_entry *e, const char *pat
+ #endif
+ 	e->spoofed_blocks = inode->i_blocks;
+ 	e->spoofed_blksize = 1 << inode->i_blkbits;
++	e->has_statfs = !kstat_statfs_snapshot(&p, &e->statfs);
+ 
+ 	path_put(&p);
+ 	return 0;
+@@ -2111,6 +2360,10 @@ int susfs_kstat_init(void)
+ 	int rc;
+ 	int i;
+ 
++	kstat_vfs_statfs_fn = (void *)find_kernel_symbol_exact("vfs_statfs");
++	if (!kstat_vfs_statfs_fn)
++		pr_warn("kstat: vfs_statfs not found, a rule keeps no statfs snapshot\n");
++
+ 	/* The entries are armed UNCONDITIONALLY, and that is not cosmetic: the supercall interface
+ 	 * (CMD_SUSFS_ADD_SUS_KSTAT) can install rules with no /proc node at all, so skipping
+ 	 * registration when expose_proc=0 silently turned the whole feature into a no-op - rules

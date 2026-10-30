@@ -1,0 +1,26 @@
+Fail a skipped get_user_pages_remote() with -EFAULT instead of returning 0
+
+The sus_map hook that hides a mapping from /proc/<pid>/mem and ptrace skipped get_user_pages_remote()
+with a return value of 0. From 6.12 get_user_page_vma_remote() only tests for a negative result and
+otherwise returns the page the skipped call never stored, so __access_remote_vm() copied from a
+garbage address and the kernel oopsed. Seen booting android16-6.12 and android17-6.18 in QEMU, on
+the first read of /proc/self/mem at the address of a mapping with a sus_map rule, made by an app uid.
+The older callers treat any result of zero or less as nothing pinned, so they act the same.
+
+diff --git a/kernel/sus_map.c b/kernel/sus_map.c
+index b1de84c..a8aa639 100644
+--- a/kernel/sus_map.c
++++ b/kernel/sus_map.c
+@@ -532,7 +532,11 @@ static int sus_map_vm_access_pre(struct kprobe *kp, struct pt_regs *regs)
+         return 0;
+ 
+     atomic_inc(&n_vm_hides);
+-    regs_set_return_value(regs, 0);     /* "nothing transferred" */
++    /* A negative errno, not 0: from 6.12 get_user_page_vma_remote() only tests for
++     * got < 0 and otherwise uses the page it was never given, which oopsed on the
++     * first /proc/<pid>/mem read of a hidden mapping.  Older callers treat any
++     * result <= 0 as "nothing pinned", so the answer they act on is the same. */
++    regs_set_return_value(regs, -EFAULT);
+     susfs_probe_return(regs);          /* skip the call: nothing is pinned */
+     return 1;
+ }

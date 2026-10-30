@@ -1,0 +1,121 @@
+Clear BTYPE when a kprobe skips the function it probed
+
+Several hooks skip the probed function by setting pc to the link register. The function was
+entered by an indirect call, so the BTYPE of that call is still in the saved PSTATE, and on a BTI
+kernel the first instruction back in the caller is not a landing pad. The first supercall then
+ends in "Oops - BTI" inside invoke_syscall(), seen booting android17-6.18 in QEMU. The kernel's
+own arm64_skip_faulting_instruction() clears BTYPE for the same reason.
+
+diff --git a/kernel/sus_map.c b/kernel/sus_map.c
+index 1c56e69..ce460ac 100644
+--- a/kernel/sus_map.c
++++ b/kernel/sus_map.c
+@@ -269,7 +269,7 @@ static int sus_map_skip_vma_pre(struct kprobe *kp, struct pt_regs *regs)
+ 	if (!sus_map_hide_vma(vma, kp->symbol_name))
+ 		return 0;
+ 	regs_set_return_value(regs, 0);
+-	regs->pc = regs->regs[30];
++	susfs_probe_return(regs);
+ 	return 1;
+ }
+ 
+@@ -474,7 +474,7 @@ static bool sus_map_walk_answer(struct kprobe *kp, struct pt_regs *regs,
+      * that from a skipped walk (upstream's own skip leaves the same value).  Leaving
+      * x0 = mm would turn pagemap_read()'s `ret` into a kernel pointer handed to read(2). */
+     regs_set_return_value(regs, 0);
+-    regs->pc = regs->regs[30];
++    susfs_probe_return(regs);
+     return true;
+ }
+ 
+@@ -665,7 +665,7 @@ static int sus_map_vm_access_pre(struct kprobe *kp, struct pt_regs *regs)
+ 
+     atomic_inc(&n_vm_hides);
+     regs_set_return_value(regs, 0);     /* "nothing transferred" */
+-    regs->pc = regs->regs[30];          /* skip the call: nothing is pinned */
++    susfs_probe_return(regs);          /* skip the call: nothing is pinned */
+     return 1;
+ }
+ 
+diff --git a/kernel/sus_mount.c b/kernel/sus_mount.c
+index 9242627..5af91b2 100644
+--- a/kernel/sus_mount.c
++++ b/kernel/sus_mount.c
+@@ -1536,7 +1536,7 @@ static int sus_mount_show_pre(struct kprobe *kp, struct pt_regs *regs)
+         return 0;
+     sus_mount_note_id(r);
+     atomic_inc(&n_ident_hits);
+-    regs->pc = regs->regs[30];   /* skip this mount line */
++    susfs_probe_return(regs);   /* skip this mount line */
+     /* These show_* callbacks return int and x0 still holds seq_file*.
+      * seq_read() treats a negative return as a hard error, so a stray high
+      * bit here would break the whole read; upstream's equivalent site
+diff --git a/kernel/susfs.h b/kernel/susfs.h
+index 9d1288d..967f257 100644
+--- a/kernel/susfs.h
++++ b/kernel/susfs.h
+@@ -5,6 +5,7 @@
+ #include <linux/string.h>
+ #include <linux/err.h>	/* IS_ERR */
+ #include <linux/mm.h>	/* PAGE_SIZE */
++#include <linux/ptrace.h>	/* struct pt_regs, PSR_BTYPE_MASK */
+ 
+ /* A kernel pointer taken out of a kprobe register, checked before dereference: single_open()'s fake inode is (void *)1
+  * and a kretprobe hands that sentinel over as "the argument" - the sus_map vma probe panicked on exactly that (fault
+@@ -256,4 +257,14 @@ void susfs_or_entry_exit(void);
+ int susfs_create_gate_init(void);
+ void susfs_create_gate_exit(void);
+ 
++/* Leave a function a kprobe pre_handler has taken over as if it had returned, by resuming at its caller.  The probed
++ * functions are mostly entered through an indirect call, and the BTYPE that call left in the saved PSTATE makes the
++ * first instruction back in the caller trap on a BTI kernel.  arm64_skip_faulting_instruction() clears it for the
++ * same reason.  The caller sets the return value. */
++static inline void susfs_probe_return(struct pt_regs *regs)
++{
++	regs->pstate &= ~PSR_BTYPE_MASK;
++	regs->pc = regs->regs[30];
++}
++
+ #endif
+diff --git a/kernel/susfs_hide_syms.c b/kernel/susfs_hide_syms.c
+index 3a67bb7..d69cb18 100644
+--- a/kernel/susfs_hide_syms.c
++++ b/kernel/susfs_hide_syms.c
+@@ -609,13 +609,13 @@ static int hide_syms_s_show_pre(struct kprobe *kp, struct pt_regs *regs)
+ 	if (name_should_hide(iter->name)) {
+ 		atomic_inc(&hide_hit_count);
+ 		regs->regs[0] = 0;              /* s_show returns 0 */
+-		regs->pc = regs->regs[30];      /* skip the line */
++		susfs_probe_return(regs);      /* skip the line */
+ 		return 1;
+ 	}
+ 	if (iter->module_name[0] && hide_module_name_match(iter->module_name)) {
+ 		atomic_inc(&n_kallsyms_mod_skipped);
+ 		regs->regs[0] = 0;
+-		regs->pc = regs->regs[30];
++		susfs_probe_return(regs);
+ 		return 1;
+ 	}
+ 	return 0;
+@@ -664,7 +664,7 @@ static int hide_syms_m_show_pre(struct kprobe *kp, struct pt_regs *regs)
+ 
+ 	atomic_inc(&n_modlines_skipped);
+ 	regs_set_return_value(regs, 0);		/* no output for this entry */
+-	regs->pc = regs->regs[30];
++	susfs_probe_return(regs);
+ 	return 1;
+ }
+ 
+diff --git a/kernel/susfs_supercall.c b/kernel/susfs_supercall.c
+index bd7c844..36cd24d 100644
+--- a/kernel/susfs_supercall.c
++++ b/kernel/susfs_supercall.c
+@@ -416,7 +416,7 @@ static int reboot_pre(struct kprobe *kp, struct pt_regs *regs)
+ 	 * __arm64_sys_reboot and return 0 - with these magic values reboot would otherwise
+ 	 * return -EINVAL, and the prebuilt ksu_susfs tool checks the syscall result.  The
+ 	 * command itself still runs from task_work before we return to userspace. */
+-	regs->pc = regs->regs[30];
++	susfs_probe_return(regs);
+ 	regs->regs[0] = 0;
+ 	return 1;
+ }
