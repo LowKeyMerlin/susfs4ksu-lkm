@@ -84,3 +84,24 @@ Needs verification or a port (narrow):
 The memory-safety and statfs/cmdline fix batches need no code: they are already handled or are moot
 because the LKM uses snapshots, real ids, atomic buffer swaps and kfree_rcu rather than the in-tree
 edits those commits patched.
+
+## p1-capacity outcome
+
+The three accumulating rule tables now grow instead of refusing rules at a fixed cap:
+
+- sus_kstat: growable array, reallocated under the writer mutex and swapped under the reader
+  spinlock (readers already copy out under that spinlock). Freed on unload after the drain.
+- sus_map: RCU-published flex-array table, used count stored inside it so a reader on an older
+  table cannot overrun it; grown with a spare allocated outside the spinlock, old table freed with
+  kvfree_rcu. Lock-free readers unchanged in shape.
+- open_redirect: RCU-published flex-array table with an index-based free list grown alongside it;
+  growth runs under or_lock before any accounting changes, old table freed with kvfree_rcu. The
+  BITS_PER_LONG "marked" word in clear-all became an allocated bitmap. Reader gate moved to the
+  live count the file already documented.
+
+hide_modules is left bounded at 16 on purpose: it is a list of module NAMES to hide (default holds
+only this module), not an accumulating rule set, and 16 covers every realistic hiding scenario. A
+dynamic rewrite of its fixed 2D name arrays would add risk for no practical gain.
+
+Unload frees follow the existing priority-filter reasoning: a kernel-owned kvfree_rcu needs no
+rcu_barrier because the callback runs kernel code, not module code.
