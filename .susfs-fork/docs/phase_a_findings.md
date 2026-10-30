@@ -136,3 +136,22 @@ rcu_barrier because the callback runs kernel code, not module code.
 - listmount/statmount full enumeration hiding and the 16K fixup fold remain build-gated: the
   listmount/statmount return-probe lacks the per-mount struct context needed to drop a marked mount
   from the enumeration, and the 16K fold needs 16K-page handling that cannot be validated blind.
+
+## Closing outcomes (p0, p1-618, p3, p4, p5)
+
+- p0: abi_drift.py was already the upstream comparison tool, so no new script. Running it showed the
+  parity.json pins two commits behind on every stable branch. Both commits are not applicable
+  (KernelSU patch only; priority-filter UAF fix for two objects that are one RCU object here). Pins moved,
+  reasons under "triaged" in parity.json. It now reports only the fdinfo kern_path gap.
+- p1-618: no 6.18 source locally; the DDK and GKI builds are the validation. The internal checks and the
+  four points the build must settle are under "audits" in parity.json.
+- p4: selinux_hide stays in KernelSU. Five of six forks ship it and hook selinuxfs and setprocattr at
+  run time; a module copy would patch the same slots twice. Recorded as ksu-side.
+- p5: module/toggle.sh plus webroot/index.html for the two on/off nodes (enable_log, avc_spoof). Saved in
+  /data/adb/susfs_guard_lkm/toggles, re-applied by load.sh after a load. Host test: tools/test_toggle.py.
+  Unverified until a device run: that the loader's context can write the nodes at boot (a failure is
+  logged and never fails the boot).
+- p3: reviewed what this branch changed, not every file. Found and fixed one bug in sus_map add (a freed
+  slot hid a later duplicate; the old code had it too). The open_redirect add path and the kstat
+  lookup-then-append callers hold no entry pointer across a grow. Not done: a line-by-line read of the
+  other kernel files, and kstat_table_grow still copies inside the IRQ-off lock.
