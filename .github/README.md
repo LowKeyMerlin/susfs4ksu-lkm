@@ -1,8 +1,6 @@
 # SUSFS for KernelSU (LKM Edition)
 
-[![build](https://github.com/LowKeyMerlin/susfs4ksu-lkm/actions/workflows/susfs-build.yml/badge.svg?branch=susfs)](https://github.com/LowKeyMerlin/susfs4ksu-lkm/actions/workflows/susfs-build.yml)
-[![smoke](https://github.com/LowKeyMerlin/susfs4ksu-lkm/actions/workflows/susfs-smoke.yml/badge.svg?branch=susfs)](https://github.com/LowKeyMerlin/susfs4ksu-lkm/actions/workflows/susfs-smoke.yml)
-[![android](https://github.com/LowKeyMerlin/susfs4ksu-lkm/actions/workflows/susfs-android.yml/badge.svg?branch=susfs)](https://github.com/LowKeyMerlin/susfs4ksu-lkm/actions/workflows/susfs-android.yml)
+[![pipeline](https://github.com/LowKeyMerlin/susfs4ksu-lkm/actions/workflows/susfs-pipeline.yml/badge.svg?branch=susfs)](https://github.com/LowKeyMerlin/susfs4ksu-lkm/actions/workflows/susfs-pipeline.yml)
 [![license](https://img.shields.io/badge/license-GPL--2.0-blue)](../LICENSE)
 
 [SUSFS](https://gitlab.com/simonpunk/susfs4ksu) as a loadable kernel module. It loads into the
@@ -36,7 +34,7 @@ Needs an arm64 device with KernelSU or one of its forks, already up and running.
 
 1. Download `ksu_susfs_lkm-module-<tag>-arm64.zip` from
    [Releases](https://github.com/LowKeyMerlin/susfs4ksu-lkm/releases), or from the artifacts of the
-   latest successful `build-lkm-susfs` run.
+   latest successful `susfs-pipeline` run.
 2. Flash it in the KernelSU manager and reboot. The installer picks the `.ko` for your kernel and
    writes `/data/adb/susfs_guard_lkm-install.log`. It refuses a manager that is not KernelSU.
 3. Add rules through the `/proc/susfs_*` nodes, see [PROC_INTERFACES.en.md](../PROC_INTERFACES.en.md).
@@ -133,7 +131,10 @@ parent cannot conflict.
 * Added code and tests are in `.susfs-fork/`.
 * Changes to files the parent owns are numbered patches in `.susfs-fork/patches/`.
 * Workflows are named `susfs-*`. `susfs-sync` mirrors the parent every night and rebases `susfs`.
-* New work is tried on a `test/<item>` branch, then squashed onto `susfs`.
+* New work is tried on a `test/<item>` branch, then squashed onto `susfs`. A push there runs the
+  build and the QEMU smoke. `gh workflow run susfs-pipeline.yml --ref test/<item> -f full=true`
+  adds the KernelSU forks and the Android guest. Which stages a branch runs is set in its
+  `.susfs-fork/flow.json`.
 
 ## Credits
 

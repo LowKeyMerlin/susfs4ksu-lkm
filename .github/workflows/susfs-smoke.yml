@@ -1,5 +1,5 @@
 name: susfs-smoke
-run-name: "susfs-smoke: ${{ inputs.title || (github.event_name == 'workflow_run' && format('build #{0} on {1}', github.event.workflow_run.run_number, github.event.workflow_run.head_branch)) || (github.event_name == 'schedule' && 'scheduled') || (inputs.run && format('manual, build {0}', inputs.run)) || 'manual' }}"
+run-name: "susfs-smoke: ${{ inputs.title || (github.event_name == 'schedule' && 'scheduled') || (inputs.run && format('manual, build {0}', inputs.run)) || 'manual' }}"
 
 # Boot kernels in QEMU and run the module's scripts as KernelSU would: post-fs-data.sh loads the
 # .ko, the SUSFS probe must answer, the boot settles and a second load must not stack. The scripts
@@ -16,11 +16,15 @@ run-name: "susfs-smoke: ${{ inputs.title || (github.event_name == 'workflow_run'
 # verified so the network does not decide the outcome. Google releases on its own schedule, hence
 # the weekly run against the newest releases.
 #
-# The workflow name below must match .susfs-fork/gen_build.py.
+# susfs-pipeline.yml calls this with the run of its build. A schedule or a dispatch without a run
+# tests the newest pipeline build of the default branch.
 on:
-  workflow_run:
-    workflows: [build-lkm-susfs]
-    types: [completed]
+  workflow_call:
+    inputs:
+      run:
+        description: Run whose module zip is tested
+        type: string
+        required: true
   schedule:
     - cron: "11 5 * * 2"
   workflow_dispatch:
@@ -36,18 +40,8 @@ permissions:
   contents: read
   actions: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.workflow_run.id || github.run_id }}
-
 jobs:
   plan:
-    # Only builds of this repository on the default branch, the zip is executed in the VM. Other
-    # branches are tested by dispatching the workflow by hand.
-    if: >-
-      github.event_name != 'workflow_run' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_repository.full_name == github.repository &&
-      github.event.workflow_run.head_branch == github.event.repository.default_branch)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -62,13 +56,13 @@ jobs:
       - name: Pick the build
         id: run
         env:
-          TRIGGER_RUN: ${{ github.event.workflow_run.id }}
           INPUT_RUN: ${{ inputs.run }}
+          BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          run="${TRIGGER_RUN:-$INPUT_RUN}"
-          [ -n "$run" ] || run="$(gh run list --workflow build-lkm-susfs --status success --limit 1 \
-            --json databaseId --jq '.[0].databaseId // empty')"
+          run="$INPUT_RUN"
+          [ -n "$run" ] || run="$(gh run list --workflow susfs-pipeline.yml --branch "$BRANCH" --event push \
+            --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
           [ -n "$run" ] || { echo "::error::there is no successful build to test"; exit 1; }
           echo "run=$run" >> "$GITHUB_OUTPUT"
 
@@ -95,10 +89,6 @@ jobs:
   # ubuntu-latest moves to a new release over several weeks and two jobs of one run can land on
   # different ones, so the release label is pinned here and in the smoke job. Move both together.
   tools:
-    if: >-
-      github.event_name != 'workflow_run' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -114,7 +104,7 @@ jobs:
       - name: Hand them to the kernel jobs
         uses: actions/upload-artifact@v7
         with:
-          name: vm-tools
+          name: vm-tools-smoke
           path: ${{ runner.temp }}/tools
           retention-days: 1
           if-no-files-found: error
@@ -160,7 +150,7 @@ jobs:
         timeout-minutes: 5
         run: |
           set -euo pipefail
-          bash .susfs-fork/smoke/retry.sh gh run download "$GITHUB_RUN_ID" --name vm-tools --dir "$RUNNER_TEMP/tools"
+          bash .susfs-fork/smoke/retry.sh gh run download "$GITHUB_RUN_ID" --name vm-tools-smoke --dir "$RUNNER_TEMP/tools"
           sudo DEBIAN_FRONTEND=noninteractive dpkg -i --skip-same-version "$RUNNER_TEMP"/tools/debs/*.deb
           for tool in qemu-system-aarch64 cpio; do
             command -v "$tool" > /dev/null || { echo "::error::$tool is missing after the install"; exit 1; }

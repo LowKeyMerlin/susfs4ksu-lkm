@@ -1,5 +1,5 @@
 name: susfs-ksu
-run-name: "susfs-ksu: ${{ inputs.title || (github.event_name == 'workflow_run' && format('build #{0} on {1}', github.event.workflow_run.run_number, github.event.workflow_run.head_branch)) || (github.event_name == 'schedule' && 'scheduled') || (github.event_name == 'workflow_dispatch' && format('manual, {0} forks, build {1}', inputs.channel, inputs.run || 'latest')) || 'manual' }}"
+run-name: "susfs-ksu: ${{ inputs.title || (github.event_name == 'schedule' && 'scheduled') || (github.event_name == 'workflow_dispatch' && format('manual, {0} forks, build {1}', inputs.channel, inputs.run || 'latest')) || 'manual' }}"
 
 # Boot every kernel of the module zip with KernelSU loaded first, as on a device: KernelSU runs
 # the module's scripts and the module hooks into it. Each fork of ksud_forks.json is tested in
@@ -11,7 +11,7 @@ run-name: "susfs-ksu: ${{ inputs.title || (github.event_name == 'workflow_run' &
 #   tip     branch head of each fork, release configuration. Never gates, warns before a fork's
 #           next release breaks the module.
 #
-# A module build triggers stable, and so does a weekly run since forks release on their own
+# The full pipeline runs stable, and so does a weekly run since forks release on their own
 # schedule. Tip runs weekly.
 #
 # A fork with no stable release, or one that cannot build as a loadable module, is listed in the
@@ -19,11 +19,15 @@ run-name: "susfs-ksu: ${{ inputs.title || (github.event_name == 'workflow_run' &
 # retried once, then counts as failed. The scripts under test come from the zip the build
 # produced, the ones in this repository only drive the VM.
 #
-# The workflow name below must match .susfs-fork/gen_build.py.
+# susfs-pipeline.yml calls this with the run of its build. A schedule or a dispatch without a run
+# tests the newest pipeline build of the default branch.
 on:
-  workflow_run:
-    workflows: [build-lkm-susfs]
-    types: [completed]
+  workflow_call:
+    inputs:
+      run:
+        description: Run whose module zip is tested
+        type: string
+        required: true
   schedule:
     # A scheduled run's channel comes from its cron line, see the channel step.
     - cron: "41 5 * * 2"
@@ -46,18 +50,8 @@ permissions:
   contents: read
   actions: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.workflow_run.id || github.run_id }}
-
 jobs:
   plan:
-    # Only builds of this repository on the default branch, the zip is executed in the VM. Other
-    # branches are tested by dispatching the workflow by hand.
-    if: >-
-      github.event_name != 'workflow_run' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_repository.full_name == github.repository &&
-      github.event.workflow_run.head_branch == github.event.repository.default_branch)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -84,13 +78,13 @@ jobs:
       - name: Pick the build
         id: run
         env:
-          TRIGGER_RUN: ${{ github.event.workflow_run.id }}
           INPUT_RUN: ${{ inputs.run }}
+          BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          run="${TRIGGER_RUN:-$INPUT_RUN}"
-          [ -n "$run" ] || run="$(gh run list --workflow build-lkm-susfs --status success --limit 1 \
-            --json databaseId --jq '.[0].databaseId // empty')"
+          run="$INPUT_RUN"
+          [ -n "$run" ] || run="$(gh run list --workflow susfs-pipeline.yml --branch "$BRANCH" --event push \
+            --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
           [ -n "$run" ] || { echo "::error::there is no successful build to test"; exit 1; }
           echo "run=$run" >> "$GITHUB_OUTPUT"
 
@@ -130,10 +124,6 @@ jobs:
   # Network downloads for the VMs are fetched once, see susfs-smoke.yml. The kernel jobs must run on
   # the same image as this one.
   tools:
-    if: >-
-      github.event_name != 'workflow_run' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -149,7 +139,7 @@ jobs:
       - name: Hand them to the kernel jobs
         uses: actions/upload-artifact@v7
         with:
-          name: vm-tools
+          name: vm-tools-ksu
           path: ${{ runner.temp }}/tools
           retention-days: 1
           if-no-files-found: error
@@ -282,7 +272,7 @@ jobs:
         timeout-minutes: 5
         run: |
           set -euo pipefail
-          bash .susfs-fork/smoke/retry.sh gh run download "$GITHUB_RUN_ID" --name vm-tools --dir "$RUNNER_TEMP/tools"
+          bash .susfs-fork/smoke/retry.sh gh run download "$GITHUB_RUN_ID" --name vm-tools-ksu --dir "$RUNNER_TEMP/tools"
           sudo DEBIAN_FRONTEND=noninteractive dpkg -i --skip-same-version "$RUNNER_TEMP"/tools/debs/*.deb
           for tool in qemu-system-aarch64 cpio secilc; do
             command -v "$tool" > /dev/null || { echo "::error::$tool is missing after the install"; exit 1; }

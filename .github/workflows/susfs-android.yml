@@ -1,5 +1,5 @@
 name: susfs-android
-run-name: "susfs-android: ${{ inputs.title || (github.event_name == 'workflow_run' && format('ksu #{0} on {1}', github.event.workflow_run.run_number, github.event.workflow_run.head_branch)) || (inputs.ksu && format('manual, ksu {0}', inputs.ksu)) || 'manual' }}"
+run-name: "susfs-android: ${{ inputs.title || (inputs.run && format('manual, run {0}', inputs.run)) || 'manual' }}"
 
 # Run the module on an Android guest (Cuttlefish, newest AOSP release build, arm64 under QEMU) with
 # a device's SELinux policy and app uids. Two jobs, each on a fresh guest:
@@ -10,22 +10,25 @@ run-name: "susfs-android: ${{ inputs.title || (github.event_name == 'workflow_ru
 #          packages: hidden and visible callers, owner and root, refused input, and the refresh
 #          after packages.list changes.
 #
-# The module comes from the build that made the KernelSU run, found through the commit. The
-# KernelSU modules are the ones susfs-ksu built, so this follows it. The scripts under test come
-# from the zip, the ones in this repository only drive the guest.
+# The module zip and the KernelSU modules come from one pipeline run, its build and its susfs-ksu
+# job. The scripts under test come from the zip, the ones in this repository only drive the guest.
 #
-# The workflow name below must match susfs-ksu.yml.
+# susfs-pipeline.yml calls this with its own run. A dispatch without a run tests the newest
+# pipeline run of the default branch.
 on:
-  workflow_run:
-    workflows: [susfs-ksu]
-    types: [completed]
+  workflow_call:
+    inputs:
+      run:
+        description: Pipeline run with the module zip and the KernelSU builds
+        type: string
+        required: true
   workflow_dispatch:
     inputs:
       title:
         description: Name for this run in the workflow list, a default is used when empty
         required: false
-      ksu:
-        description: susfs-ksu run to follow, the latest successful one when empty
+      run:
+        description: Pipeline run to test, the newest successful one of the default branch when empty
         required: false
       guard:
         description: Also run the guard job, which takes about an hour on the emulated guest
@@ -36,51 +39,30 @@ permissions:
   contents: read
   actions: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.workflow_run.id || github.run_id }}
-
 jobs:
   plan:
-    # Only runs of this repository on the default branch, the zip is executed in the guest. Other
-    # branches are tested by dispatching the workflow by hand.
-    if: >-
-      github.event_name != 'workflow_run' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_repository.full_name == github.repository &&
-      github.event.workflow_run.head_branch == github.event.repository.default_branch)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
-      ksu: ${{ steps.pick.outputs.ksu }}
-      build: ${{ steps.pick.outputs.build }}
+      ksu: ${{ steps.pick.outputs.run }}
+      build: ${{ steps.pick.outputs.run }}
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
-      - name: Pick the runs
+      - name: Pick the run
         id: pick
         env:
-          TRIGGER_RUN: ${{ github.event.workflow_run.id }}
-          INPUT_RUN: ${{ inputs.ksu }}
+          INPUT_RUN: ${{ inputs.run }}
+          BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          ksu="${TRIGGER_RUN:-$INPUT_RUN}"
-          [ -n "$ksu" ] || ksu="$(gh run list --workflow susfs-ksu --status success --limit 1 \
-            --json databaseId --jq '.[0].databaseId')"
-          [ -n "$ksu" ] || { echo "no successful susfs-ksu run to follow"; exit 1; }
-          # A susfs-ksu run that skipped its own plan, a build of another branch, tested nothing.
-          if [ -n "$TRIGGER_RUN" ] && [ "$(gh run view "$ksu" --json jobs \
-            --jq '[.jobs[] | select(.name == "plan" and .conclusion == "success")] | length')" = 0 ]; then
-            echo "susfs-ksu run $ksu tested nothing" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          sha="$(gh run view "$ksu" --json headSha --jq .headSha)"
-          build="$(gh run list --workflow build-lkm-susfs --commit "$sha" --status success --limit 1 \
-            --json databaseId --jq '.[0].databaseId')"
-          [ -n "$build" ] || { echo "no successful build of $sha"; exit 1; }
-          echo "ksu=$ksu" >> "$GITHUB_OUTPUT"
-          echo "build=$build" >> "$GITHUB_OUTPUT"
-          echo "ksu run $ksu, build run $build, commit $sha" >> "$GITHUB_STEP_SUMMARY"
+          run="$INPUT_RUN"
+          [ -n "$run" ] || run="$(gh run list --workflow susfs-pipeline.yml --branch "$BRANCH" --event push \
+            --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+          [ -n "$run" ] || { echo "::error::there is no pipeline run to test"; exit 1; }
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "pipeline run $run" >> "$GITHUB_STEP_SUMMARY"
 
   guard:
     needs: plan
@@ -206,7 +188,6 @@ jobs:
 
   prio:
     needs: plan
-    if: needs.plan.outputs.build != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:

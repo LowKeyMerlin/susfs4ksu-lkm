@@ -17,7 +17,6 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 SOURCE = ROOT / ".github/workflows/build-ddk.yml"
 TARGET = ROOT / ".github/workflows/susfs-build.yml"
 IMAGES = pathlib.Path(__file__).resolve().parent / "images.json"
-# susfs-triage.yml waits for a workflow with this name.
 NAME = "build-lkm-susfs"
 # Run name in the workflow list: the given title, else what started the run.
 RUN_TITLE = (
@@ -52,21 +51,11 @@ def header(text):
 
 
 def triggers(text):
+    # susfs-pipeline.yml calls the build and decides when it runs. This file references no secret.
     text, n = re.subn(
         r"^on:\n.*?\n  workflow_dispatch:",
         "on:\n"
-        "  # Documentation-only pushes have nothing to compile.\n"
-        "  push:\n"
-        "    branches:\n"
-        "      - susfs\n"
-        "    paths-ignore:\n"
-        '      - "**.md"\n'
-        "  # Pull requests into susfs build the same way. This file references no secret.\n"
-        "  pull_request:\n"
-        "    branches:\n"
-        "      - susfs\n"
-        "    paths-ignore:\n"
-        '      - "**.md"\n'
+        "  workflow_call:\n"
         "  workflow_dispatch:\n"
         "    inputs:\n"
         "      title:\n"
@@ -74,6 +63,15 @@ def triggers(text):
         "        required: false", text, count=1, flags=re.S | re.M)
     if n != 1:
         raise Reject("triggers: no on block ending in workflow_dispatch")
+    return text
+
+
+def drop_concurrency(text):
+    # Called from the pipeline, github.workflow is the pipeline's name, so this group would be the
+    # pipeline's own and the build would wait on or cancel its caller. The pipeline has the group.
+    text, n = re.subn(r"^concurrency:\n(?:  [^\n]*\n)+\n?", "", text, count=1, flags=re.M)
+    if n != 1:
+        raise Reject("concurrency: no top-level concurrency block")
     return text
 
 
@@ -269,7 +267,7 @@ def node24(text):
     return re.sub(r"(?<![\w./-])(actions/[\w-]+)@v(\d+)(?![\w.])", raise_pin, text)
 
 
-EDITS = [header, triggers, self_reference, drop_probe_uploads, short_retention, ship_probe,
+EDITS = [header, triggers, drop_concurrency, self_reference, drop_probe_uploads, short_retention, ship_probe,
          patch_steps, packing_job, images, release_note, node24]
 
 

@@ -1,8 +1,8 @@
 name: susfs-release
 run-name: "susfs-release: ${{ inputs.title || inputs.tag || github.event.release.tag_name }}"
 
-# Attach the module zip to a release. It is the zip the build of the tagged commit produced, not
-# rebuilt or repacked. A tag whose commit has no successful build is an error.
+# Attach the module zip to a release. It is the zip the pipeline of the tagged commit built and
+# tested, not rebuilt or repacked. A tag whose commit has no successful full pipeline is an error.
 on:
   release:
     types: [published]
@@ -37,11 +37,11 @@ jobs:
           set -euo pipefail
           sha="$(gh api "repos/$REPO/commits/$TAG" --jq .sha)"
           # Push runs only, a pull request run builds a merge commit, not the tagged one.
-          run="$(gh run list --repo "$REPO" --workflow susfs-build.yml --event push --commit "$sha" \
+          run="$(gh run list --repo "$REPO" --workflow susfs-pipeline.yml --event push --commit "$sha" \
                    --limit 50 --json databaseId,conclusion \
                    --jq '[.[] | select(.conclusion == "success")][0].databaseId')"
           if [ -z "$run" ] || [ "$run" = "null" ]; then
-            echo "::error::no successful susfs-build.yml run for $TAG ($sha)"
+            echo "::error::no successful susfs-pipeline.yml push run for $TAG ($sha)"
             exit 1
           fi
           echo "run=$run" >> "$GITHUB_OUTPUT"

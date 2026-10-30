@@ -1,32 +1,28 @@
 name: susfs-triage
-run-name: "susfs-triage: ${{ format('build #{0} on {1}', github.event.workflow_run.run_number, github.event.workflow_run.head_branch) }}"
 
 # Collect what is needed to debug a failed build in one artifact: the failed steps, their log
 # and the patch and pack rejects. Nothing is checked out or executed from the run, the values
 # below are only written to files.
 #
-# The workflow name below must match .susfs-fork/gen_build.py.
+# susfs-pipeline.yml calls this when its build fails, so the run is the caller's own.
 on:
-  workflow_run:
-    workflows: [build-lkm-susfs]
-    types: [completed]
+  workflow_call:
 
 permissions:
   actions: read
 
 jobs:
   triage:
-    if: contains(fromJSON('["failure", "timed_out"]'), github.event.workflow_run.conclusion)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      RUN_ID: ${{ github.event.workflow_run.id }}
-      RUN_URL: ${{ github.event.workflow_run.html_url }}
-      SHA: ${{ github.event.workflow_run.head_sha }}
-      BRANCH: ${{ github.event.workflow_run.head_branch }}
-      EVENT: ${{ github.event.workflow_run.event }}
+      RUN_ID: ${{ github.run_id }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      SHA: ${{ github.sha }}
+      BRANCH: ${{ github.head_ref || github.ref_name }}
+      EVENT: ${{ github.event_name }}
     steps:
       - name: Collect the failure
         run: |
@@ -48,14 +44,18 @@ jobs:
                    | .steps[] | select(.conclusion | IN("failure", "timed_out", "cancelled"))
                    | "- \($job): \(.name)"' "$dir/jobs.ndjson"
           } > "$dir/summary.md"
-          # The rest is best effort, a missing log must not lose the summary.
-          gh run view "$RUN_ID" --log-failed > "$dir/failed.log" 2>&1 || true
+          # The rest is best effort, a missing log must not lose the summary. gh run view
+          # --log-failed waits for the run to finish, so the failed jobs' logs are fetched one by one.
+          jq -r 'select(.conclusion | IN("failure", "timed_out")) | .id' "$dir/jobs.ndjson" |
+          while read -r job; do
+            gh api "repos/$GH_REPO/actions/jobs/$job/logs" >> "$dir/failed.log" 2>&1 || true
+          done
           gh run download "$RUN_ID" --pattern 'patch-rejects-*' --dir "$dir/patch-rejects" || true
           gh run download "$RUN_ID" --pattern 'pack-rejects' --dir "$dir/pack-rejects" || true
 
       - name: Upload the bundle
         uses: actions/upload-artifact@v7
         with:
-          name: triage-${{ github.event.workflow_run.id }}
+          name: triage-${{ github.run_id }}
           path: ${{ runner.temp }}/triage
           retention-days: 14

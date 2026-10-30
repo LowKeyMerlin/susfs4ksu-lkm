@@ -5,18 +5,7 @@ name: build-lkm-susfs
 run-name: "build-lkm-susfs: ${{ inputs.title || (github.event_name == 'pull_request' && format('PR #{0} {1}', github.event.pull_request.number, github.event.pull_request.title)) || format('{0} on {1}', github.event_name, github.ref_name) }}"
 
 on:
-  # Documentation-only pushes have nothing to compile.
-  push:
-    branches:
-      - susfs
-    paths-ignore:
-      - "**.md"
-  # Pull requests into susfs build the same way. This file references no secret.
-  pull_request:
-    branches:
-      - susfs
-    paths-ignore:
-      - "**.md"
+  workflow_call:
   workflow_dispatch:
     inputs:
       title:
@@ -28,10 +17,6 @@ on:
 # actions analysis flagged the missing block twice as actions/missing-workflow-permissions.
 permissions:
   contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   # One .ko per GKI (kernel version × Android release) combination that exists.  A module is NOT portable across these
