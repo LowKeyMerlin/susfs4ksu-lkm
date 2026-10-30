@@ -1,0 +1,58 @@
+name: susfs-ksud
+run-name: "susfs-ksud: ${{ inputs.title || (github.event_name == 'schedule' && 'scheduled') || 'manual' }}"
+
+# Read the ksud of every fork in .susfs-fork/ksud_forks.json and keep one open issue listing the
+# forks that no longer run a module as expected: the disable and remove files, the <stage>.sh
+# names and the post-fs-data and service stages. The bootloop guard disables the module through
+# the disable file, so a fork that ignores it leaves the guard useless. The issue closes when
+# every fork matches again. Reports only, never fails a build. A fork that cannot be fetched
+# fails this run instead.
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+    inputs:
+      title:
+        description: Name for this run in the workflow list, a default is used when empty
+        required: false
+
+concurrency:
+  group: susfs-ksud
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  ksud:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read the forks
+        run: python3 .susfs-fork/ksud_contract.py > "$RUNNER_TEMP/ksud.md"
+
+      - name: Update the issue
+        run: |
+          set -euo pipefail
+          label=susfs-ksud
+          title="A KernelSU fork runs modules differently"
+          gh label create "$label" --description "A KernelSU fork no longer matches what the module relies on" --force
+          num="$(gh issue list --label "$label" --state open --json number --jq '.[0].number // empty')"
+          if [ -s "$RUNNER_TEMP/ksud.md" ]; then
+            { echo "The forks below no longer match what the module relies on in ksud. The bootloop"
+              echo "guard and the boot scripts may not work there until this is looked at."
+              echo
+              cat "$RUNNER_TEMP/ksud.md"; } > "$RUNNER_TEMP/body.md"
+            if [ -n "$num" ]; then
+              gh issue edit "$num" --body-file "$RUNNER_TEMP/body.md"
+            else
+              gh issue create --title "$title" --label "$label" --body-file "$RUNNER_TEMP/body.md"
+            fi
+          elif [ -n "$num" ]; then
+            gh issue close "$num" --comment "Every listed fork matches again."
+          fi

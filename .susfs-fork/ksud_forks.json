@@ -1,0 +1,8 @@
+[
+  {"name": "KernelSU", "repo": "https://github.com/tiann/KernelSU.git"},
+  {"name": "SukiSU-Ultra", "repo": "https://github.com/SukiSU-Ultra/SukiSU-Ultra.git"},
+  {"name": "BakaSU", "repo": "https://github.com/Baka-SU/BakaSU.git"},
+  {"name": "KernelSU-Next", "repo": "https://github.com/KernelSU-Next/KernelSU-Next.git"},
+  {"name": "rsuntk", "repo": "https://github.com/rsuntk/KernelSU.git", "lkm": false},
+  {"name": "backslashxx", "repo": "https://github.com/backslashxx/KernelSU.git"}
+]
