@@ -251,6 +251,30 @@ static int (*pfn_ida_alloc_range)(struct ida *ida, unsigned int min,
 static void (*pfn_ida_free)(struct ida *ida, unsigned int id);
 #endif
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+/* The kernel's 6.12+ unique mount-id counter (static atomic64_t mnt_id_ctr in fs/namespace.c),
+ * read but never incremented so a marked mount can be given a plausible mnt_id_unique.  Resolved
+ * from kallsyms (GKI enables CONFIG_KALLSYMS_ALL) and optional: without it the unique id is left as
+ * the kernel assigned it.  sus_mount_sus_id_ctr is our own monotonic offset, the analogue of
+ * upstream's sus_mnt_id_ctr (commit 7d91da2). */
+static atomic64_t *sus_mount_mnt_id_ctr;
+static atomic64_t sus_mount_sus_id_ctr = ATOMIC64_INIT(0);
+
+/* Craft a plausible mnt_id_unique for a mount we just marked.  Upstream (7d91da2) does the same in
+ * its mount allocators: read the live counter and add our own monotonically, so the marked mount's
+ * unique id sits in the live range with no gap a detector can threshold on.  Reading (not
+ * incrementing) mnt_id_ctr is deliberate - the next few legitimate mounts may share the same unique
+ * id, which upstream accepts and which does no harm while the mount is hidden or umounted for the
+ * target.  Only the 64-bit unique id is touched; the 32-bit mnt_id stays the real KSU-range id. */
+static void sus_mount_craft_unique(struct mount *r)
+{
+    if (!sus_mount_mnt_id_ctr)
+        return;
+    r->mnt_id_unique = atomic64_read(sus_mount_mnt_id_ctr) +
+                       atomic64_inc_return(&sus_mount_sus_id_ctr);
+}
+#endif
+
 static bool sus_mount_ida_ready(void)
 {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
@@ -2314,6 +2338,11 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long 
         if (n_replaced < (int)ARRAY_SIZE(replaced))
             replaced[n_replaced++] = r->mnt_id;
         r->mnt_id = new_id;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+        /* 6.12+ also exposes a unique 64-bit id (statx STATX_MNT_ID_UNIQUE, listmount, statmount);
+         * craft it so the marked mount leaves no gap in that series either. */
+        sus_mount_craft_unique(r);
+#endif
         /* After the id is replaced, exactly like upstream: the climb starts at a
          * mount that now carries a KSU-range id and stops at the first ancestor
          * that does not - i.e. the id mountinfo still prints for the host. */
@@ -2492,6 +2521,9 @@ int susfs_sus_mount_init(void)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
     sus_mount_namespace_sem = (struct rw_semaphore *)find_kernel_symbol_exact("namespace_sem");
     pfn_put_mnt_ns = (void *)find_kernel_symbol_exact("put_mnt_ns");
+    sus_mount_mnt_id_ctr = (atomic64_t *)find_kernel_symbol_exact("mnt_id_ctr");
+    if (!sus_mount_mnt_id_ctr)
+        pr_warn("sus_mount: mnt_id_ctr not resolved - mnt_id_unique of marked mounts keeps its gap, detectable on 6.12+ unless the mounts are hidden or umounted for the target\n");
 #endif
 
     err = security_secctx_to_secid(param_su_ctx, strlen(param_su_ctx), &su_sid);
