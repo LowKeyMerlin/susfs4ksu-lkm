@@ -1,0 +1,81 @@
+name: susfs-pins
+run-name: "susfs-pins: ${{ inputs.title || (github.event_name == 'schedule' && 'scheduled') || 'manual' }}"
+
+# Look for newer ddk-min toolchain images than those in .susfs-fork/images.json. If there are any,
+# regenerate susfs-build.yml on the pins/images branch and open a pull request into susfs, whose
+# build checks the images before anyone merges. Nothing is merged here.
+#
+# SYNC_TOKEN needs contents, workflows and pull requests write access: pushing a workflow file
+# and starting the build from a pull request both require it.
+on:
+  schedule:
+    - cron: "37 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      title:
+        description: Name for this run in the workflow list, a default is used when empty
+        required: false
+
+# Shared with susfs-sync, both use the tip of susfs.
+concurrency:
+  group: susfs-branch
+
+permissions:
+  contents: read
+
+jobs:
+  pins:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+      BRANCH: pins/images
+    steps:
+      - name: Require the token
+        run: '[ -n "$GH_TOKEN" ] || { echo "::error::the SYNC_TOKEN secret is not set"; exit 1; }'
+
+      - uses: actions/checkout@v5
+        with:
+          ref: susfs
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Look for newer images
+        id: refresh
+        run: |
+          set -euo pipefail
+          python3 .susfs-fork/refresh_images.py | tee "$RUNNER_TEMP/moves.txt"
+          changed=true
+          if git diff --quiet -- .susfs-fork/images.json; then
+            changed=false
+          elif git rev-parse --quiet --verify "origin/$BRANCH" > /dev/null \
+              && git merge-base --is-ancestor origin/susfs "origin/$BRANCH" \
+              && git diff --quiet "origin/$BRANCH" -- .susfs-fork/images.json; then
+            echo "already proposed on $BRANCH"
+            changed=false
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+
+      - name: Propose the update
+        if: steps.refresh.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          python3 .susfs-fork/gen_build.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          git add .susfs-fork/images.json .github/workflows/susfs-build.yml
+          { echo "ci: update the toolchain images"; echo; cat "$RUNNER_TEMP/moves.txt"; } | git commit --quiet -F -
+          git push --force-with-lease origin "$BRANCH"
+          { echo "Newer ddk-min images for the build, from .susfs-fork/refresh_images.py."
+            echo
+            cat "$RUNNER_TEMP/moves.txt"
+            echo
+            echo "The build of this pull request runs on them. Merge it when that is green."; } > "$RUNNER_TEMP/body.md"
+          num="$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$num" ]; then
+            gh pr edit "$num" --body-file "$RUNNER_TEMP/body.md"
+          else
+            gh pr create --base susfs --head "$BRANCH" --title "ci: update the toolchain images" \
+              --body-file "$RUNNER_TEMP/body.md"
+          fi

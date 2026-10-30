@@ -1,0 +1,96 @@
+name: susfs-sync
+run-name: "susfs-sync: ${{ inputs.title || (github.event_name == 'schedule' && 'scheduled') || 'manual' }}"
+
+# Keep main identical to the parent repository, rebase susfs onto it and regenerate
+# susfs-build.yml from the build workflow it brought in.
+#
+# susfs only adds files, so the rebase has nothing to conflict with. On a conflict, or if the
+# generator no longer fits upstream's workflow, the job fails and uploads the sync-triage artifact.
+#
+# SYNC_TOKEN is a personal access token with contents and workflows write access to this
+# repository. GITHUB_TOKEN cannot push upstream workflow changes and its pushes do not start the
+# build that follows a rebase.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      title:
+        description: Name for this run in the workflow list, a default is used when empty
+        required: false
+
+# Shared with susfs-pins, both rewrite susfs.
+concurrency:
+  group: susfs-branch
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+    steps:
+      - name: Require the token
+        run: '[ -n "$GH_TOKEN" ] || { echo "::error::the SYNC_TOKEN secret is not set"; exit 1; }'
+
+      - uses: actions/checkout@v5
+        with:
+          ref: susfs
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Mirror upstream into main
+        run: |
+          set -euo pipefail
+          parent="$(gh api "repos/$GITHUB_REPOSITORY" --jq .parent.full_name)"
+          git remote add upstream "https://github.com/$parent.git"
+          # The parent is only read. Everything is pushed to this repository.
+          git fetch upstream main
+          # Fast-forward only, a rewritten upstream history stops here.
+          git push origin upstream/main:refs/heads/main
+
+      - name: Rebase susfs and regenerate the build
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rebase origin/main
+          # A failed regeneration still pushes the plain rebase, then fails the job.
+          rc=0
+          sh .susfs-fork/regen.sh 2>&1 | tee "$RUNNER_TEMP/regen.log" || rc=$?
+          # The module guard needs upstream's scripts to keep their shape. Better to find out now.
+          python3 .susfs-fork/pack_extra.py --check --rejects "$RUNNER_TEMP/triage/pack-rejects" 2>&1 |
+            tee -a "$RUNNER_TEMP/regen.log" || rc=$?
+          # Rebasing and folding commit as the bot. Use each commit's author as committer and keep the
+          # date, so a commit that needs no change keeps its hash.
+          git rebase --quiet --exec 'GIT_COMMITTER_NAME="$(git log -1 --format=%an)" GIT_COMMITTER_EMAIL="$(git log -1 --format=%ae)" GIT_COMMITTER_DATE="$(git log -1 --format=%cI)" git commit --quiet --amend --no-edit' origin/main
+          git push --force-with-lease origin susfs
+          exit "$rc"
+
+      - name: Collect the state of the failure
+        if: failure() && hashFiles('.susfs-fork/gen_build.py') != ''
+        run: |
+          dir="$RUNNER_TEMP/triage"
+          mkdir -p "$dir"
+          {
+            echo "main:   $(git rev-parse origin/main)"
+            echo "susfs:  $(git rev-parse origin/susfs)"
+            echo
+            git status
+            echo
+            git log --oneline origin/main..origin/susfs
+          } > "$dir/state.txt" 2>&1 || true
+          git diff > "$dir/conflicts.diff" || true
+          cp "$RUNNER_TEMP/regen.log" "$dir/" || true
+          cp .github/workflows/build-ddk.yml .susfs-fork/images.json "$dir/" || true
+
+      - name: Upload the state of the failure
+        if: failure() && hashFiles('.susfs-fork/gen_build.py') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: sync-triage
+          path: ${{ runner.temp }}/triage
+          if-no-files-found: ignore
