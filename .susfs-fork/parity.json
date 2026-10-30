@@ -18,7 +18,7 @@
     {"upstream": "kernel/kallsyms.c susfs_starts_with", "ours": "susfs_hide_syms.c", "status": "implemented", "evidence": "tested"},
     {"upstream": "fs/readdir.c susfs_is_inode_sus_path", "ours": "sus_dirent.c", "status": "implemented", "evidence": "static"},
     {"upstream": "fs/readdir.c susfs_get_data_path (gki-android12-5.10 only)", "ours": "sus_dirent.c (FUSE superblock handling)", "status": "lkm-different", "evidence": "static"},
-    {"upstream": "fs/namei.c susfs_is_inode_sus_path", "ours": "sus_path.c, susfs_create_gate.c, susfs_opath.c", "status": "lkm-different", "evidence": "static"},
+    {"upstream": "fs/namei.c susfs_is_inode_sus_path", "ours": "sus_path.c, susfs_opath.c", "status": "lkm-different", "evidence": "static"},
     {"upstream": "fs/namei.c susfs_open_redirect_spoof_do_sys_openat", "ours": "susfs_or_entry.c, susfs_open_redirect.c", "status": "lkm-different", "evidence": "static"},
     {"upstream": "fs/namei.c SUSFS_IS_INODE_OPEN_REDIRECT, SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK", "ours": "susfs_open_redirect.c", "status": "lkm-different", "evidence": "static"},
     {"upstream": "fs/namei.c susfs_open_redirect_spoof_vfs_readlink", "ours": "susfs_open_redirect.c (d_path reverse face)", "status": "lkm-different", "evidence": "static"},

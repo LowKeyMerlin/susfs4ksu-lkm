@@ -267,11 +267,6 @@ static inline bool susfs_open_redirect_active(void)
 int susfs_or_entry_init(void);
 void susfs_or_entry_exit(void);
 
-/* The create family's entry layer (susfs_create_gate.c): answers EACCES for a hidden name
- * where filename_create() would have answered EEXIST before any LSM hook could run. */
-int susfs_create_gate_init(void);
-void susfs_create_gate_exit(void);
-
 /* Leave a function a kprobe pre_handler has taken over as if it had returned, by resuming at its caller.  The probed
  * functions are mostly entered through an indirect call, and the BTYPE that call left in the saved PSTATE makes the
  * first instruction back in the caller trap on a BTI kernel.  arm64_skip_faulting_instruction() clears it for the

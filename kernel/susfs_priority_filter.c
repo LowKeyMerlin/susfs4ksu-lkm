@@ -315,7 +315,7 @@ static bool prio_hides(unsigned int who)
 }
 
 /* __nocfi noinline: the call through orig is an indirect call into the kernel, which the build's
- * CFI call-site gate refuses if instrumented, see susfs_create_gate.c. */
+ * CFI call-site gate refuses if instrumented, see tools/cfi_sites.py. */
 static __nocfi noinline long prio_dispatch(const struct pt_regs *regs, susfs_syscall_fn_t orig,
 					   int user_which)
 {
