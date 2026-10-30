@@ -2,7 +2,7 @@ name: susfs-pins
 run-name: "susfs-pins: ${{ inputs.title || (github.event_name == 'schedule' && 'scheduled') || 'manual' }}"
 
 # Look for newer ddk-min toolchain images than those in .susfs-fork/images.json. If there are any,
-# regenerate susfs-build.yml on the pins/images branch and open a pull request into susfs, whose
+# regenerate susfs-build.yml on the pins/images branch and open a pull request into susfs-main, whose
 # build checks the images before anyone merges. Nothing is merged here.
 #
 # SYNC_TOKEN needs contents, workflows and pull requests write access: pushing a workflow file
@@ -36,7 +36,7 @@ jobs:
 
       - uses: actions/checkout@v5
         with:
-          ref: susfs
+          ref: susfs-main
           fetch-depth: 0
           token: ${{ secrets.SYNC_TOKEN }}
 
@@ -76,6 +76,6 @@ jobs:
           if [ -n "$num" ]; then
             gh pr edit "$num" --body-file "$RUNNER_TEMP/body.md"
           else
-            gh pr create --base susfs --head "$BRANCH" --title "ci: update the toolchain images" \
+            gh pr create --base susfs-main --head "$BRANCH" --title "ci: update the toolchain images" \
               --body-file "$RUNNER_TEMP/body.md"
           fi

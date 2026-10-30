@@ -1,16 +1,18 @@
 name: susfs-guard
 run-name: "susfs-guard: ${{ inputs.title || (github.event_name == 'pull_request' && format('PR #{0} {1}', github.event.pull_request.number, github.event.pull_request.title)) || format('{0} on {1}', github.event_name, github.ref_name) }}"
 
-# The susfs branch may only add files. Editing or deleting an upstream file here would make
-# syncing conflict. susfs-build.yml must match what the generator produces from this tree, and the
+# susfs-main may only add files. Editing or deleting an upstream file there would make syncing
+# conflict. susfs-dev may edit kernel/, so it skips that check. susfs-build.yml must match what the generator produces from this tree, and the
 # bootloop guard must pass its host test.
 on:
   push:
     branches:
-      - susfs
+      - susfs-main
+      - susfs-dev
   pull_request:
     branches:
-      - susfs
+      - susfs-main
+      - susfs-dev
   workflow_dispatch:
     inputs:
       title:
@@ -22,6 +24,7 @@ permissions:
 
 jobs:
   additive-only:
+    if: (github.base_ref || github.ref_name) != 'susfs-dev'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -33,7 +36,7 @@ jobs:
         run: |
           changed="$(git diff --no-renames --name-only --diff-filter=MDT origin/main...HEAD)"
           if [ -n "$changed" ]; then
-            echo "::error::susfs must only add files, these files from main are changed:"
+            echo "::error::susfs-main must only add files, these files from main are changed:"
             echo "$changed"
             exit 1
           fi

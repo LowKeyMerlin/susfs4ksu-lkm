@@ -13,7 +13,7 @@ them.
 | `test/<item>` | No | Throwaway, one change under test | The author, deleted after the squash |
 
 `susfs-main` keeps upstream conflicts at zero: it never edits a file the parent owns, so a sync
-cannot conflict in the tree and a patch that stops applying fails the build with the rejects
+cannot conflict in the tree and a patch that stops applying fails the sync and the build with the rejects
 attached. `susfs-dev` is the place for work that should not wait for upstream or be written as a
 patch. It is not synced. An upstream change that dev wants is cherry-picked by hand, and a dev
 change that `susfs-main` wants is rewritten as a patch.
@@ -23,7 +23,8 @@ change that `susfs-main` wants is rewritten as a patch.
 | | `main` | `susfs-main` | `susfs-dev` |
 | --- | --- | --- | --- |
 | Edit upstream files | no | no, patches only | yes |
-| `susfs-guard` (add files only) | no | runs | does not run |
+| `susfs-guard`, add-files-only check | no | runs | skipped |
+| `susfs-guard`, build and guard tests | no | runs | runs |
 | `gen_build.py` check | no | runs | runs |
 | Scheduled sync, drift, pins | sync only | yes | no |
 

@@ -1,10 +1,10 @@
 name: susfs-sync
 run-name: "susfs-sync: ${{ inputs.title || (github.event_name == 'schedule' && 'scheduled') || 'manual' }}"
 
-# Keep main identical to the parent repository, rebase susfs onto it and regenerate
+# Keep main identical to the parent repository, rebase susfs-main onto it and regenerate
 # susfs-build.yml from the build workflow it brought in.
 #
-# susfs only adds files, so the rebase has nothing to conflict with. On a conflict, or if the
+# susfs-main only adds files, so the rebase has nothing to conflict with. On a conflict, or if the
 # generator no longer fits upstream's workflow, the job fails and uploads the sync-triage artifact.
 #
 # SYNC_TOKEN is a personal access token with contents and workflows write access to this
@@ -19,7 +19,7 @@ on:
         description: Name for this run in the workflow list, a default is used when empty
         required: false
 
-# Shared with susfs-pins, both rewrite susfs.
+# Shared with susfs-pins, both rewrite susfs-main. susfs-dev is not synced.
 concurrency:
   group: susfs-branch
 
@@ -38,7 +38,7 @@ jobs:
 
       - uses: actions/checkout@v5
         with:
-          ref: susfs
+          ref: susfs-main
           fetch-depth: 0
           token: ${{ secrets.SYNC_TOKEN }}
 
@@ -52,7 +52,7 @@ jobs:
           # Fast-forward only, a rewritten upstream history stops here.
           git push origin upstream/main:refs/heads/main
 
-      - name: Rebase susfs and regenerate the build
+      - name: Rebase susfs-main and regenerate the build
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -64,10 +64,14 @@ jobs:
           # The module guard needs upstream's scripts to keep their shape. Better to find out now.
           python3 .susfs-fork/pack_extra.py --check --rejects "$RUNNER_TEMP/triage/pack-rejects" 2>&1 |
             tee -a "$RUNNER_TEMP/regen.log" || rc=$?
+          # A patch that upstream now carries itself stops applying. Find out now, not at the next build.
+          git worktree add --quiet --detach "$RUNNER_TEMP/patchcheck"
+          (cd "$RUNNER_TEMP/patchcheck" && sh .susfs-fork/apply_patches.sh) 2>&1 | tee -a "$RUNNER_TEMP/regen.log" || rc=$?
+          git worktree remove --force "$RUNNER_TEMP/patchcheck"
           # Rebasing and folding commit as the bot. Use each commit's author as committer and keep the
           # date, so a commit that needs no change keeps its hash.
           git rebase --quiet --exec 'GIT_COMMITTER_NAME="$(git log -1 --format=%an)" GIT_COMMITTER_EMAIL="$(git log -1 --format=%ae)" GIT_COMMITTER_DATE="$(git log -1 --format=%cI)" git commit --quiet --amend --no-edit' origin/main
-          git push --force-with-lease origin susfs
+          git push --force-with-lease origin susfs-main
           exit "$rc"
 
       - name: Collect the state of the failure
@@ -77,11 +81,11 @@ jobs:
           mkdir -p "$dir"
           {
             echo "main:   $(git rev-parse origin/main)"
-            echo "susfs:  $(git rev-parse origin/susfs)"
+            echo "susfs-main: $(git rev-parse origin/susfs-main)"
             echo
             git status
             echo
-            git log --oneline origin/main..origin/susfs
+            git log --oneline origin/main..origin/susfs-main
           } > "$dir/state.txt" 2>&1 || true
           git diff > "$dir/conflicts.diff" || true
           cp "$RUNNER_TEMP/regen.log" "$dir/" || true

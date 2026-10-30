@@ -1,6 +1,6 @@
 # SUSFS for KernelSU (LKM Edition)
 
-[![pipeline](https://github.com/LowKeyMerlin/susfs4ksu-lkm/actions/workflows/susfs-pipeline.yml/badge.svg?branch=susfs)](https://github.com/LowKeyMerlin/susfs4ksu-lkm/actions/workflows/susfs-pipeline.yml)
+[![pipeline](https://github.com/LowKeyMerlin/susfs4ksu-lkm/actions/workflows/susfs-pipeline.yml/badge.svg?branch=susfs-main)](https://github.com/LowKeyMerlin/susfs4ksu-lkm/actions/workflows/susfs-pipeline.yml)
 [![license](https://img.shields.io/badge/license-GPL--2.0-blue)](../LICENSE)
 
 [SUSFS](https://gitlab.com/simonpunk/susfs4ksu) as a loadable kernel module. It loads into the
@@ -125,13 +125,13 @@ does not have to be GKI supported, and the kernel does not need SUSFS patches.
 
 ## Development
 
-`main` mirrors the parent repository and is never edited. `susfs` only adds files, so syncing the
+`main` mirrors the parent repository and is never edited. `susfs-main` only adds files, so syncing the
 parent cannot conflict.
 
 * Added code and tests are in `.susfs-fork/`.
 * Changes to files the parent owns are numbered patches in `.susfs-fork/patches/`.
-* Workflows are named `susfs-*`. `susfs-sync` mirrors the parent every night and rebases `susfs`.
-* New work is tried on a `test/<item>` branch, then squashed onto `susfs`. A push there runs the
+* Workflows are named `susfs-*`. `susfs-sync` mirrors the parent every night and rebases `susfs-main`.
+* New work is tried on a `test/<item>` branch, then squashed onto `susfs-main` or `susfs-dev`. A push there runs the
   build and the QEMU smoke. `gh workflow run susfs-pipeline.yml --ref test/<item> -f full=true`
   adds the KernelSU forks and the Android guest. Which stages a branch runs is set in its
   `.susfs-fork/flow.json`.
