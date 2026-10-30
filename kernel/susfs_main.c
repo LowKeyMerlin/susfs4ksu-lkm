@@ -415,6 +415,31 @@ static int susfs_load_layer(int id, bool fatal)
     return 0;
 }
 
+/* A susfs-enabled KernelSU fork compiles susfs into the kernel image.  A built-in susfs and this
+ * module would both own the SUSFS_MAGIC reboot command and both publish the /proc/susfs_* nodes, so
+ * the two must never run together.  A built-in susfs defines its fs/susfs.c entry points as vmlinux
+ * symbols; this module's own functions are module-owned and find_kernel_symbol_exact() refuses
+ * those, so a hit here means a built-in susfs and nothing else.  Checked once, at load, before any
+ * layer arms. */
+static bool susfs_builtin_present(void)
+{
+    static const char *const markers[] = {
+        "susfs_update_sus_kstat",
+        "susfs_add_sus_path",
+        "susfs_spoof_uname",
+    };
+    int i;
+
+    for (i = 0; i < (int)ARRAY_SIZE(markers); i++) {
+        if (find_kernel_symbol_exact(markers[i])) {
+            pr_warn("susfs_guard_lkm: built-in susfs detected (%s is in the kernel image) - refusing to load so the two do not both own SUSFS_MAGIC or /proc/susfs_*\n",
+                    markers[i]);
+            return true;
+        }
+    }
+    return false;
+}
+
 static int __init susfs_init(void)
 {
     int i;
@@ -432,6 +457,12 @@ static int __init susfs_init(void)
     /* Now that kallsyms lookups work, check the addresses themselves: see imports_guard.c. */
     if (susfs_imports_crosscheck())
         return -EINVAL;
+
+    /* A built-in susfs (a susfs-enabled KernelSU) and this module cannot coexist: both would own the
+     * SUSFS_MAGIC reboot command and the /proc/susfs_* nodes.  Detected here, before any layer arms,
+     * so the refusal leaves nothing behind. */
+    if (susfs_builtin_present())
+        return -EEXIST;
 
     /* Text/data patching needs a cache-flush helper whose name differs between kernels; resolve it
      * here, before any layer can patch.  Not fatal by itself, but below 6.12 sus_path is a fatal
