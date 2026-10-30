@@ -41,6 +41,7 @@
 #define CMD_SUSFS_SUS_SU                        0x60000 /* deprecated */
 #define CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING       0x60010
 #define CMD_SUSFS_ADD_SUS_MAP                   0x60020
+#define CMD_SUSFS_SET_PRIORITY_UID_FILTER       0x60030
 
 /* 126 is a USERSPACE-side sentinel the kernel never produces: the ksu_susfs C tool pre-seeds payload.err with it and
  * prints "SUSFS operation not supported, please enable it in kernel" when the field is STILL 126 after the syscall,
@@ -58,6 +59,14 @@
 #define SUSFS_ENABLED_FEATURES_SIZE             8192
 #define SUSFS_MAX_VERSION_BUFSIZE               16
 #define SUSFS_MAX_VARIANT_BUFSIZE               16
+
+/* The uids a getpriority uid filter can hide are the app uids of one user, and its payload is a
+ * comma separated list of package names (upstream susfs_def.h). */
+#define SUSFS_PRIORITY_UID_FILTER_MIN_UID       10000
+#define SUSFS_PRIORITY_UID_FILTER_MAX_UID       19999
+#define SUSFS_PRIORITY_UID_FILTER_UID_NUM \
+	(SUSFS_PRIORITY_UID_FILTER_MAX_UID - SUSFS_PRIORITY_UID_FILTER_MIN_UID + 1)
+#define SUSFS_APP_STR_BUF_SIZE                  65535
 
 #define SUSFS_VERSION_STR "v2.3.0"
 #define SUSFS_VARIANT_STR "GKI-LKM"
@@ -135,6 +144,11 @@ struct st_susfs_uname {
 
 struct st_susfs_log {
 	bool enabled;
+	int err;
+};
+
+struct st_susfs_priority_uid_filter {
+	char app_strings[SUSFS_APP_STR_BUF_SIZE];
 	int err;
 };
 
