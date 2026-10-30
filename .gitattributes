@@ -1,0 +1,4 @@
+# Check out our files with LF on every platform: shell scripts break with CRLF, which a Windows
+# checkout with core.autocrlf=true would add. Upstream files are not listed and keep their endings.
+.susfs-fork/** text eol=lf
+.github/workflows/susfs-*.yml text eol=lf

@@ -1,0 +1,229 @@
+name: susfs-smoke
+run-name: "susfs-smoke: ${{ inputs.title || (github.event_name == 'schedule' && 'scheduled') || (inputs.run && format('manual, build {0}', inputs.run)) || 'manual' }}"
+
+# Boot kernels in QEMU and run the module's scripts as KernelSU would: post-fs-data.sh loads the
+# .ko, the SUSFS probe must answer, the boot settles and a second load must not stack. The scripts
+# under test come from the zip the build produced, the ones in this repository only drive the VM.
+#
+# Every kernel of the zip is booted twice. The ddk kernel is the vmlinux of the image the .ko was
+# built in, so the ABI agrees. The gki kernel is Google's newest release build of the same KMI,
+# which is what a device runs and differs in patch level and build. Kernels and releases come from
+# the zip's provenance.json and Google's release tags, so a new kernel is tested without editing
+# this file.
+#
+# Every kernel must pass. A boot with no verdict is retried once, and a kernel that still cannot
+# be tried fails the run, since the module is not covered on it. Downloads are retried and
+# verified so the network does not decide the outcome. Google releases on its own schedule, hence
+# the weekly run against the newest releases.
+#
+# susfs-pipeline.yml calls this with the run of its build. A schedule or a dispatch without a run
+# tests the newest pipeline build of the default branch.
+on:
+  workflow_call:
+    inputs:
+      run:
+        description: Run whose module zip is tested
+        type: string
+        required: true
+  schedule:
+    - cron: "11 5 * * 2"
+  workflow_dispatch:
+    inputs:
+      title:
+        description: Name for this run in the workflow list, a default is used when empty
+        required: false
+      run:
+        description: Build run to test, the latest successful build when empty
+        required: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      run: ${{ steps.run.outputs.run }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Pick the build
+        id: run
+        env:
+          INPUT_RUN: ${{ inputs.run }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          run="$INPUT_RUN"
+          [ -n "$run" ] || run="$(gh run list --workflow susfs-pipeline.yml --branch "$BRANCH" --event push \
+            --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+          [ -n "$run" ] || { echo "::error::there is no successful build to test"; exit 1; }
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+      - name: Plan the kernels
+        id: matrix
+        env:
+          RUN: ${{ steps.run.outputs.run }}
+        run: |
+          set -euo pipefail
+          module="$RUNNER_TEMP/module"
+          smoke=.susfs-fork/smoke
+          bash $smoke/retry.sh gh run download "$RUN" --pattern 'ksu_susfs_lkm-module-*' --dir "$module"
+          ddk="$(python3 $smoke/plan.py "$module")"
+          mapfile -t kmis < <(jq -r '.include[].variant' <<< "$ddk")
+          bash $smoke/retry.sh python3 $smoke/gki_latest.py "${kmis[@]}" > "$RUNNER_TEMP/gki.json"
+          echo "matrix=$(python3 $smoke/plan.py "$module" "$RUNNER_TEMP/gki.json")" >> "$GITHUB_OUTPUT"
+
+  # The runner's package mirror sometimes stalls mid-download and apt waits for minutes. With one
+  # job per kernel that hit a quarter of them. The QEMU packages and the guest busybox are fetched
+  # once here, with a speed floor, a second mirror and a hash check, and passed to the kernel jobs
+  # as an artifact to install from disk.
+  #
+  # The packages are the ones this image lacks, so the kernel jobs must use the same image.
+  # ubuntu-latest moves to a new release over several weeks and two jobs of one run can land on
+  # different ones, so the release label is pinned here and in the smoke job. Move both together.
+  tools:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download QEMU and busybox, build the probes
+        run: |
+          set -euo pipefail
+          bash .susfs-fork/smoke/qemu_debs.sh "$RUNNER_TEMP/tools/debs"
+          bash .susfs-fork/smoke/busybox.sh "$RUNNER_TEMP/tools/busybox"
+          bash .susfs-fork/smoke/probes.sh "$RUNNER_TEMP/tools/probes"
+
+      - name: Hand them to the kernel jobs
+        uses: actions/upload-artifact@v7
+        with:
+          name: vm-tools-smoke
+          path: ${{ runner.temp }}/tools
+          retention-days: 1
+          if-no-files-found: error
+
+  smoke:
+    name: smoke (${{ matrix.key }})
+    needs: [plan, tools]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RUN: ${{ needs.plan.outputs.run }}
+      KEY: ${{ matrix.key }}
+      VARIANT: ${{ matrix.variant }}
+      SOURCE: ${{ matrix.source }}
+      KERNEL: ${{ matrix.kernel }}
+      RELEASE: ${{ matrix.ref }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Get the module zip of the build
+        run: |
+          set -euo pipefail
+          bash .susfs-fork/smoke/retry.sh gh run download "$RUN" \
+            --pattern 'ksu_susfs_lkm-module-*' --dir "$RUNNER_TEMP/download"
+          prov="$(find "$RUNNER_TEMP/download" -name provenance.json | head -n 1)"
+          echo "MODULE=$(dirname "$prov")" >> "$GITHUB_ENV"
+
+      - name: Get the kernel of the Google release
+        if: matrix.source == 'gki'
+        run: |
+          curl -fsSL --connect-timeout 10 --max-time 300 --speed-limit 50000 --speed-time 15 \
+            --retry 3 --retry-delay 10 --retry-all-errors -o "$RUNNER_TEMP/Image" "$KERNEL"
+
+      # dpkg, not apt: apt still re-downloads every package from the archive, which is the stall to
+      # avoid. The files are the full set the tools job found missing, so dpkg installs without the
+      # network and reports any dependency the runner image lacks.
+      - name: Install QEMU
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          bash .susfs-fork/smoke/retry.sh gh run download "$GITHUB_RUN_ID" --name vm-tools-smoke --dir "$RUNNER_TEMP/tools"
+          sudo DEBIAN_FRONTEND=noninteractive dpkg -i --skip-same-version "$RUNNER_TEMP"/tools/debs/*.deb
+          for tool in qemu-system-aarch64 cpio; do
+            command -v "$tool" > /dev/null || { echo "::error::$tool is missing after the install"; exit 1; }
+          done
+
+      # A boot with no verdict is retried once, usually a slow or stalled runner. A failed boot is not
+      # retried, the module did something wrong.
+      - name: Boot the kernel and judge the console
+        id: judge
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/out"
+          kernel="$KERNEL"
+          [ "$SOURCE" = ddk ] || kernel="$RUNNER_TEMP/Image"
+          for attempt in 1 2; do
+            bash .susfs-fork/smoke/boot.sh "$kernel" "$VARIANT" "$MODULE" "$out" "$RUNNER_TEMP/tools/busybox"
+            rc=0
+            python3 .susfs-fork/smoke/check.py "$out/console.log" --variant "$KEY" \
+              --qemu-rc "$(cat "$out/qemu.rc")" > "$out/report.md" || rc=$?
+            [ "$rc" = 3 ] || break
+            echo "::notice title=$KEY::no verdict on attempt $attempt"
+          done
+          case "$rc" in
+            0) verdict=pass ;;
+            1) verdict=fail ;;
+            3) verdict=inconclusive ;;
+            *) verdict=error ;;
+          esac
+          echo "$verdict" > "$out/verdict"
+          [ -z "$RELEASE" ] || echo "Kernel: Google release \`$RELEASE\`" >> "$GITHUB_STEP_SUMMARY"
+          cat "$out/report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the console and the verdict
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: smoke-${{ matrix.key }}
+          path: ${{ runner.temp }}/out
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Fail unless the kernel passed
+        if: always() && steps.judge.conclusion == 'success'
+        run: |
+          verdict="$(cat "$RUNNER_TEMP/out/verdict")"
+          [ "$verdict" = pass ] || { echo "::error::$KEY: $verdict, the console is in the smoke-$KEY artifact"; exit 1; }
+
+  # Every kernel job fails unless its verdict is pass, so the matrix result is the run's verdict.
+  # The verdict files only fill the table, a failed download here costs the table, not the result.
+  report:
+    needs: [plan, smoke]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      KEYS: ${{ join(fromJSON(needs.plan.outputs.matrix).include.*.key, ' ') }}
+      SMOKE_RESULT: ${{ needs.smoke.result }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Tabulate the verdicts and fail unless every kernel passed
+        run: |
+          set -euo pipefail
+          bash .susfs-fork/smoke/retry.sh gh run download "$GITHUB_RUN_ID" --pattern 'smoke-*' \
+            --dir "$RUNNER_TEMP/verdicts" || echo "::warning::the verdicts could not be downloaded, the table is incomplete"
+          {
+            echo "| kernel | verdict |"
+            echo "| --- | --- |"
+            for key in $KEYS; do
+              file="$(find "$RUNNER_TEMP/verdicts" -path "*/smoke-$key/verdict" 2> /dev/null | head -n 1)"
+              echo "| $key | $([ -n "$file" ] && cat "$file" || echo "no verdict") |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "$SMOKE_RESULT" = success ] || { echo "::error::not every kernel passed, the smoke job is $SMOKE_RESULT"; exit 1; }

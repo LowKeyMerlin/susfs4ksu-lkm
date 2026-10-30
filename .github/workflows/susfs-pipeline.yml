@@ -1,0 +1,148 @@
+name: susfs-pipeline
+run-name: "susfs-pipeline: ${{ inputs.title || (github.event_name == 'pull_request' && format('PR #{0} {1}', github.event.pull_request.number, github.event.pull_request.title)) || format('{0} on {1}{2}', github.event_name, github.ref_name, inputs.full && ', full' || '') }}"
+
+# Build the module, then test the zip of this run: QEMU smoke on every kernel, the KernelSU forks
+# and the Android guest. Every stage reads the artifacts of this run, so what is tested is what
+# was built, and the workflow files and test scripts are the ones of the pushed commit.
+#
+# The full pipeline runs for susfs-main, susfs-dev and pull requests into them. A test/ branch runs the build and the
+# smoke unless dispatched with full. The verdict job is the one check to require.
+on:
+  push:
+    branches:
+      - susfs-main
+      - susfs-dev
+      - "test/**"
+    paths-ignore:
+      - "**.md"
+  pull_request:
+    branches:
+      - susfs-main
+      - susfs-dev
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+    inputs:
+      title:
+        description: Name for this run in the workflow list, a default is used when empty
+        required: false
+      full:
+        description: Also run the KernelSU forks and the Android guest
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# A newer push to a test branch replaces its running pipeline. module branches and pull requests queue.
+concurrency:
+  group: susfs-pipeline-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/heads/test/') }}
+
+jobs:
+  # What this branch validates comes from its own .susfs-fork/flow.json, so the workflow files stay
+  # the same on every branch and only that file differs. A branch that drops a stage there skips
+  # it even in the full pipeline. The build needs no switch: apply_patches.sh does nothing without
+  # a patches directory.
+  flow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      smoke: ${{ steps.read.outputs.smoke }}
+      ksu: ${{ steps.read.outputs.ksu }}
+      android: ${{ steps.read.outputs.android }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: .susfs-fork/flow.json
+          sparse-checkout-cone-mode: false
+
+      - name: Read the flow of this branch
+        id: read
+        env:
+          FULL: ${{ github.event_name != 'workflow_dispatch' && !startsWith(github.ref, 'refs/heads/test/') || inputs.full }}
+        run: |
+          set -euo pipefail
+          f=.susfs-fork/flow.json
+          jq -e '.stages | type == "array" and all(IN("smoke", "ksu", "android"))
+                 and (index("android") == null or index("ksu") != null)' "$f" > /dev/null ||
+            { echo "::error::$f: stages must be a list of smoke, ksu and android, android needs ksu"; exit 1; }
+          on() { jq -e --arg s "$1" '.stages | index($s)' "$f" > /dev/null && echo true || echo false; }
+          smoke=$(on smoke)
+          ksu=false
+          [ "$FULL" != true ] || ksu=$(on ksu)
+          android=false
+          [ "$ksu" != true ] || android=$(on android)
+          printf 'smoke=%s\nksu=%s\nandroid=%s\n' "$smoke" "$ksu" "$android" | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    needs: flow
+    uses: ./.github/workflows/susfs-build.yml
+    permissions:
+      contents: read
+      # The packing job deletes the run's intermediate artifacts.
+      actions: write
+
+  triage:
+    needs: build
+    if: failure() && needs.build.result == 'failure'
+    uses: ./.github/workflows/susfs-triage.yml
+    permissions:
+      actions: read
+
+  smoke:
+    needs: [flow, build]
+    if: needs.flow.outputs.smoke == 'true'
+    uses: ./.github/workflows/susfs-smoke.yml
+    with:
+      run: ${{ github.run_id }}
+    permissions:
+      contents: read
+      actions: read
+
+  ksu:
+    needs: [flow, build]
+    if: needs.flow.outputs.ksu == 'true'
+    uses: ./.github/workflows/susfs-ksu.yml
+    with:
+      run: ${{ github.run_id }}
+    permissions:
+      contents: read
+      actions: read
+
+  # Uses the KernelSU modules the ksu stage built, so it only runs after it.
+  android:
+    needs: [flow, ksu]
+    if: needs.flow.outputs.android == 'true'
+    uses: ./.github/workflows/susfs-android.yml
+    with:
+      run: ${{ github.run_id }}
+    permissions:
+      contents: read
+      actions: read
+
+  verdict:
+    needs: [flow, build, smoke, ksu, android]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      FLOW: ${{ needs.flow.result }}
+      BUILD: ${{ needs.build.result }}
+      RESULTS: >-
+        smoke ${{ needs.flow.outputs.smoke }} ${{ needs.smoke.result }}
+        ksu ${{ needs.flow.outputs.ksu }} ${{ needs.ksu.result }}
+        android ${{ needs.flow.outputs.android }} ${{ needs.android.result }}
+    steps:
+      - name: Fail unless every stage that had to run passed
+        run: |
+          echo "flow=$FLOW build=$BUILD"
+          [ "$FLOW" = success ] && [ "$BUILD" = success ] || exit 1
+          set -- $RESULTS
+          bad=0
+          while [ $# -ge 3 ]; do
+            echo "$1: wanted=$2 result=$3"
+            [ "$2" != true ] || [ "$3" = success ] || bad=1
+            shift 3
+          done
+          exit $bad
