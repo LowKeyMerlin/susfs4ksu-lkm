@@ -10,7 +10,7 @@
  * Because nothing is pinned, the numbers are all that identify a rule's files: a filesystem may reuse an inode number
  * after a file is deleted, so every match also compares i_generation (the same field NFS export handles use; a
  * filesystem that does not maintain it reports 0, which is no worse than matching the number alone).  The rule table
- * is a fixed array of SUS_OR_MAX slots that ARE reused: deleting or replacing a rule retires its slot, and the slot is
+ * is an RCU-published table of slots that ARE reused: deleting or replacing a rule retires its slot, and the slot is
  * cleared and handed out again once a grace period has passed (or_reclaim_slot() - every reader copies what it needs
  * out of an entry under rcu_read_lock, which is what makes that safe).  susfs_open_redirect_rules counts live rules, so
  * the name layer stops paying a lookup once the last rule is gone.
@@ -48,6 +48,9 @@
 #include "mount.h"		/* fs/mount.h: real_mount() -> mnt_id */
 #include <linux/atomic.h>	/* reverse-disguise hit counters */
 #include <linux/rcupdate.h>	/* the entry hook's match runs under rcu_read_lock, like the probes */
+#include <linux/slab.h>		/* kvmalloc/kvfree/kvfree_rcu for the growable rule table */
+#include <linux/overflow.h>	/* struct_size() for the flex-array table */
+#include <linux/bitmap.h>	/* bitmap_zalloc/bitmap_free in or_clear_all() */
 #include <linux/statfs.h>	/* struct kstatfs: the snapshot the reverse statfs face answers from */
 #include <linux/mm.h>		/* struct vm_area_struct (the maps reverse face) */
 #include <linux/kdev_t.h>	/* MAJOR/MINOR, to render dev:ino the way proc does */
@@ -62,7 +65,8 @@
 #include "susfs_kprobe.h"
 #include "susfs_or_entry.h"	/* susfs_or_entry_armed(): the forward direction lives there now */
 
-#define SUS_OR_MAX 64
+/* Initial slot count; the table doubles from here when every slot is live (or_grow_locked). */
+#define SUS_OR_INIT_CAP 64
 /* The ABI fields are char[256]; matching that width stops a legal long path from being truncated into a rule for a
  * different path. */
 #define OR_PATH_MAX 256
@@ -139,13 +143,30 @@ struct sus_or_entry {
 	bool dead;
 };
 
-static struct sus_or_entry or_entries[SUS_OR_MAX];
-static int nor;		/* highest index ever handed out, plus one: the scan bound */
-/* Slots that were handed out and have been taken back (or_reclaim_slot()).  A slot returns here once
+/* RCU-published backing store, grown under or_lock when every slot is in use, so there is no
+ * fixed ceiling on simultaneous rules.  nor (the scan bound) lives inside the table: a lockless
+ * reader that dereferenced an older, smaller table reads that table's own bound and so cannot
+ * walk off its end.  Readers return pointers INTO the table and use them under rcu_read_lock, so
+ * growth frees the old table with kvfree_rcu after a grace period - the same discipline a
+ * reclaimed slot already follows. */
+struct sus_or_table {
+	struct rcu_head rcu;
+	int nor;	/* highest index ever handed out, plus one: the scan bound */
+	int cap;	/* immutable for this table's lifetime */
+	struct sus_or_entry e[];
+};
+static struct sus_or_table __rcu *or_tbl;
+/* Retired slot INDICES (not pointers), so the list survives a table swap; a slot returns here once
  * a grace period has passed, which is what turns the UPPER BOUND into "how many rules exist at the
- * same time" instead of "how many times a rule was ever added". */
-static unsigned int or_free[SUS_OR_MAX];
+ * same time" instead of "how many times a rule was ever added".  Writer-only under or_lock, grown
+ * alongside the table. */
+static unsigned int *or_free;
 static unsigned int or_free_n;
+static unsigned int or_free_cap;
+
+/* The current table under or_lock (writers) or rcu_read_lock (readers). */
+#define or_table_locked()	rcu_dereference_protected(or_tbl, lockdep_is_held(&or_lock))
+#define or_table_read()		rcu_dereference_check(or_tbl, lockdep_is_held(&or_lock))
 /* How many rules are live right now, which is what the name-layer hook reads before it resolves anything: the hook runs
  * for every open() on the system, so a table that once had a rule must not keep costing a path lookup after that rule
  * was deleted.  Written under or_lock, read locklessly (susfs.h states the contract). */
@@ -235,31 +256,33 @@ static bool or_uid_matches(int scheme)
 
 static struct sus_or_entry *or_find_by_path(const char *target)
 {
+	struct sus_or_table *t = or_table_read();
 	int i;
 
-	for (i = 0; i < READ_ONCE(nor); i++) {
-		if (READ_ONCE(or_entries[i].dead))
+	for (i = 0; i < READ_ONCE(t->nor); i++) {
+		if (READ_ONCE(t->e[i].dead))
 			continue;
-		if (!strcmp(or_entries[i].target_pathname, target))
-			return &or_entries[i];
+		if (!strcmp(t->e[i].target_pathname, target))
+			return &t->e[i];
 	}
 	return NULL;
 }
 
 static struct sus_or_entry *or_find_by_inode(unsigned long ino, dev_t dev, unsigned int gen)
 {
+	struct sus_or_table *t = or_table_read();
 	int i;
 
-	for (i = 0; i < READ_ONCE(nor); i++) {
+	for (i = 0; i < READ_ONCE(t->nor); i++) {
 		/* dead is cleared LAST by the writer, so skipping dead entries also skips any entry whose
 		 * fields are still being written. */
-		if (READ_ONCE(or_entries[i].dead))
+		if (READ_ONCE(t->e[i].dead))
 			continue;
 		smp_rmb();
-		if (or_entries[i].target_ino == ino &&
-		    or_entries[i].target_dev == dev &&
-		    or_entries[i].target_igen == gen)
-			return &or_entries[i];
+		if (t->e[i].target_ino == ino &&
+		    t->e[i].target_dev == dev &&
+		    t->e[i].target_igen == gen)
+			return &t->e[i];
 	}
 	return NULL;
 }
@@ -279,7 +302,7 @@ bool susfs_open_redirect_match_path(const struct path *path, char *buf, size_t b
 	struct sus_or_entry *e;
 	bool hit = false;
 
-	if (!READ_ONCE(nor) || !path->dentry)
+	if (!READ_ONCE(susfs_open_redirect_rules) || !path->dentry)
 		return false;
 	inode = d_inode(path->dentry);
 	if (!inode)
@@ -297,16 +320,17 @@ bool susfs_open_redirect_match_path(const struct path *path, char *buf, size_t b
 /* Reverse direction: keyed on the redirected (really opened) inode, published like or_find_by_inode(). */
 static struct sus_or_entry *or_find_by_redirected_inode(unsigned long ino, dev_t dev, unsigned int gen)
 {
+	struct sus_or_table *t = or_table_read();
 	int i;
 
-	for (i = 0; i < READ_ONCE(nor); i++) {
-		if (READ_ONCE(or_entries[i].dead))
+	for (i = 0; i < READ_ONCE(t->nor); i++) {
+		if (READ_ONCE(t->e[i].dead))
 			continue;
 		smp_rmb();
-		if (or_entries[i].redirected_ino == ino &&
-		    or_entries[i].redirected_dev == dev &&
-		    or_entries[i].redirected_igen == gen)
-			return &or_entries[i];
+		if (t->e[i].redirected_ino == ino &&
+		    t->e[i].redirected_dev == dev &&
+		    t->e[i].redirected_igen == gen)
+			return &t->e[i];
 	}
 	return NULL;
 }
@@ -320,6 +344,7 @@ bool susfs_open_redirect_spoof_ids(unsigned long ino, unsigned long *out_ino,
 				   unsigned long *out_mnt_id)
 {
 	struct sus_or_entry *e = NULL;
+	struct sus_or_table *t;
 	int i, hits = 0;
 	unsigned long tino = 0, tmnt = 0;
 
@@ -328,13 +353,14 @@ bool susfs_open_redirect_spoof_ids(unsigned long ino, unsigned long *out_ino,
 	/* The numbers are copied out inside the rcu section: rule slots are recycled after a grace
 	 * period (or_reclaim_slot()), so an entry may not be read after this function returns. */
 	rcu_read_lock();
-	for (i = 0; i < READ_ONCE(nor); i++) {
-		if (READ_ONCE(or_entries[i].dead))
+	t = or_table_read();
+	for (i = 0; i < READ_ONCE(t->nor); i++) {
+		if (READ_ONCE(t->e[i].dead))
 			continue;
 		smp_rmb();
-		if (or_entries[i].redirected_ino != ino)
+		if (t->e[i].redirected_ino != ino)
 			continue;
-		e = &or_entries[i];
+		e = &t->e[i];
 		if (++hits > 1)
 			break;
 	}
@@ -355,12 +381,13 @@ bool susfs_open_redirect_spoof_ids(unsigned long ino, unsigned long *out_ino,
  * belongs to the reverse entry of an existing rule, and replacing it would silently break that rule's disguise. */
 static bool or_is_redirected_path(const char *target)
 {
+	struct sus_or_table *t = or_table_read();
 	int i;
 
-	for (i = 0; i < READ_ONCE(nor); i++) {
-		if (READ_ONCE(or_entries[i].dead))
+	for (i = 0; i < READ_ONCE(t->nor); i++) {
+		if (READ_ONCE(t->e[i].dead))
 			continue;
-		if (!strcmp(or_entries[i].redirected_pathname, target))
+		if (!strcmp(t->e[i].redirected_pathname, target))
 			return true;
 	}
 	return false;
@@ -406,7 +433,7 @@ static int or_dpath_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	bool hit = false;
 
 	a->target[0] = '\0';
-	if (!READ_ONCE(nor) || IS_ERR_OR_NULL(path) || !path->dentry)
+	if (!READ_ONCE(susfs_open_redirect_rules) || IS_ERR_OR_NULL(path) || !path->dentry)
 		return 0;
 	if (!or_reverse_visible())
 		return 0;
@@ -473,7 +500,7 @@ static int or_statfs_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 	a->hit = false;
 	a->buf = NULL;
-	if (!READ_ONCE(nor) || IS_ERR_OR_NULL(path) || !path->dentry)
+	if (!READ_ONCE(susfs_open_redirect_rules) || IS_ERR_OR_NULL(path) || !path->dentry)
 		return 0;
 	if (!or_reverse_visible())
 		return 0;
@@ -960,18 +987,76 @@ static const struct proc_ops or_proc_ops = {
 
 static struct proc_dir_entry *or_proc_entry;
 
-int susfs_open_redirect_init(void)
+/* Allocate a table of `cap` slots, every one starting OUT of service.  A fresh slot would
+ * otherwise read as dead == false - i.e. as a complete rule - and a lockless reader scans up to
+ * `nor`, which grows before its slot is filled.  With the flag raised here, "never used" and
+ * "reclaimed" are the same state, or_add() publishes a slot by simply growing the bound, and no
+ * reader has to order its load of `nor` against its load of `dead` (arm64 may reorder those two
+ * loads, so a barrier in the writer would not have been enough - see the note in or_add()). */
+static struct sus_or_table *or_table_alloc(int cap)
 {
+	struct sus_or_table *t;
 	int i;
 
-	/* Every slot starts OUT of service.  The array is static, so a fresh slot would otherwise read
-	 * as dead == false - i.e. as a complete rule - and a lockless reader scans up to `nor`, which
-	 * grows before its slot is filled.  With the flag raised here, "never used" and "reclaimed" are
-	 * the same state, or_add() can publish a slot by simply growing the bound, and no reader has to
-	 * order its load of `nor` against its load of `dead` (arm64 may reorder those two loads, so a
-	 * barrier in the writer would not have been enough - see the note in or_add()). */
-	for (i = 0; i < SUS_OR_MAX; i++)
-		WRITE_ONCE(or_entries[i].dead, true);
+	t = kvmalloc(struct_size(t, e, cap), GFP_KERNEL);
+	if (!t)
+		return NULL;
+	t->nor = 0;
+	t->cap = cap;
+	for (i = 0; i < cap; i++)
+		t->e[i].dead = true;
+	return t;
+}
+
+/* Double the table and the free list.  Called with or_lock held, so GFP_KERNEL is fine.  The live
+ * prefix is copied (the rest stays dead from or_table_alloc), the new table is published with
+ * release and the old one freed after a grace period; a lockless reader on the old table finishes
+ * before then.  On OOM the old table stays in place and NULL is returned. */
+static struct sus_or_table *or_grow_locked(void)
+{
+	struct sus_or_table *old = or_table_locked();
+	struct sus_or_table *fresh;
+	unsigned int *free2;
+	int cap = old->cap * 2;
+
+	fresh = or_table_alloc(cap);
+	if (!fresh)
+		return NULL;
+	memcpy(fresh->e, old->e, old->nor * sizeof(old->e[0]));
+	fresh->nor = old->nor;
+
+	free2 = kvmalloc_array(cap, sizeof(*free2), GFP_KERNEL);
+	if (!free2) {
+		kvfree(fresh);
+		return NULL;
+	}
+	if (or_free_n)
+		memcpy(free2, or_free, or_free_n * sizeof(*or_free));
+	kvfree(or_free);
+	or_free = free2;
+	or_free_cap = cap;
+
+	rcu_assign_pointer(or_tbl, fresh);
+	kvfree_rcu(old, rcu);
+	return fresh;
+}
+
+int susfs_open_redirect_init(void)
+{
+	struct sus_or_table *t;
+
+	/* The backing table and the free list must exist before any rule is added or any reader runs. */
+	t = or_table_alloc(SUS_OR_INIT_CAP);
+	if (!t)
+		return -ENOMEM;
+	or_free = kvmalloc_array(SUS_OR_INIT_CAP, sizeof(*or_free), GFP_KERNEL);
+	if (!or_free) {
+		kvfree(t);
+		return -ENOMEM;
+	}
+	or_free_cap = SUS_OR_INIT_CAP;
+	or_free_n = 0;
+	rcu_assign_pointer(or_tbl, t);
 
 	or_cred_getsecid =
 		(void *)find_kernel_symbol_exact("security_cred_getsecid");
@@ -1001,14 +1086,13 @@ int susfs_open_redirect_init(void)
 		pr_warn("open_redirect: vfs_statfs not found - the reverse statfs face will report a zeroed snapshot\n");
 	susfs_or_entry_init();
 
-	SUSFS_LOGI("susfs_open_redirect: %d rules (forward %s, proc %d)\n", nor,
+	SUSFS_LOGI("susfs_open_redirect: %d rules (forward %s, proc %d)\n", t->nor,
 		susfs_or_entry_armed() ? "armed" : "unavailable", or_proc_entry != NULL);
 	return 0;
 }
 
 void susfs_open_redirect_exit(void)
 {
-	int i;
 
 	/* Stop being reachable from the syscall table first: the hook pointer is cleared before the
 	 * probes come down, so no entry that is still installed can call into this layer's exit. */
@@ -1030,35 +1114,47 @@ void susfs_open_redirect_exit(void)
 
 	/* Nothing can reach these any more: the probes are already gone.  There is nothing to release
 	 * either - an entry holds numbers, a kstatfs snapshot and two strings, and the paths it parsed
-	 * when it was added were dropped right there.  This used to walk the table path_put()ing each
-	 * entry's cached struct path. */
-	for (i = 0; i < READ_ONCE(nor); i++)
-		or_entries[i].dead = true;
-	nor = 0;
-	or_free_n = 0;		/* nothing is left to hand out: every slot is dead again */
+	 * when it was added were dropped right there.  Free the backing store; the probes are
+	 * unregistered and drained, so no reader can still hold a pointer into it, and a kernel-owned
+	 * kvfree_rcu needs no barrier (see the priority-filter note).  Tolerates a NULL table from a
+	 * failed load. */
 	WRITE_ONCE(susfs_open_redirect_rules, 0);	/* the count the name layer reads; hook is already gone */
+	{
+		struct sus_or_table *t = rcu_dereference_protected(or_tbl, true);
+
+		if (t) {
+			rcu_assign_pointer(or_tbl, NULL);
+			kvfree_rcu(t, rcu);
+		}
+	}
+	kvfree(or_free);
+	or_free = NULL;
+	or_free_n = 0;
+	or_free_cap = 0;
 }
 
 static int or_proc_show(struct seq_file *m, void *v)
 {
+	struct sus_or_table *t;
 	int i;
 
 	mutex_lock(&or_lock);
+	t = or_table_locked();
 	if (!susfs_open_redirect_rules) {
 		seq_puts(m, "(empty)\n");
 	} else {
-		for (i = 0; i < READ_ONCE(nor); i++) {
-			if (READ_ONCE(or_entries[i].dead))
+		for (i = 0; i < READ_ONCE(t->nor); i++) {
+			if (READ_ONCE(t->e[i].dead))
 				continue;
 			seq_printf(m, "%s -> %s uid=%d (ino=%lu dev=%lu mnt=%lu | rev: ino=%lu dev=%lu)\n",
-				   or_entries[i].target_pathname,
-				   or_entries[i].redirected_pathname,
-				   or_entries[i].uid_scheme,
-				   or_entries[i].target_ino,
-				   (unsigned long)or_entries[i].target_dev,
-				   or_entries[i].target_mnt_id,
-				   or_entries[i].redirected_ino,
-				   (unsigned long)or_entries[i].redirected_dev);
+				   t->e[i].target_pathname,
+				   t->e[i].redirected_pathname,
+				   t->e[i].uid_scheme,
+				   t->e[i].target_ino,
+				   (unsigned long)t->e[i].target_dev,
+				   t->e[i].target_mnt_id,
+				   t->e[i].redirected_ino,
+				   (unsigned long)t->e[i].redirected_dev);
 		}
 	}
 	/* "registered" is not "reached": a hook whose counter stays 0 across a real read means GKI inlined its call sites
@@ -1200,14 +1296,18 @@ static int or_add(const char *target, const char *redirected, int scheme)
 		return -EINVAL;
 	}
 
-	/* Capacity is checked before anything is retired, so a full table cannot silently kill the rule
-	 * that was working: the only way to fail here is a NEW rule with no free slot and no unused slot
-	 * left.  Rewriting an existing rule takes the slot the rewrite releases, so it never fails on
-	 * capacity - see the reclaim below. */
-	if (!e && !or_free_n && nor >= SUS_OR_MAX) {
-		path_put(&rp);
-		path_put(&tp);
-		return -ENOSPC;
+	/* Capacity is secured before anything is retired, so a failure leaves the table exactly as it
+	 * was.  A rewrite reclaims its own slot below, so only a NEW rule with every slot live needs a
+	 * bigger table; or_lock is held (a mutex), so that growth may sleep.  The only failure left is
+	 * OOM. */
+	{
+		struct sus_or_table *t = or_table_locked();
+
+		if (!e && !or_free_n && t->nor >= t->cap && !or_grow_locked()) {
+			path_put(&rp);
+			path_put(&tp);
+			return -ENOMEM;
+		}
 	}
 
 	if (e) {
@@ -1223,16 +1323,19 @@ static int or_add(const char *target, const char *redirected, int scheme)
 	}
 
 	/* A reclaimed slot first, a never-used one otherwise.  Both are already out of service (dead is
-	 * raised for every slot in susfs_open_redirect_init() and stays raised while a slot is on the
-	 * free list), so growing the bound cannot publish a half-written entry: a lockless reader that
+	 * raised for every slot in or_table_alloc() and stays raised while a slot is on the free list),
+	 * so growing the bound cannot publish a half-written entry: a lockless reader that
 	 * sees the new `nor` finds dead == true and skips the slot.  Ordering the flag against the bound
 	 * was tried and is not enough on arm64, which may reorder the reader's load of `nor` against its
 	 * load of `dead` - raising the flag up front is what removes the window instead of narrowing
 	 * it. */
-	if (or_free_n) {
-		e = &or_entries[or_free[--or_free_n]];
-	} else {
-		e = &or_entries[nor++];
+	{
+		struct sus_or_table *t = or_table_locked();
+
+		if (or_free_n)
+			e = &t->e[or_free[--or_free_n]];
+		else
+			e = &t->e[t->nor++];
 	}
 
 	/* Then fill it in, and publish by clearing the flag last.  Every field is written before that
@@ -1270,6 +1373,8 @@ static int or_add(const char *target, const char *redirected, int scheme)
  * accept a caller that skipped the wait. */
 static void or_release_slot(struct sus_or_entry *e)
 {
+	struct sus_or_table *t = or_table_locked();
+
 	WARN_ON_ONCE(!READ_ONCE(e->dead));
 
 	e->target_pathname[0] = '\0';
@@ -1285,11 +1390,12 @@ static void or_release_slot(struct sus_or_entry *e)
 	e->uid_scheme = 0;
 	smp_wmb();
 	/* Cannot overflow while the accounting is right: only a live slot is pushed, and a live slot is
-	 * off the list until it is handed out again.  The check is here so a future path that frees the
-	 * same slot twice says so instead of writing past the array - or_free_n sits right after it. */
-	WARN_ON_ONCE(or_free_n >= SUS_OR_MAX);
-	if (or_free_n < SUS_OR_MAX)
-		or_free[or_free_n++] = (unsigned int)(e - or_entries);
+	 * off the list until it is handed out again (the list is sized to the table's capacity, so it
+	 * has room for every slot).  The check is here so a future path that frees the same slot twice
+	 * says so instead of writing past the array. */
+	WARN_ON_ONCE(or_free_n >= or_free_cap);
+	if (or_free_n < or_free_cap)
+		or_free[or_free_n++] = (unsigned int)(e - t->e);
 }
 
 /* Retire one slot: raise the flag, wait a grace period, then clear and free it.  The wait is the whole
@@ -1316,16 +1422,30 @@ static void or_reclaim_slot(struct sus_or_entry *e)
  * waits once, not once per rule, and never hands a callee the inside of a table it is clearing. */
 static void or_clear_all(void)
 {
-	unsigned long marked = 0;
+	struct sus_or_table *t = or_table_locked();
+	unsigned long *marked;
+	bool any = false;
 	int i;
 
-	BUILD_BUG_ON(SUS_OR_MAX > BITS_PER_LONG);
+	/* The table has no fixed ceiling now, so the per-slot "I marked this one" set is an allocated
+	 * bitmap rather than a word.  or_lock is held throughout (no concurrent grow), so `t` is stable
+	 * and GFP_KERNEL is fine. */
+	marked = bitmap_zalloc(t->nor, GFP_KERNEL);
+	if (!marked) {
+		/* Out of memory for the batch: drop each rule on its own, correct but a grace period each. */
+		for (i = 0; i < t->nor; i++)
+			if (!READ_ONCE(t->e[i].dead))
+				or_reclaim_slot(&t->e[i]);
+		WRITE_ONCE(susfs_open_redirect_rules, 0);
+		return;
+	}
 
-	for (i = 0; i < nor; i++) {
-		if (READ_ONCE(or_entries[i].dead))
+	for (i = 0; i < t->nor; i++) {
+		if (READ_ONCE(t->e[i].dead))
 			continue;
-		WRITE_ONCE(or_entries[i].dead, true);
-		marked |= 1UL << i;
+		WRITE_ONCE(t->e[i].dead, true);
+		set_bit(i, marked);
+		any = true;
 	}
 
 	/* The live count drops before the wait, not after: the name-layer hook reads it on every open, and
@@ -1333,14 +1453,14 @@ static void or_clear_all(void)
 	 * name to find nothing. */
 	WRITE_ONCE(susfs_open_redirect_rules, 0);
 
-	if (marked) {
+	if (any) {
 		smp_wmb();
 		synchronize_rcu();
-		for (i = 0; i < nor; i++) {
-			if (marked & (1UL << i))
-				or_release_slot(&or_entries[i]);
-		}
+		for (i = 0; i < t->nor; i++)
+			if (test_bit(i, marked))
+				or_release_slot(&t->e[i]);
 	}
+	bitmap_free(marked);
 }
 
 /* Only the rules whose target path matches are dropped; the reverse entry is not
