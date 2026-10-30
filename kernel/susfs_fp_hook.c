@@ -197,6 +197,29 @@ static bool fp_has_landing_pad(const void *fn)
 	}
 }
 
+/* B imm26, the instruction of a CFI jump table entry. */
+#define SUSFS_ARM64_B_MASK	0xfc000000u
+#define SUSFS_ARM64_B		0x14000000u
+
+static bool fp_is_branch_stub(const void *fn)
+{
+	return (READ_ONCE(*(const u32 *)fn) & SUSFS_ARM64_B_MASK) == SUSFS_ARM64_B;
+}
+
+/*
+ * Whether the kernel can call the wrapper the way it calls the entry it replaces. A landing pad always
+ * allows it. Without BTI, a kernel with CFI jump tables has plain branch stubs for its entries, and the
+ * address the module gets for its own function is such a stub too, so a stub is accepted where the
+ * original entry is one: the kernel already calls that kind of entry. An entry that cannot be read, a
+ * NULL one, is judged by the landing pad alone and refused later by the caller.
+ */
+static bool fp_entry_callable(const void *wrapper, const void *entry)
+{
+	if (fp_has_landing_pad(wrapper))
+		return true;
+	return entry && fp_is_branch_stub(wrapper) && fp_is_branch_stub(entry);
+}
+
 int susfs_fp_install(struct susfs_fp_hook *h)
 {
 	susfs_syscall_fn_t old;
@@ -227,7 +250,13 @@ int susfs_fp_install(struct susfs_fp_hook *h)
 		pr_warn("susfs_fp: %s: no native entry and no compat entry\n", h->name);
 		return -EINVAL;
 	}
-	if (!h->wrapper || !fp_has_landing_pad((const void *)h->wrapper)) {
+	/* Both tables are judged before either is touched, so a refusal leaves nothing half armed. */
+	if (!h->wrapper ||
+	    (h->nr >= 0 && !fp_entry_callable((const void *)h->wrapper,
+					      (const void *)READ_ONCE(sys_call_table_ptr[h->nr]))) ||
+	    (cnr >= 0 && compat_sys_call_table_ptr &&
+	     !fp_entry_callable((const void *)h->wrapper,
+				(const void *)READ_ONCE(compat_sys_call_table_ptr[cnr])))) {
 		pr_warn("susfs_fp: %s has no valid call landing pad (0x%08x) - not installed\n",
 			h->name, h->wrapper ? READ_ONCE(*(const u32 *)h->wrapper) : 0);
 		return -EINVAL;

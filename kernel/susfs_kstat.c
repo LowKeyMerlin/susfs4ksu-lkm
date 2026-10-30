@@ -20,7 +20,8 @@
  * cp_new_stat, so VFS-layer kprobes miss): the reliable hook is the RETURN of the stat syscall,
  * where the user statbuf is fully written - so this layer replaces the sys_call_table entries of
  * the numbers below and rewrites the requested fields of the user buffer in the wrapper's tail,
- * once the original has returned (see kstat_hooks[] and susfs_kstat_post()).  Native:
+ * once the original has returned (see kstat_hooks[] and susfs_kstat_post()).  statfs and fstatfs,
+ * native and AArch32, are answered from a snapshot kept with the rule (susfs_kstatfs_post()).  Native:
  * newfstatat(79), fstat(80), statx(291).
  * AArch32: fstatat64(327), stat64(195), lstat64(196), fstat64(197) -> struct stat64; stat(106),
  * lstat(107), fstat(108) -> struct compat_stat; statx(397) -> the SAME struct statx as native
@@ -56,7 +57,19 @@
 #include "susfs_fp_hook.h"	/* struct susfs_fp_hook + install/remove/drain: the table entries */
 #include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
 #include "ksu_allow_gate.h"	/* the control-node gate is su's own */
+#include <linux/statfs.h>
+#include <asm/statfs.h>
+#include <linux/file.h>
+#include <linux/slab.h>
 #include "susfs_kprobe.h"
+#include "symbol_resolver.h"	/* find_kernel_symbol_exact */
+#include "mount.h"		/* fs/mount.h: real_mount() -> the mnt_id fdinfo prints */
+#include "proc/internal.h"	/* fs/proc/internal.h: PROC_I(), the task and fd an fdinfo inode names */
+#include <linux/fdtable.h>
+#include <linux/magic.h>
+#include <linux/nospec.h>
+#include <linux/pid.h>
+#include <linux/sched/task.h>
 
 /* KSTAT_SPOOF_* bits live in susfs_abi.h (upstream declares them in susfs.h next to struct
  * st_susfs_sus_kstat).  KSTAT_AUTO_SPOOF* below are /proc-interface masks, not supercall ABI. */
@@ -90,6 +103,12 @@ struct sus_kstat_entry {
 	long long spoofed_blocks;
 	long spoofed_blksize;
 	unsigned int flags;
+	/* What statfs of the path answered when the rule was added, for an app to be given later. */
+	struct kstatfs statfs;
+	bool has_statfs;
+	/* The mount id fdinfo printed for the path when the rule was added, which is what an app is
+	 * given. Not re-read by update, as upstream keeps it. */
+	unsigned int spoofed_mnt_id;
 };
 
 static struct sus_kstat_entry kstat_entries[SUS_KSTAT_MAX];
@@ -217,6 +236,63 @@ static bool susfs_kstat_lookup(unsigned long ino, dev_t dev,
 			found = true;
 			break;
 		}
+	}
+	spin_unlock_irqrestore(&kstat_table_lock, flags);
+	return found;
+}
+
+/* The statfs snapshot of a rule, copied out the same way. */
+static bool susfs_kstat_lookup_statfs(unsigned long ino, dev_t dev, struct kstatfs *out)
+{
+	unsigned long flags;
+	bool found = false;
+	int i;
+
+	spin_lock_irqsave(&kstat_table_lock, flags);
+	for (i = 0; i < nkstat; i++) {
+		if (kstat_entries[i].target_ino == ino &&
+		    kstat_entries[i].target_dev == dev &&
+		    kstat_entries[i].has_statfs) {
+			*out = kstat_entries[i].statfs;
+			found = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&kstat_table_lock, flags);
+	return found;
+}
+
+/* The snapshot is taken with the kernel's vfs_statfs(), resolved by name. A checked indirect call
+ * to a kernel symbol is a CFI panic, so the call sits in its own __nocfi function. */
+static int (*kstat_vfs_statfs_fn)(const struct path *path, struct kstatfs *buf);
+
+static __nocfi noinline int kstat_statfs_snapshot(const struct path *path, struct kstatfs *out)
+{
+	if (!kstat_vfs_statfs_fn)
+		return -EOPNOTSUPP;
+	return kstat_vfs_statfs_fn(path, out);
+}
+
+/* What fdinfo prints for a rule's target: the mount id the path had when the rule was added and,
+ * if the rule spoofs it, the inode. Found by inode and device like the stat family, so a bind mount
+ * of the same filesystem is answered too, as upstream answers it. */
+static bool susfs_kstat_lookup_fdinfo(unsigned long ino, dev_t dev,
+				      unsigned long *new_ino, unsigned int *new_mnt_id)
+{
+	unsigned long flags;
+	bool found = false;
+	int i;
+
+	spin_lock_irqsave(&kstat_table_lock, flags);
+	for (i = 0; i < nkstat; i++) {
+		const struct sus_kstat_entry *e = &kstat_entries[i];
+
+		if (e->target_ino != ino || e->target_dev != dev)
+			continue;
+		*new_ino = (e->flags & KSTAT_SPOOF_INO) ? e->spoofed_ino : ino;
+		*new_mnt_id = e->spoofed_mnt_id;
+		found = true;
+		break;
 	}
 	spin_unlock_irqrestore(&kstat_table_lock, flags);
 	return found;
@@ -493,6 +569,261 @@ static void kstat_maps_disarm(void)
 	unregister_kretprobe(&krp_kstat_map_vma);
 	susfs_krp_forget_addr(&krp_kstat_map_vma);
 	kstat_maps_registered = false;
+	mutex_unlock(&kstat_maps_ctl_lock);
+}
+
+/* ---- /proc/<pid>/fdinfo/<fd> coverage ----
+ *
+ * Upstream's seq_show() in fs/proc/fd.c prints the rule's mount id and inode itself, where the
+ * file is at hand. Here it is not (seq_show() is static and the file a local of it), so the two
+ * numbers are read back from the formatted text at the return and replaced, as the maps hook does.
+ * The text has no device, so the rule is matched on the file itself, found the way seq_show() finds
+ * it, see kstat_fdinfo_target().
+ *
+ * Above 5.15 the name is not unique (four symbols on 6.1 and 6.6), and the kernel keeps no table
+ * that holds the address of this one, so every match is probed and the handler tells fdinfo's own
+ * file by the name of its directory. Armed with the first rule, removed when the module unloads. */
+#define KSTAT_FDINFO_MAX 32
+
+static int kstat_fdinfo_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	*(struct seq_file **)ri->data = (struct seq_file *)regs->regs[0];
+	return 0;
+}
+
+/* The decimal that follows label in text, and where it ends; NULL when there is none. */
+static const char *kstat_fdinfo_num(const char *text, const char *label, unsigned long *val)
+{
+	const char *p = strstr(text, label);
+	unsigned long v = 0;
+
+	if (!p)
+		return NULL;
+	p += strlen(label);
+	if (*p < '0' || *p > '9')
+		return NULL;
+	for (; *p >= '0' && *p <= '9'; p++)
+		v = v * 10 + (unsigned long)(*p - '0');
+	*val = v;
+	return p;
+}
+
+/* The inode and encoded device of the file an fdinfo entry describes. seq_show() takes them from
+ * the descriptor the fdinfo inode names (task and fd number, set when the entry was looked up),
+ * and so does this. A probe cannot sleep, so it reads the descriptor table under rcu and the task
+ * lock: the lock keeps exit_files() from freeing the table, rcu keeps the file and the table's
+ * array alive, and nothing is taken a reference on or written. */
+static bool kstat_fdinfo_target(struct seq_file *m, unsigned long *ino, dev_t *dev)
+{
+	struct inode *pi = m->private;	/* single_open(file, seq_show, inode) */
+	struct task_struct *task;
+	struct fdtable *fdt;
+	struct file *f;
+	unsigned int fd;
+	bool ok = false;
+
+	if (!susfs_ptr_plausible(pi) || pi != file_inode(m->file) ||
+	    pi->i_sb->s_magic != PROC_SUPER_MAGIC)
+		return false;
+	fd = PROC_I(pi)->fd;
+
+	rcu_read_lock();
+	task = pid_task(PROC_I(pi)->pid, PIDTYPE_PID);
+	if (task) {
+		task_lock(task);
+		if (task->files) {
+			fdt = rcu_dereference(task->files->fdt);
+			if (fdt && fd < fdt->max_fds) {
+				f = rcu_dereference(fdt->fd[array_index_nospec(fd, fdt->max_fds)]);
+				if (f && file_inode(f)) {
+					*ino = file_inode(f)->i_ino;
+					*dev = new_encode_dev(file_inode(f)->i_sb->s_dev);
+					ok = true;
+				}
+			}
+		}
+		task_unlock(task);
+	}
+	rcu_read_unlock();
+	return ok;
+}
+
+/* The mnt_id and ino lines every fdinfo starts with, for the file the descriptor is. */
+static void kstat_fdinfo_self(struct seq_file *m)
+{
+	unsigned long ino, mnt, new_ino, file_ino;
+	unsigned int new_mnt_id;
+	char head[160], old[64], new[64];
+	const char *p;
+	int old_len, new_len;
+	size_t n;
+	dev_t dev;
+
+	n = min(m->count, sizeof(head) - 1);
+	memcpy(head, m->buf, n);
+	head[n] = 0;
+	p = kstat_fdinfo_num(head, "mnt_id:\t", &mnt);
+	if (!p || !kstat_fdinfo_num(p, "ino:\t", &ino))
+		return;
+	/* the descriptor may have been closed or replaced since the text was written */
+	if (!kstat_fdinfo_target(m, &file_ino, &dev) || file_ino != ino)
+		return;
+	if (!susfs_kstat_lookup_fdinfo(ino, dev, &new_ino, &new_mnt_id))
+		return;
+
+	old_len = scnprintf(old, sizeof(old), "mnt_id:\t%lu\nino:\t%lu\n", mnt, ino);
+	new_len = scnprintf(new, sizeof(new), "mnt_id:\t%u\nino:\t%lu\n", new_mnt_id, new_ino);
+	kstat_buf_replace(m, old, old_len, new, new_len);
+}
+
+/* An inotify descriptor lists each watch as
+ *   inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:0 fhandle-bytes:...
+ * with the watched inode and its raw s_dev, which is all a rule is matched on, so no file is looked
+ * up. Upstream rewrites ino and sdev here for an app; so does this, for the parts the rule spoofs,
+ * the device decoded from its stat() form as the maps hook does. The fhandle that follows holds
+ * the real inode number in a filesystem-specific form and is left as it is, as upstream leaves it. */
+static bool kstat_fdinfo_hex(const char **p, const char *end, unsigned long *val)
+{
+	unsigned long v = 0;
+	const char *s = *p;
+
+	for (; s < end; s++) {
+		int c = *s;
+
+		if (c >= '0' && c <= '9')
+			c -= '0';
+		else if (c >= 'a' && c <= 'f')
+			c -= 'a' - 10;
+		else
+			break;
+		v = (v << 4) | (unsigned long)c;
+	}
+	if (s == *p)
+		return false;
+	*val = v;
+	*p = s;
+	return true;
+}
+
+static void kstat_fdinfo_inotify(struct seq_file *m)
+{
+	static const char tag[] = "inotify wd:";
+	size_t pos = 0;
+
+	while (pos < m->count) {
+		const char *line = m->buf + pos, *end, *p;
+		size_t left = m->count - pos, len;
+		unsigned long wd, ino, sdev, new_ino;
+		unsigned int new_dev;
+		struct sus_kstat_snapshot snap;
+		char old[80], new[80];
+		int old_len, new_len;
+
+		end = memchr(line, '\n', left);
+		len = end ? (size_t)(end - line) + 1 : left;
+		end = line + len;
+		pos += len;
+		if (len <= sizeof(tag) || memcmp(line, tag, sizeof(tag) - 1))
+			continue;
+
+		p = line + sizeof(tag) - 1;
+		if (!kstat_fdinfo_hex(&p, end, &wd) || end - p < 5 || memcmp(p, " ino:", 5))
+			continue;
+		p += 5;
+		if (!kstat_fdinfo_hex(&p, end, &ino) || end - p < 6 || memcmp(p, " sdev:", 6))
+			continue;
+		p += 6;
+		if (!kstat_fdinfo_hex(&p, end, &sdev))
+			continue;
+		if (!susfs_kstat_lookup(ino, new_encode_dev((dev_t)sdev), &snap) ||
+		    !(snap.flags & (KSTAT_SPOOF_INO | KSTAT_SPOOF_DEV)))
+			continue;
+
+		new_ino = (snap.flags & KSTAT_SPOOF_INO) ? snap.spoofed_ino : ino;
+		new_dev = (snap.flags & KSTAT_SPOOF_DEV)
+			  ? (unsigned int)new_decode_dev((u32)snap.spoofed_dev) : (unsigned int)sdev;
+		old_len = scnprintf(old, sizeof(old), "wd:%lx ino:%lx sdev:%x", wd, ino, (unsigned int)sdev);
+		new_len = scnprintf(new, sizeof(new), "wd:%lx ino:%lx sdev:%x", wd, new_ino, new_dev);
+		if (kstat_buf_replace(m, old, old_len, new, new_len))
+			pos += new_len - old_len;
+	}
+}
+
+static int kstat_fdinfo_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct seq_file *m = *(struct seq_file **)ri->data;
+	struct dentry *d;
+
+	if (susfs_kstat_table_empty() || (long)regs_return_value(regs))
+		return 0;
+	if (!susfs_ptr_plausible(m) || !m->buf || !m->count || !m->file)
+		return 0;
+	d = m->file->f_path.dentry;
+	if (!d || !d->d_parent || strcmp(d->d_parent->d_name.name, "fdinfo"))
+		return 0;
+	if (!susfs_kstat_gate_ok())
+		return 0;
+
+	kstat_fdinfo_self(m);
+	kstat_fdinfo_inotify(m);
+	return 0;
+}
+
+static struct kretprobe krp_kstat_fdinfo[KSTAT_FDINFO_MAX];
+static int n_kstat_fdinfo;
+
+/* Under the lock and exiting flag of the maps hook: the same callers arm both. */
+static void kstat_fdinfo_arm(void)
+{
+	unsigned long addrs[KSTAT_FDINFO_MAX];
+	int i, n, rc;
+
+	mutex_lock(&kstat_maps_ctl_lock);
+	if (kstat_maps_exiting || n_kstat_fdinfo) {
+		mutex_unlock(&kstat_maps_ctl_lock);
+		return;
+	}
+	n = ksu_find_symbol_all("seq_show", addrs, KSTAT_FDINFO_MAX);
+	if (n <= 0)
+		pr_warn("susfs_kstat: seq_show not found - fdinfo prints the real mount id and inode\n");
+	else if (n == KSTAT_FDINFO_MAX)
+		pr_warn("susfs_kstat: %d seq_show symbols or more, fdinfo's may not be among them\n", n);
+	for (i = 0; i < n; i++) {
+		struct kretprobe *kr = &krp_kstat_fdinfo[i];
+
+		kr->kp.addr = (void *)addrs[i];
+		kr->entry_handler = kstat_fdinfo_entry;
+		kr->handler = kstat_fdinfo_ret;
+		kr->data_size = sizeof(struct seq_file *);
+		kr->maxactive = 16;
+		rc = register_kretprobe(kr);
+		if (rc) {
+			susfs_krp_forget_addr(kr);
+			pr_warn("susfs_kstat: register_kretprobe(seq_show @%px) failed %d\n",
+				(void *)addrs[i], rc);
+			continue;
+		}
+		n_kstat_fdinfo++;
+	}
+	if (n_kstat_fdinfo)
+		SUSFS_LOGI("susfs_kstat: fdinfo hook armed (seq_show on %d/%d symbols)\n",
+			   n_kstat_fdinfo, n);
+	mutex_unlock(&kstat_maps_ctl_lock);
+}
+
+/* After kstat_maps_disarm(), which stops later arms. */
+static void kstat_fdinfo_disarm(void)
+{
+	int i;
+
+	mutex_lock(&kstat_maps_ctl_lock);
+	for (i = 0; i < KSTAT_FDINFO_MAX; i++) {
+		if (!krp_kstat_fdinfo[i].kp.addr)
+			continue;
+		unregister_kretprobe(&krp_kstat_fdinfo[i]);
+		susfs_krp_forget_addr(&krp_kstat_fdinfo[i]);
+	}
+	n_kstat_fdinfo = 0;
 	mutex_unlock(&kstat_maps_ctl_lock);
 }
 
@@ -849,6 +1180,10 @@ static_assert(sizeof(((struct compat_stat *)0)->st_atime_nsec) == 4, "compat_sta
  * fs/stat.c has no COMPAT_SYSCALL_DEFINE for statx on arm64 - filling the same 256-byte
  * struct statx at a zero-extended 32-bit pointer.  statbuf is args[4] and the requested mask
  * args[3], exactly as in the native case; only the counter differs (see KSTAT_COUNTERS above). */
+#define COMPAT_STATFS_NR	99	/* statfs(path, struct compat_statfs *) */
+#define COMPAT_FSTATFS_NR	100	/* fstatfs(fd, struct compat_statfs *) */
+#define COMPAT_STATFS64_NR	266	/* statfs64(path, size, struct compat_statfs64 *) */
+#define COMPAT_FSTATFS64_NR	267	/* fstatfs64(fd, size, struct compat_statfs64 *) */
 #define COMPAT_STATX_NR		397	/* statx(dfd, path, flags, mask, struct statx *) */
 
 struct kstat_nr_entry {
@@ -1386,7 +1721,7 @@ static bool susfs_kstat_spoof_statx(struct kstat_call_state *st, unsigned long s
  * syscall_get_nr() and the two classifiers below were paid on all of them - measured at ~28 ns per
  * syscall when the stat family moved onto it (getpid 113 -> 141 ns), and re-measured at the time of
  * this change as 126 ns without the tracepoint vs 151 ns with it (three runs each, +25..31 ns), on
- * the same device the module ships to.  As a wrapper tail it runs only for the thirteen numbers in
+ * the same device the module ships to.  As a wrapper tail it runs only for the numbers in
  * kstat_hooks[], and both the "which ABI" and the "which syscall" questions are answered by which
  * table entry was called rather than by a test that every syscall has to pay for.  Nothing is lost:
  * the arguments arrive from the wrapper, which copies them out of regs BEFORE calling the original
@@ -1601,7 +1936,7 @@ static __nocfi void susfs_kstat_post(long nr, bool compat, const unsigned long *
  *     everything armed                        151 / 150 / 151 ns   <- tracepoint registered
  *
  * i.e. +25..31 ns per syscall, on every syscall, whether or not it is one this module cares about.
- * Now only these thirteen numbers pay anything, and both classifiers went away with the tracepoint.
+ * Now only these numbers pay anything, and both classifiers went away with the tracepoint.
  *
  * Arguments are copied out of regs BEFORE the original runs: a syscall's return value is written
  * into regs->regs[0] (arch/arm64/kernel/syscall.c, and the compat entry point does the same), so
@@ -1619,6 +1954,12 @@ static __nocfi void susfs_kstat_post(long nr, bool compat, const unsigned long *
  * by name - so one that does not match what this kernel calls the entry shows up as "no symbol"
  * there and changes nothing about the hook itself.
  */
+static susfs_syscall_fn_t kstat_orig_statfs;
+static susfs_syscall_fn_t kstat_orig_fstatfs;
+static susfs_syscall_fn_t kstat_orig_compat_statfs;
+static susfs_syscall_fn_t kstat_orig_compat_fstatfs;
+static susfs_syscall_fn_t kstat_orig_compat_statfs64;
+static susfs_syscall_fn_t kstat_orig_compat_fstatfs64;
 static susfs_syscall_fn_t kstat_orig_nfstatat;
 static susfs_syscall_fn_t kstat_orig_fstat;
 static susfs_syscall_fn_t kstat_orig_statx;
@@ -1633,6 +1974,204 @@ static susfs_syscall_fn_t kstat_orig_compat_fstat;
 static susfs_syscall_fn_t kstat_orig_compat_statx;
 static susfs_syscall_fn_t kstat_orig_compat_getdents64;
 static susfs_syscall_fn_t kstat_orig_compat_getdents;
+
+/* ---- statfs and fstatfs ----
+ * Upstream answers an app with the numbers a sus_kstat path had when the rule was added, by
+ * branching inside vfs_statfs(). That function is inlined into its callers on some kernels (all of
+ * 6.1, and 6.12 and 6.18 for statfs), so a probe on it never fires there, the same way the stat
+ * chain is out of reach. The wrappers below answer on the return of the syscall instead, like the
+ * stat family, but for a caller the rules apply to the original does not run at all: the wrapper
+ * resolves the argument once, takes vfs_statfs() of it, swaps in the snapshot of that inode if a
+ * rule holds one, and fills the caller's buffer in the layout of the entry, as fs/statfs.c does.
+ * One resolution is what makes it safe. Answering after the original needs a second lookup of a
+ * user string or descriptor that another thread can swap in between, and then the real numbers of
+ * a hidden path reach the caller whichever of the two lookups sees which path. Any other caller,
+ * and every call while no rule exists, goes to the original untouched. */
+enum kstatfs_layout { KSTATFS_NATIVE, KSTATFS_COMPAT, KSTATFS_COMPAT64 };
+
+/* vfs_statfs() of a resolved path, and the snapshot a rule holds for its inode if there is one.
+ * Upstream's order in vfs_statfs: a sus_kstat rule first, then the non-sus mount for an umounted
+ * process, then the path as it is. The mount face lives in sus_mount.c. */
+static int kstatfs_of_path(const struct path *p, struct kstatfs *st, struct kstatfs *snap,
+			   bool *hit)
+{
+	struct inode *inode = d_backing_inode(p->dentry);
+	struct path alt;
+	int err;
+
+	*hit = false;
+	if (susfs_kstat_gate_ok() && inode &&
+	    susfs_kstat_lookup_statfs(inode->i_ino, new_encode_dev(inode->i_sb->s_dev), snap)) {
+		err = kstat_statfs_snapshot(p, st);
+		if (!err)
+			*hit = true;
+		return err;
+	}
+	if (sus_mount_non_sus_path(p, &alt)) {
+		err = kstat_statfs_snapshot(&alt, st);
+		path_put(&alt);
+		return err;
+	}
+	return kstat_statfs_snapshot(p, st);
+}
+
+/* The check put_compat_statfs() makes: a field the 32-bit layout cannot hold fails the call with
+ * EOVERFLOW. A snapshot can hold one the live numbers did not (a smaller mount went on top). */
+static bool kstatfs_fits32(const struct kstatfs *k)
+{
+	const u64 hi = 0xffffffff00000000ULL;
+
+	if ((k->f_blocks | k->f_bfree | k->f_bavail | k->f_bsize | k->f_frsize) & hi)
+		return false;
+	if (k->f_files != ~0ULL && (k->f_files & hi))
+		return false;
+	return k->f_ffree == ~0ULL || !(k->f_ffree & hi);
+}
+
+static long kstatfs_put(enum kstatfs_layout layout, void __user *ubuf, const struct kstatfs *k)
+{
+	switch (layout) {
+	case KSTATFS_NATIVE: {
+		struct statfs b;
+
+		memset(&b, 0, sizeof(b));
+		b.f_type = k->f_type;
+		b.f_bsize = k->f_bsize;
+		b.f_blocks = k->f_blocks;
+		b.f_bfree = k->f_bfree;
+		b.f_bavail = k->f_bavail;
+		b.f_files = k->f_files;
+		b.f_ffree = k->f_ffree;
+		b.f_fsid = k->f_fsid;
+		b.f_namelen = k->f_namelen;
+		b.f_frsize = k->f_frsize;
+		b.f_flags = k->f_flags;
+		if (copy_to_user(ubuf, &b, sizeof(b)))
+			return -EFAULT;
+		return 0;
+	}
+	case KSTATFS_COMPAT: {
+		struct compat_statfs b;
+
+		if (!kstatfs_fits32(k))
+			return -EOVERFLOW;
+		memset(&b, 0, sizeof(b));
+		b.f_type = k->f_type;
+		b.f_bsize = k->f_bsize;
+		b.f_blocks = k->f_blocks;
+		b.f_bfree = k->f_bfree;
+		b.f_bavail = k->f_bavail;
+		b.f_files = k->f_files;
+		b.f_ffree = k->f_ffree;
+		b.f_fsid.val[0] = k->f_fsid.val[0];
+		b.f_fsid.val[1] = k->f_fsid.val[1];
+		b.f_namelen = k->f_namelen;
+		b.f_frsize = k->f_frsize;
+		b.f_flags = k->f_flags;
+		if (copy_to_user(ubuf, &b, sizeof(b)))
+			return -EFAULT;
+		return 0;
+	}
+	case KSTATFS_COMPAT64: {
+		struct compat_statfs64 b;
+
+		memset(&b, 0, sizeof(b));
+		b.f_type = k->f_type;
+		b.f_bsize = k->f_bsize;
+		b.f_blocks = k->f_blocks;
+		b.f_bfree = k->f_bfree;
+		b.f_bavail = k->f_bavail;
+		b.f_files = k->f_files;
+		b.f_ffree = k->f_ffree;
+		b.f_fsid.val[0] = k->f_fsid.val[0];
+		b.f_fsid.val[1] = k->f_fsid.val[1];
+		b.f_namelen = k->f_namelen;
+		b.f_frsize = k->f_frsize;
+		b.f_flags = k->f_flags;
+		if (copy_to_user(ubuf, &b, sizeof(b)))
+			return -EFAULT;
+		return 0;
+	}
+	}
+	return 0;
+}
+
+static atomic_t n_kstat_statfs_hits = ATOMIC_INIT(0);
+
+/* What fs/statfs.c does for the six entries, with the snapshot swapped in. a[0] is the path or the
+ * descriptor and the buffer follows it, after the size of the 64-bit AArch32 calls (which must be
+ * exactly the struct, as there). The caller's ABI is known from which entry was called. */
+static __nocfi long susfs_kstatfs_answer(enum kstatfs_layout layout, bool by_fd, bool compat,
+					 const unsigned long *a)
+{
+	unsigned int lookup = LOOKUP_FOLLOW | LOOKUP_AUTOMOUNT;
+	unsigned long ubuf = layout == KSTATFS_COMPAT64 ? a[2] : a[1];
+	unsigned long uarg = compat ? (u32)a[0] : a[0];
+	struct kstatfs st, snap;
+	struct path p;
+	bool hit;
+	int err;
+
+	if (layout == KSTATFS_COMPAT64 && (u32)a[1] != sizeof(struct compat_statfs64))
+		return -EINVAL;
+	if (compat)
+		ubuf = (unsigned long)compat_ptr((u32)ubuf);
+
+	if (by_fd) {
+		struct file *f = fget((unsigned int)uarg);
+
+		if (!f)
+			return -EBADF;
+		err = kstatfs_of_path(&f->f_path, &st, &snap, &hit);
+		fput(f);
+	} else {
+retry:
+		err = user_path_at(AT_FDCWD, (const char __user *)uarg, lookup, &p);
+		if (err)
+			return err;
+		err = kstatfs_of_path(&p, &st, &snap, &hit);
+		path_put(&p);
+		if (err == -ESTALE && !(lookup & LOOKUP_REVAL)) {
+			lookup |= LOOKUP_REVAL;
+			goto retry;
+		}
+	}
+	if (err)
+		return err;
+	if (hit) {
+		atomic_inc(&n_kstat_statfs_hits);
+		st = snap;
+	}
+	return kstatfs_put(layout, (void __user *)ubuf, &st);
+}
+
+#define SUSFS_KSTATFS_WRAPPER(fn, slot, layout, by_fd, combat)		\
+	static __nocfi long fn(const struct pt_regs *regs)		\
+	{								\
+		susfs_syscall_fn_t orig = READ_ONCE(slot);		\
+		unsigned long a[6];					\
+									\
+		if (!orig)						\
+			return -ENOSYS;					\
+		if (!kstat_vfs_statfs_fn)				\
+			return orig(regs);				\
+		/* A sus_kstat app, or an umounted process that may sit on a marked mount. */ \
+		if (!((!susfs_kstat_table_empty() && susfs_kstat_gate_ok()) || \
+		      (sus_mount_has_marked() &&			\
+		       (READ_ONCE(susfs_ksu_umount_gate_off)		\
+			? susfs_is_current_proc_umounted_app()		\
+			: susfs_is_current_proc_umounted()))))		\
+			return orig(regs);				\
+		syscall_get_arguments(current, (struct pt_regs *)regs, a);	\
+		return susfs_kstatfs_answer(layout, by_fd, combat, a);	\
+	}
+
+SUSFS_KSTATFS_WRAPPER(kstat_wrap_statfs, kstat_orig_statfs, KSTATFS_NATIVE, false, false)
+SUSFS_KSTATFS_WRAPPER(kstat_wrap_fstatfs, kstat_orig_fstatfs, KSTATFS_NATIVE, true, false)
+SUSFS_KSTATFS_WRAPPER(kstat_wrap_compat_statfs, kstat_orig_compat_statfs, KSTATFS_COMPAT, false, true)
+SUSFS_KSTATFS_WRAPPER(kstat_wrap_compat_fstatfs, kstat_orig_compat_fstatfs, KSTATFS_COMPAT, true, true)
+SUSFS_KSTATFS_WRAPPER(kstat_wrap_compat_statfs64, kstat_orig_compat_statfs64, KSTATFS_COMPAT64, false, true)
+SUSFS_KSTATFS_WRAPPER(kstat_wrap_compat_fstatfs64, kstat_orig_compat_fstatfs64, KSTATFS_COMPAT64, true, true)
 
 #define SUSFS_KSTAT_WRAPPER(fn, slot, nrval, combat)			\
 	static __nocfi long fn(const struct pt_regs *regs)		\
@@ -1720,6 +2259,25 @@ static __nocfi long kstat_wrap_compat_getdents(const struct pt_regs *regs)
 }
 
 static struct susfs_fp_hook kstat_hooks[] = {
+	{ .nr = __NR_statfs, .nr_compat = 0, .name = "kstat/statfs",
+	  .sym = "__arm64_sys_statfs",
+	  .wrapper = kstat_wrap_statfs, .orig_slot = &kstat_orig_statfs },
+	{ .nr = __NR_fstatfs, .nr_compat = 0, .name = "kstat/fstatfs",
+	  .sym = "__arm64_sys_fstatfs",
+	  .wrapper = kstat_wrap_fstatfs, .orig_slot = &kstat_orig_fstatfs },
+	{ .nr = -1, .nr_compat = COMPAT_STATFS_NR, .name = "kstat/compat statfs",
+	  .sym = "__arm64_compat_sys_statfs",
+	  .wrapper = kstat_wrap_compat_statfs, .orig_slot_compat = &kstat_orig_compat_statfs },
+	{ .nr = -1, .nr_compat = COMPAT_FSTATFS_NR, .name = "kstat/compat fstatfs",
+	  .sym = "__arm64_compat_sys_fstatfs",
+	  .wrapper = kstat_wrap_compat_fstatfs, .orig_slot_compat = &kstat_orig_compat_fstatfs },
+	{ .nr = -1, .nr_compat = COMPAT_STATFS64_NR, .name = "kstat/compat statfs64",
+	  .sym = "__arm64_compat_sys_statfs64",
+	  .wrapper = kstat_wrap_compat_statfs64, .orig_slot_compat = &kstat_orig_compat_statfs64 },
+	{ .nr = -1, .nr_compat = COMPAT_FSTATFS64_NR, .name = "kstat/compat fstatfs64",
+	  .sym = "__arm64_compat_sys_fstatfs64",
+	  .wrapper = kstat_wrap_compat_fstatfs64, .orig_slot_compat = &kstat_orig_compat_fstatfs64 },
+
 	{ .nr = __NR_newfstatat, .nr_compat = 0, .name = "kstat/newfstatat",
 	  .sym = "__arm64_sys_newfstatat",
 	  .wrapper = kstat_wrap_nfstatat, .orig_slot = &kstat_orig_nfstatat },
@@ -1833,6 +2391,7 @@ static int susfs_kstat_fill_from_path(struct sus_kstat_entry *e, const char *pat
 
 	e->target_ino = inode->i_ino;
 	e->target_dev = new_encode_dev(inode->i_sb->s_dev);
+	e->spoofed_mnt_id = real_mount(p.mnt)->mnt_id;
 	e->spoofed_ino = inode->i_ino;
 	e->spoofed_dev = new_encode_dev(inode->i_sb->s_dev);
 	e->spoofed_nlink = inode->i_nlink;
@@ -1857,6 +2416,7 @@ static int susfs_kstat_fill_from_path(struct sus_kstat_entry *e, const char *pat
 #endif
 	e->spoofed_blocks = inode->i_blocks;
 	e->spoofed_blksize = 1 << inode->i_blkbits;
+	e->has_statfs = !kstat_statfs_snapshot(&p, &e->statfs);
 
 	path_put(&p);
 	return 0;
@@ -2073,8 +2633,10 @@ void susfs_kstat_supercall(unsigned int cmd, void __user **arg)
 	mutex_unlock(&kstat_lock);
 	info.err = err;
 	/* Armed outside the lock and only after a rule actually landed: a hook that can never fire is worse than no hook. */
-	if (!err)
+	if (!err) {
 		kstat_maps_arm();
+		kstat_fdinfo_arm();
+	}
 out:
 	/* Upstream (fs/susfs.c susfs_add_sus_kstat) writes back ONLY the err field for this
 	 * input-type command, never the whole struct: copying the full struct back would overrun a
@@ -2110,6 +2672,10 @@ int susfs_kstat_init(void)
 {
 	int rc;
 	int i;
+
+	kstat_vfs_statfs_fn = (void *)find_kernel_symbol_exact("vfs_statfs");
+	if (!kstat_vfs_statfs_fn)
+		pr_warn("kstat: vfs_statfs not found, a rule keeps no statfs snapshot\n");
 
 	/* The entries are armed UNCONDITIONALLY, and that is not cosmetic: the supercall interface
 	 * (CMD_SUSFS_ADD_SUS_KSTAT) can install rules with no /proc node at all, so skipping
@@ -2168,6 +2734,7 @@ void susfs_kstat_exit(void)
 	int i;
 
 	kstat_maps_disarm();
+	kstat_fdinfo_disarm();
 
 	/* Every entry is restored first and the drain runs after all of them: restoring stops new
 	 * callers, and susfs_fp_drain() is what covers a task that already picked one of our wrappers
@@ -2329,8 +2896,10 @@ static ssize_t kstat_proc_write(struct file *file, const char __user *buf,
 
 	mutex_unlock(&kstat_lock);
 
-	if (!err)
+	if (!err) {
 		kstat_maps_arm();
+		kstat_fdinfo_arm();
+	}
 
 	if (err) {
 		pr_warn("kstat proc write '%s' -> err %d\n", argv[0], err);

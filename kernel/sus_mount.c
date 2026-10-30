@@ -148,6 +148,7 @@
 #include "susfs_log.h"
 #include "susfs.h"	/* module-wide declarations */
 #include "ksu_allow_gate.h"	/* the control-node gate is su's own */
+#include "ksu_umount_gate.h"	/* the vfs_statfs face of a marked mount */
 #include "susfs_kprobe.h"
 
 /* ---- the "which mounts are ours" prefix list: state ----
@@ -728,6 +729,52 @@ static bool sus_mount_is_ours(struct mount *r)
     if (sus_mount_path_is_ours(r->mnt_devname))
         return true;
     return sus_mount_ident_match(r);
+}
+
+static atomic_t n_statfs_redirects = ATOMIC_INIT(0);
+
+/* Climbs under mount_lock. Reading mnt_parent without it races a lazy umount dropping the
+ * parent. Without the symbol the face stays off. */
+static int (*pfn_follow_up)(struct path *path);
+
+/* True while a mount is marked; lets the statfs wrappers skip calls nothing can change. */
+bool sus_mount_has_marked(void)
+{
+    return pfn_follow_up && (READ_ONCE(n_idmap) > 0 || READ_ONCE(n_ident) > 0);
+}
+
+/* Counterpart of upstream's susfs_get_non_sus_vfsmnt_from_vfsmnt() in vfs_statfs. For an
+ * umounted caller on a marked mount, sets *out to a held path on the root of the first mount
+ * that is not marked and returns true; the caller path_puts it. Deviation: a chain with no such
+ * ancestor is left alone, upstream answers with the top mount. Without KernelSU the umount
+ * answer is always false, so the app check stands in, as elsewhere in the module. */
+__nocfi bool sus_mount_non_sus_path(const struct path *path, struct path *out)
+{
+    struct path p;
+
+    if (!pfn_follow_up || !path || !path->mnt || !path->dentry || !out)
+        return false;
+    if (!sus_mount_is_ours(real_mount(path->mnt)))
+        return false;
+    if (READ_ONCE(susfs_ksu_umount_gate_off)
+        ? !susfs_is_current_proc_umounted_app()
+        : !susfs_is_current_proc_umounted())
+        return false;
+
+    p = *path;
+    path_get(&p);
+    while (sus_mount_is_ours(real_mount(p.mnt))) {
+        if (!pfn_follow_up(&p)) {
+            path_put(&p);
+            return false;
+        }
+    }
+    /* follow_up() leaves the mountpoint dentry; the answer is for the parent's root. */
+    dput(p.dentry);
+    p.dentry = dget(p.mnt->mnt_root);
+    *out = p;
+    atomic_inc(&n_statfs_redirects);
+    return true;
 }
 
 /* The id the caller is allowed to see for a mount we hide: the first ancestor
@@ -1472,7 +1519,8 @@ static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
                      "keep: prefixes=%d rescans=%d\n"
                      "fdinfo: probes=%d entry=%d hits=%d rewrites=%d nolabel=%d\n"
                      "statx: entry=%d ret=%d hits=%d rewrites=%d nobuf=%d err=%d copyfail=%d nomap=%d "
-                     "(sys=%d do=%d)\n",
+                     "(sys=%d do=%d)\n"
+                     "statfs: redirects=%d\n",
                      sus_mount_idmap_live(), n_idmap,
                      sus_mount_ident_live(), READ_ONCE(n_ident), mount_registered,
                      (int)sus_mount_is_su_domain(),
@@ -1500,7 +1548,8 @@ static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
                      atomic_read(&n_statx_hits), atomic_read(&n_statx_rewrites),
                      atomic_read(&n_statx_nobuf), atomic_read(&n_statx_err),
                      atomic_read(&n_statx_copyfail), atomic_read(&n_statx_nomap),
-                     (int)kr_statx_ok, (int)kr_statx_do_ok);
+                     (int)kr_statx_ok, (int)kr_statx_do_ok,
+                     atomic_read(&n_statfs_redirects));
 }
 static const struct kernel_param_ops sus_mount_stat_ops = {
     .get = sus_mount_stat_show,
@@ -1536,7 +1585,7 @@ static int sus_mount_show_pre(struct kprobe *kp, struct pt_regs *regs)
         return 0;
     sus_mount_note_id(r);
     atomic_inc(&n_ident_hits);
-    regs->pc = regs->regs[30];   /* skip this mount line */
+    susfs_probe_return(regs);   /* skip this mount line */
     /* These show_* callbacks return int and x0 still holds seq_file*.
      * seq_read() treats a negative return as a hard error, so a stray high
      * bit here would break the whole read; upstream's equivalent site
@@ -2395,6 +2444,9 @@ int susfs_sus_mount_init(void)
     pfn_security_cred_getsecid =
         (void *)find_kernel_symbol_exact("security_cred_getsecid");
     pfn_d_path = (void *)find_kernel_symbol_exact("d_path");
+    pfn_follow_up = (void *)find_kernel_symbol_exact("follow_up");
+    if (!pfn_follow_up)
+        pr_warn("sus_mount: follow_up not resolved - statfs of a marked mount is not redirected\n");
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
     void *loader_xa = (void *)&mnt_id_xa;
     void *loader_alloc = (void *)&__xa_alloc;

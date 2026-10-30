@@ -15,6 +15,7 @@
 #include <linux/fs.h>
 #include <linux/mm.h>		/* struct mm_struct; sus_map_find_vma() walks its vmas */
 #include <linux/mm_types.h>
+#include <linux/mmap_lock.h>	/* mmap_read_trylock() for the access_remote_vm probe */
 #include <linux/version.h>	/* LINUX_VERSION_CODE: mm->mmap vs mm->mm_mt (6.1) */
 #include <linux/namei.h>
 #include <linux/dcache.h>
@@ -269,7 +270,7 @@ static int sus_map_skip_vma_pre(struct kprobe *kp, struct pt_regs *regs)
 	if (!sus_map_hide_vma(vma, kp->symbol_name))
 		return 0;
 	regs_set_return_value(regs, 0);
-	regs->pc = regs->regs[30];
+	susfs_probe_return(regs);
 	return 1;
 }
 
@@ -474,7 +475,7 @@ static bool sus_map_walk_answer(struct kprobe *kp, struct pt_regs *regs,
      * that from a skipped walk (upstream's own skip leaves the same value).  Leaving
      * x0 = mm would turn pagemap_read()'s `ret` into a kernel pointer handed to read(2). */
     regs_set_return_value(regs, 0);
-    regs->pc = regs->regs[30];
+    susfs_probe_return(regs);
     return true;
 }
 
@@ -664,8 +665,12 @@ static int sus_map_vm_access_pre(struct kprobe *kp, struct pt_regs *regs)
         return 0;
 
     atomic_inc(&n_vm_hides);
-    regs_set_return_value(regs, 0);     /* "nothing transferred" */
-    regs->pc = regs->regs[30];          /* skip the call: nothing is pinned */
+    /* A negative errno, not 0: from 6.12 get_user_page_vma_remote() only tests for
+     * got < 0 and otherwise uses the page it was never given, which oopsed on the
+     * first /proc/<pid>/mem read of a hidden mapping.  Older callers treat any
+     * result <= 0 as "nothing pinned", so the answer they act on is the same. */
+    regs_set_return_value(regs, -EFAULT);
+    susfs_probe_return(regs);          /* skip the call: nothing is pinned */
     return 1;
 }
 
@@ -790,10 +795,65 @@ static struct kretprobe kr_map_files = {
 };
 static bool kr_map_files_ok;
 
+/* The gup probes above never fire on the 5.15 builds: the call is inlined into
+ * __access_remote_vm there (gup_calls stayed 0 over a /proc/self/mem read of a hidden
+ * mapping), so the hide silently did nothing.  __access_remote_vm itself is called from
+ * several places and stays out of line.
+ *
+ * Upstream decides once, on the vma at the start address, under mmap_read_lock.  Here the
+ * lock is not held yet at entry and a probe must not sleep, so take it with a trylock.  If
+ * the trylock loses, the read goes through unhidden; that is a leak only while a writer
+ * holds the lock, and the next read is hidden again.  Arguments: (mm, addr, buf, len, flags). */
+static atomic_t n_arvm_calls = ATOMIC_INIT(0);
+
+static int sus_map_access_remote_vm_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
+    /* 5.10 still passes the task first: (tsk, mm, addr, buf, len, flags) */
+    struct mm_struct *mm = (struct mm_struct *)regs->regs[1];
+    unsigned long addr = regs->regs[2];
+#else
+    struct mm_struct *mm = (struct mm_struct *)regs->regs[0];
+    unsigned long addr = regs->regs[1];
+#endif
+    struct vm_area_struct *vma;
+    struct inode *inode;
+    bool hide = false;
+
+    if (!smp_load_acquire(&nmap))
+        return 0;
+    if (!sus_map_gate_ok())
+        return 0;
+    if (!mm || !addr)
+        return 0;
+
+    atomic_inc(&n_arvm_calls);
+    if (!mmap_read_trylock(mm))
+        return 0;
+    vma = find_vma(mm, addr);
+    if (vma && vma->vm_file && vma->vm_start <= addr) {
+        inode = file_inode(vma->vm_file);
+        hide = inode && sus_map_lookup(inode->i_ino, inode->i_sb->s_dev);
+    }
+    mmap_read_unlock(mm);
+    if (!hide)
+        return 0;
+
+    atomic_inc(&n_vm_hides);
+    regs_set_return_value(regs, 0);     /* bytes transferred: none, as upstream */
+    susfs_probe_return(regs);
+    return 1;
+}
+
+static struct kprobe kp_access_remote_vm = {
+    .symbol_name = "__access_remote_vm",
+    .pre_handler = sus_map_access_remote_vm_pre,
+};
+
 /* Kept in one table so init and exit cannot drift apart. */
 static struct kprobe *const map_probes[] = {
     &kp_map, &kp_map_smap, &kp_map_outer, &kp_map_walk, &kp_map_walk_vma,
-    &kp_gup_remote, &kp_gup_remote_inner,
+    &kp_gup_remote, &kp_gup_remote_inner, &kp_access_remote_vm,
 };
 #define N_MAP_PROBES ARRAY_SIZE(map_probes)
 static bool map_registered;
@@ -828,7 +888,7 @@ static int sus_map_stat_show(char *buf, const struct kernel_param *kp)
     return scnprintf(buf, PAGE_SIZE,
                      "rules=%d armed=%d/%d walk_seen=%d walk_vma=%d walk_skipped=%d "
                      "ops_hit=%d scan_fail=%d nofile=%d nomatch=%d getlink: calls=%d skip=%d nomatch=%d hides=%d putfail=%d line_hides=%d\n"
-                     "vm: gup_calls=%d inner_calls=%d hides=%d\n"
+                     "vm: gup_calls=%d inner_calls=%d hides=%d arvm_calls=%d\n"
                      "ops: smaps=%px smaps_shmem=%px pagemap=%px\n",
                      sus_map_active(), armed, (int)N_MAP_PROBES,
                      atomic_read(&n_walk_seen), atomic_read(&n_walk_seen_vma),
@@ -839,7 +899,7 @@ static int sus_map_stat_show(char *buf, const struct kernel_param *kp)
                      atomic_read(&n_getlink_nomatch), atomic_read(&n_map_files_hides),
                      atomic_read(&n_map_files_putfail), atomic_read(&n_show_hides),
                      atomic_read(&n_gup_calls), atomic_read(&n_gup_inner_calls),
-                     atomic_read(&n_vm_hides),
+                     atomic_read(&n_vm_hides), atomic_read(&n_arvm_calls),
                      sus_map_ops_smaps, sus_map_ops_smaps_shmem,
                      sus_map_ops_pagemap);
 }

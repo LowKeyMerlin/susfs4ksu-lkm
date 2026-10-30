@@ -5,6 +5,7 @@
 #include <linux/string.h>
 #include <linux/err.h>	/* IS_ERR */
 #include <linux/mm.h>	/* PAGE_SIZE */
+#include <linux/ptrace.h>	/* struct pt_regs, PSR_BTYPE_MASK */
 
 /* A kernel pointer taken out of a kprobe register, checked before dereference: single_open()'s fake inode is (void *)1
  * and a kretprobe hands that sentinel over as "the argument" - the sus_map vma probe panicked on exactly that (fault
@@ -130,6 +131,11 @@ void sus_path_exit(void);
 int susfs_sus_mount_init(void);
 void susfs_sus_mount_exit(void);
 
+/* vfs_statfs face of a marked mount: see sus_mount.c. Fills *out with a held path on the
+ * first non-KSU ancestor when the caller is umounted and path->mnt is marked; false otherwise. */
+bool sus_mount_non_sus_path(const struct path *path, struct path *out);
+bool sus_mount_has_marked(void);
+
 int susfs_spoof_cmdline_init(void);
 void susfs_spoof_cmdline_exit(void);
 
@@ -165,6 +171,7 @@ enum susfs_feature {
 	SUSFS_FEAT_OPEN_REDIRECT,
 	SUSFS_FEAT_SUS_MAP,
 	SUSFS_FEAT_AVC_SPOOF,	/* commands only: no upstream CONFIG_* line for it */
+	SUSFS_FEAT_PRIORITY_FILTER,	/* commands only, like the one above */
 	SUSFS_FEAT_COUNT,
 };
 
@@ -181,6 +188,12 @@ void sus_path_supercall(unsigned int cmd, void __user **arg);
 void susfs_kstat_supercall(unsigned int cmd, void __user **arg);
 void susfs_open_redirect_supercall(void __user **arg);
 void susfs_sus_mount_supercall(void __user **arg);
+void susfs_priority_filter_supercall(void __user **arg);
+
+/* The getpriority and ioprio calls answer ESRCH for the uids of the packages the supercall names
+ * (susfs_priority_filter.c). */
+int susfs_priority_filter_init(void);
+void susfs_priority_filter_exit(void);
 
 int susfs_hide_syms_init(void);
 void susfs_hide_syms_exit(void);
@@ -258,5 +271,15 @@ void susfs_or_entry_exit(void);
  * where filename_create() would have answered EEXIST before any LSM hook could run. */
 int susfs_create_gate_init(void);
 void susfs_create_gate_exit(void);
+
+/* Leave a function a kprobe pre_handler has taken over as if it had returned, by resuming at its caller.  The probed
+ * functions are mostly entered through an indirect call, and the BTYPE that call left in the saved PSTATE makes the
+ * first instruction back in the caller trap on a BTI kernel.  arm64_skip_faulting_instruction() clears it for the
+ * same reason.  The caller sets the return value. */
+static inline void susfs_probe_return(struct pt_regs *regs)
+{
+	regs->pstate &= ~PSR_BTYPE_MASK;
+	regs->pc = regs->regs[30];
+}
 
 #endif
