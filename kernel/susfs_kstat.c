@@ -81,7 +81,9 @@
 #define KSTAT_AUTO_SPOOF_FULL_CLONE (KSTAT_AUTO_SPOOF | \
 	KSTAT_SPOOF_NLINK | KSTAT_SPOOF_SIZE)
 
-#define SUS_KSTAT_MAX 32
+/* First allocation holds this many rules; the table doubles from here as rules are added, so there
+ * is no fixed ceiling the way the old SUS_KSTAT_MAX array imposed. */
+#define SUS_KSTAT_INIT_CAP 16
 /* Upstream's target_pathname is char[256]: a shorter buffer truncates a legal long path into a wrong rule. */
 #define KSTAT_PATH_MAX 256
 
@@ -111,8 +113,11 @@ struct sus_kstat_entry {
 	unsigned int spoofed_mnt_id;
 };
 
-static struct sus_kstat_entry kstat_entries[SUS_KSTAT_MAX];
+/* Grown on demand (see kstat_table_grow); swapped under kstat_table_lock so a probe-context reader
+ * never sees a half-replaced pointer. nkstat <= kstat_cap always. */
+static struct sus_kstat_entry *kstat_entries;
 static int nkstat;
+static int kstat_cap;
 static DEFINE_MUTEX(kstat_lock);
 
 /* Table locking, in two tiers.  kstat_lock (mutex) serialises WRITERS and the /proc read, because
@@ -309,14 +314,44 @@ static struct sus_kstat_entry *susfs_kstat_find_by_path(const char *path)
 	return NULL;
 }
 
-/* Append a fully-prepared entry; -ENOSPC when the table is full. */
+/* Double the table. Runs in the writer's sleeping context (caller holds kstat_lock, which also
+ * makes nkstat/kstat_cap stable here), so the allocation is GFP_KERNEL and happens before the
+ * spinlock. The pointer swap is under kstat_table_lock, where readers serialise: once we hold it
+ * no reader is still walking the old buffer, so it can be freed as soon as the lock drops. */
+static int kstat_table_grow(void)
+{
+	struct sus_kstat_entry *old, *buf;
+	unsigned long flags;
+	int cap = kstat_cap ? kstat_cap * 2 : SUS_KSTAT_INIT_CAP;
+
+	buf = kvmalloc_array(cap, sizeof(*buf), GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	spin_lock_irqsave(&kstat_table_lock, flags);
+	old = kstat_entries;
+	if (nkstat)
+		memcpy(buf, old, nkstat * sizeof(*buf));
+	kstat_entries = buf;
+	kstat_cap = cap;
+	spin_unlock_irqrestore(&kstat_table_lock, flags);
+
+	kvfree(old);
+	return 0;
+}
+
+/* Append a fully-prepared entry, growing the table first if it is full.
+ * Returns the new index, or -ENOMEM when the table could not grow. */
 static int kstat_table_append(const struct sus_kstat_entry *src)
 {
 	unsigned long flags;
 	int idx = -1;
 
+	if (nkstat >= kstat_cap && kstat_table_grow())
+		return -ENOMEM;
+
 	spin_lock_irqsave(&kstat_table_lock, flags);
-	if (nkstat < SUS_KSTAT_MAX) {
+	if (nkstat < kstat_cap) {
 		idx = nkstat;
 		kstat_entries[idx] = *src;
 		nkstat = idx + 1;
@@ -2757,6 +2792,11 @@ void susfs_kstat_exit(void)
 		kstat_proc_entry = NULL;
 	}
 	kstat_table_clear();
+	/* The drain above means no probe-context reader can still be in the table, so the backing
+	 * buffer can go. kvfree(NULL) is fine when a failed load never allocated one. */
+	kvfree(kstat_entries);
+	kstat_entries = NULL;
+	kstat_cap = 0;
 }
 
 static int kstat_proc_show(struct seq_file *m, void *v)

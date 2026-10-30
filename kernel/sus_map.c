@@ -23,7 +23,9 @@
 #include <linux/err.h>		/* IS_ERR/ERR_PTR for the getlink hook */
 #include <linux/cred.h>		/* current_uid(), for the read gate */
 #include <linux/spinlock.h>	/* serialises rule publication */
-#include <linux/slab.h>		/* kmalloc(GFP_ATOMIC), for the deferred path release */
+#include <linux/slab.h>		/* kmalloc(GFP_ATOMIC), kvmalloc/kvfree_rcu for the rule table */
+#include <linux/rcupdate.h>	/* the rule table is RCU-published */
+#include <linux/overflow.h>	/* struct_size() for the flex-array table */
 #include <linux/task_work.h>	/* the map_files reference is released from task_work */
 #include <linux/mutex.h>	/* map_ctl_lock: serialises probe arming */
 #include <linux/proc_fs.h>	/* proc_create() for /proc/susfs_map */
@@ -38,15 +40,27 @@
 #include "patch_memory.h"
 #include "susfs_fp_hook.h"	/* susfs_fp_drain: wait out in-flight wrappers */
 
-#define SUS_MAP_MAX 64
+#define SUS_MAP_INIT_CAP 64
 
 struct sus_map_entry {
     unsigned long target_ino;
     dev_t target_dev;
 };
 
-static struct sus_map_entry map_entries[SUS_MAP_MAX];
-static int nmap;
+/* RCU-published backing store, grown on demand so there is no fixed rule ceiling.  The used
+ * count lives inside the table: a reader that dereferenced an older, smaller table reads that
+ * table's own frozen count and so can never index past its end.  Slots are still published one
+ * at a time with release semantics (target_ino last, 0 = free), so add/delete/reuse act in
+ * place under map_table_lock; only growth allocates, swapping the whole table and freeing the
+ * old one after an RCU grace period. */
+struct sus_map_table {
+    struct rcu_head rcu;
+    int n;      /* used slots; advanced with release only after the slot is filled */
+    int cap;    /* immutable for this table's lifetime */
+    struct sus_map_entry e[];
+};
+
+static struct sus_map_table __rcu *map_tbl;
 
 typedef int (*susfs_show_fn_t)(struct seq_file *, void *);
 static const struct seq_operations *sus_map_maps_op;
@@ -69,46 +83,81 @@ static DEFINE_SPINLOCK(map_table_lock);
 static unsigned long param_map_ino;
 module_param_named(map_ino, param_map_ino, ulong, 0644);
 
-/* dev==0 means "any filesystem": only the map_ino parameter can pick that. */
+/* Fill slot `idx` of `tbl` and publish it (dev first, ino last with release). */
+static void sus_map_fill(struct sus_map_table *tbl, int idx, unsigned long ino, dev_t dev)
+{
+    WRITE_ONCE(tbl->e[idx].target_dev, dev);
+    smp_store_release(&tbl->e[idx].target_ino, ino);
+}
+
+/* dev==0 means "any filesystem".  Callers run in sleeping context (supercall, /proc write,
+ * module init), so a bigger table is allocated outside the spinlock and installed under it;
+ * a spare that loses the race (another writer grew first, or a free slot turned up) is freed. */
 static int sus_map_add_full(unsigned long ino, dev_t dev, bool *added)
 {
+    struct sus_map_table *tbl, *spare = NULL;
     unsigned long flags;
-    int i, rc = 0;
+    int i, cur_cap;
 
     *added = false;
     if (!ino)
         return -EINVAL;
 
-    spin_lock_irqsave(&map_table_lock, flags);
-    for (i = 0; i < nmap; i++) {
-        if (map_entries[i].target_ino == ino && map_entries[i].target_dev == dev) {
+    for (;;) {
+        spin_lock_irqsave(&map_table_lock, flags);
+        tbl = rcu_dereference_protected(map_tbl, lockdep_is_held(&map_table_lock));
+        for (i = 0; i < tbl->n; i++) {
+            if (tbl->e[i].target_ino == ino && tbl->e[i].target_dev == dev) {
+                spin_unlock_irqrestore(&map_table_lock, flags);
+                kvfree(spare);
+                return 0;
+            }
+            if (tbl->e[i].target_ino)
+                continue;
+            sus_map_fill(tbl, i, ino, dev);
+            *added = true;
             spin_unlock_irqrestore(&map_table_lock, flags);
+            kvfree(spare);
             return 0;
         }
-        if (map_entries[i].target_ino)
-            continue;
-        WRITE_ONCE(map_entries[i].target_dev, dev);
-        smp_store_release(&map_entries[i].target_ino, ino);
-        *added = true;
+        if (tbl->n < tbl->cap) {
+            sus_map_fill(tbl, tbl->n, ino, dev);
+            smp_store_release(&tbl->n, tbl->n + 1);
+            *added = true;
+            spin_unlock_irqrestore(&map_table_lock, flags);
+            kvfree(spare);
+            return 0;
+        }
+        /* Full.  Install the spare if it is big enough for the table we are now looking at,
+         * else capture the current capacity, drop the lock and go allocate a bigger one. */
+        if (spare && spare->cap > tbl->cap) {
+            memcpy(spare->e, tbl->e, tbl->n * sizeof(tbl->e[0]));
+            spare->n = tbl->n;
+            sus_map_fill(spare, spare->n, ino, dev);
+            smp_store_release(&spare->n, spare->n + 1);
+            *added = true;
+            rcu_assign_pointer(map_tbl, spare);
+            spin_unlock_irqrestore(&map_table_lock, flags);
+            kvfree_rcu(tbl, rcu);
+            return 0;
+        }
+        cur_cap = tbl->cap;
         spin_unlock_irqrestore(&map_table_lock, flags);
-        return 0;
+
+        kvfree(spare);
+        spare = kvmalloc(struct_size(spare, e, cur_cap * 2), GFP_KERNEL);
+        if (!spare)
+            return -ENOMEM;
+        spare->cap = cur_cap * 2;
+        spare->n = 0;
     }
-    if (nmap < SUS_MAP_MAX) {
-        WRITE_ONCE(map_entries[nmap].target_dev, dev);
-        smp_store_release(&map_entries[nmap].target_ino, ino);
-        smp_store_release(&nmap, nmap + 1);
-        *added = true;
-    } else {
-        rc = -ENOSPC;
-    }
-    spin_unlock_irqrestore(&map_table_lock, flags);
-    return rc;
 }
 
 /* A deleted rule leaves a zero inode behind; add_full() reuses that slot, so a script
  * that adds and removes paths does not exhaust the 64 entries. */
 static int sus_map_del_full(unsigned long ino, dev_t dev)
 {
+    struct sus_map_table *tbl;
     unsigned long flags;
     int i, rc = -ENOENT;
 
@@ -116,14 +165,15 @@ static int sus_map_del_full(unsigned long ino, dev_t dev)
         return -EINVAL;
 
     spin_lock_irqsave(&map_table_lock, flags);
-    for (i = 0; i < nmap; i++) {
-        if (map_entries[i].target_ino != ino)
+    tbl = rcu_dereference_protected(map_tbl, lockdep_is_held(&map_table_lock));
+    for (i = 0; i < tbl->n; i++) {
+        if (tbl->e[i].target_ino != ino)
             continue;
-        if (map_entries[i].target_dev && map_entries[i].target_dev != dev)
+        if (tbl->e[i].target_dev && tbl->e[i].target_dev != dev)
             continue;
         /* target_ino is the publish word; leave target_dev alone so a reader that
          * saw the old ino never sees it paired with the dev==0 wildcard. */
-        smp_store_release(&map_entries[i].target_ino, 0);
+        smp_store_release(&tbl->e[i].target_ino, 0);
         rc = 0;
         break;
     }
@@ -133,6 +183,7 @@ static int sus_map_del_full(unsigned long ino, dev_t dev)
 
 static int sus_map_del_exact(unsigned long ino, dev_t dev)
 {
+    struct sus_map_table *tbl;
     unsigned long flags;
     int i, rc = -ENOENT;
 
@@ -140,10 +191,11 @@ static int sus_map_del_exact(unsigned long ino, dev_t dev)
         return -EINVAL;
 
     spin_lock_irqsave(&map_table_lock, flags);
-    for (i = 0; i < nmap; i++) {
-        if (map_entries[i].target_ino != ino || map_entries[i].target_dev != dev)
+    tbl = rcu_dereference_protected(map_tbl, lockdep_is_held(&map_table_lock));
+    for (i = 0; i < tbl->n; i++) {
+        if (tbl->e[i].target_ino != ino || tbl->e[i].target_dev != dev)
             continue;
-        smp_store_release(&map_entries[i].target_ino, 0);
+        smp_store_release(&tbl->e[i].target_ino, 0);
         rc = 0;
         break;
     }
@@ -153,25 +205,50 @@ static int sus_map_del_exact(unsigned long ino, dev_t dev)
 
 static int sus_map_clear(void)
 {
+    struct sus_map_table *tbl;
     unsigned long flags;
     int i;
 
     spin_lock_irqsave(&map_table_lock, flags);
-    for (i = 0; i < nmap; i++)
-        smp_store_release(&map_entries[i].target_ino, 0);
-    smp_store_release(&nmap, 0);
+    tbl = rcu_dereference_protected(map_tbl, lockdep_is_held(&map_table_lock));
+    for (i = 0; i < tbl->n; i++)
+        smp_store_release(&tbl->e[i].target_ino, 0);
+    smp_store_release(&tbl->n, 0);
     spin_unlock_irqrestore(&map_table_lock, flags);
     return 0;
 }
 
 static int sus_map_active(void)
 {
-    int i, n = smp_load_acquire(&nmap), active = 0;
+    struct sus_map_table *tbl;
+    int i, n, active = 0;
 
-    for (i = 0; i < n; i++)
-        if (smp_load_acquire(&map_entries[i].target_ino))
-            active++;
+    rcu_read_lock();
+    tbl = rcu_dereference(map_tbl);
+    if (tbl) {
+        n = smp_load_acquire(&tbl->n);
+        for (i = 0; i < n; i++)
+            if (smp_load_acquire(&tbl->e[i].target_ino))
+                active++;
+    }
+    rcu_read_unlock();
     return active;
+}
+
+/* Cheap gate for the per-VMA probe fast path: true when no slot has ever been filled since the
+ * last clear.  Matches the old nmap==0 test (a deleted rule leaves its slot counted), so a
+ * stale answer costs at most one skipped lookup, never a wrong hide. */
+static bool sus_map_empty(void)
+{
+    struct sus_map_table *tbl;
+    bool empty = true;
+
+    rcu_read_lock();
+    tbl = rcu_dereference(map_tbl);
+    if (tbl)
+        empty = (smp_load_acquire(&tbl->n) == 0);
+    rcu_read_unlock();
+    return empty;
 }
 
 static void sus_map_add(unsigned long ino)
@@ -183,23 +260,31 @@ static void sus_map_add(unsigned long ino)
 
 static bool sus_map_lookup(unsigned long ino, dev_t dev)
 {
-    int n = smp_load_acquire(&nmap);
-    int i;
+    struct sus_map_table *tbl;
+    bool hit = false;
+    int i, n;
 
     if (!ino)
         return false;
-    for (i = 0; i < n; i++) {
-        unsigned long e_ino = smp_load_acquire(&map_entries[i].target_ino);
-        dev_t e_dev;
+    rcu_read_lock();
+    tbl = rcu_dereference(map_tbl);
+    if (tbl) {
+        n = smp_load_acquire(&tbl->n);
+        for (i = 0; i < n; i++) {
+            unsigned long e_ino = smp_load_acquire(&tbl->e[i].target_ino);
+            dev_t e_dev;
 
-        if (!e_ino || e_ino != ino)
-            continue;
-        e_dev = READ_ONCE(map_entries[i].target_dev);
-        if (e_dev && e_dev != dev)
-            continue;
-        return true;
+            if (!e_ino || e_ino != ino)
+                continue;
+            e_dev = READ_ONCE(tbl->e[i].target_dev);
+            if (e_dev && e_dev != dev)
+                continue;
+            hit = true;
+            break;
+        }
     }
-    return false;
+    rcu_read_unlock();
+    return hit;
 }
 
 /* ---- the read gate ----
@@ -645,7 +730,7 @@ static int sus_map_vm_access_pre(struct kprobe *kp, struct pt_regs *regs)
     struct vm_area_struct *vma;
     struct inode *inode;
 
-    if (!smp_load_acquire(&nmap))
+    if (sus_map_empty())
         return 0;
     if (!sus_map_gate_ok())
         return 0;
@@ -820,7 +905,7 @@ static int sus_map_access_remote_vm_pre(struct kprobe *kp, struct pt_regs *regs)
     struct inode *inode;
     bool hide = false;
 
-    if (!smp_load_acquire(&nmap))
+    if (sus_map_empty())
         return 0;
     if (!sus_map_gate_ok())
         return 0;
@@ -1017,7 +1102,7 @@ static int sus_map_register_probes(void)
 
     if (n)
         SUSFS_LOGI("sus_map: %d/%d probes armed (%d rules)\n",
-                n, (int)N_MAP_PROBES, nmap);
+                n, (int)N_MAP_PROBES, sus_map_active());
 
     /* The map_files hook is a kretprobe, so it lives outside map_probes[] (which
      * holds struct kprobe *) and is tracked on its own; optional like the rest. */
@@ -1123,21 +1208,29 @@ static int sus_map_del_path(const char *path)
 
 static int sus_map_proc_show(struct seq_file *m, void *v)
 {
-    int i, n = smp_load_acquire(&nmap), active = 0;
+    struct sus_map_table *tbl;
+    int i, n = 0, cap = 0, active = 0;
 
-    for (i = 0; i < n; i++)
-        if (smp_load_acquire(&map_entries[i].target_ino))
-            active++;
+    rcu_read_lock();
+    tbl = rcu_dereference(map_tbl);
+    if (tbl) {
+        n = smp_load_acquire(&tbl->n);
+        cap = tbl->cap;
+        for (i = 0; i < n; i++)
+            if (smp_load_acquire(&tbl->e[i].target_ino))
+                active++;
+    }
 
-    seq_printf(m, "rules: %d/%d\n", active, SUS_MAP_MAX);
+    seq_printf(m, "rules: %d/%d\n", active, cap);
     for (i = 0; i < n; i++) {
-        unsigned long ino = smp_load_acquire(&map_entries[i].target_ino);
+        unsigned long ino = smp_load_acquire(&tbl->e[i].target_ino);
 
         if (!ino)
             continue;
         seq_printf(m, "ino=%lu dev=%lu\n", ino,
-                   (unsigned long)READ_ONCE(map_entries[i].target_dev));
+                   (unsigned long)READ_ONCE(tbl->e[i].target_dev));
     }
+    rcu_read_unlock();
     return 0;
 }
 
@@ -1210,7 +1303,16 @@ static struct proc_dir_entry *sus_map_entry;
 
 int susfs_sus_map_init(void)
 {
+    struct sus_map_table *tbl;
     int rc;
+
+    /* The backing table must exist before any rule is added or any reader runs. */
+    tbl = kvmalloc(struct_size(tbl, e, SUS_MAP_INIT_CAP), GFP_KERNEL);
+    if (!tbl)
+        return -ENOMEM;
+    tbl->n = 0;
+    tbl->cap = SUS_MAP_INIT_CAP;
+    rcu_assign_pointer(map_tbl, tbl);
 
     if (susfs_control_node_allowed()) {
         sus_map_entry = proc_create("susfs_map", 0777, NULL, &sus_map_proc_ops);
@@ -1222,7 +1324,7 @@ int susfs_sus_map_init(void)
     }
 
     sus_map_add(param_map_ino);
-    if (nmap == 0) {
+    if (sus_map_active() == 0) {
         SUSFS_LOGI("sus_map: no rules, hook not installed\n");
         return 0;
     }
@@ -1297,11 +1399,19 @@ void susfs_sus_map_exit(void)
     map_registered = false;
     mutex_unlock(&map_ctl_lock);
 
-    /* Published the way sus_map_add_full() does it (smp_store_release against the
-     * smp_load_acquire readers); a plain store would break that protocol.  No reader can be live
-     * by now - every probe is unregistered above - but the write should still have the right
-     * shape. */
-    smp_store_release(&nmap, 0);
+    /* Every probe is unregistered and drained above, so no reader can still hold the table.
+     * A plain free is enough then, but kvfree_rcu keeps the same "never free under a reader"
+     * protocol the growth path uses.  Runs for both a failed-load rollback and an unload, so it
+     * tolerates a NULL table (init failed before the allocation). */
+    {
+        struct sus_map_table *tbl;
+
+        tbl = rcu_dereference_protected(map_tbl, true);
+        if (tbl) {
+            rcu_assign_pointer(map_tbl, NULL);
+            kvfree_rcu(tbl, rcu);
+        }
+    }
 }
 
 /* supercall: CMD_SUSFS_ADD_SUS_MAP (resolve path -> ino/dev, register hook) */
