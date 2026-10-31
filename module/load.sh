@@ -21,14 +21,12 @@ exec >"$MODDIR/load.log" 2>&1
 echo "susfs_guard_lkm loader: $(date)"
 # The /proc control nodes exist only while sus_path's LSM layer is installed, so
 # their presence means susfs is already up (built-in or an earlier load). Do not stack.
-PROC_NODE=${SUSFS_PROC_NODE:-/proc/susfs_path}
-SYS_MODULE=${SUSFS_SYS_MODULE:-/sys/module/susfs_guard_lkm}
-if [ -e "$PROC_NODE" ] || [ -d "$SYS_MODULE" ]; then
+if [ -e /proc/susfs_path ] || [ -d /sys/module/susfs_guard_lkm ]; then
   echo "susfs already present; nothing to do."
   set_description "already present (built-in or loaded earlier)"
   exit 0
 fi
-REL=$(cat "${SUSFS_OSRELEASE:-/proc/sys/kernel/osrelease}" 2>/dev/null) || REL=""
+REL=$(cat /proc/sys/kernel/osrelease 2>/dev/null) || REL=""
 [ -n "$REL" ] || REL="unknown"
 . "$MODDIR/kmi.sh"
 # A non-empty packaged override wins over the release string, but only when it
@@ -84,8 +82,8 @@ echo "kernel $REL -> $KMI ($MODE)"
 # blocks in init_module(2) while the kernel runs module_init().  A timeout is a failed load,
 # not a reason to try another KMI.
 LOAD_TIMEOUT=60
-TIMEOUT_LOG=${SUSFS_TIMEOUT_LOG:-/data/adb/susfsload_timeout.log}
-TIMEOUT_DMESG_LOG=${SUSFS_TIMEOUT_DMESG_LOG:-/data/adb/susfsload_timeout_dmesg.log}
+TIMEOUT_LOG=/data/adb/susfsload_timeout.log
+TIMEOUT_DMESG_LOG=/data/adb/susfsload_timeout_dmesg.log
 TIMEOUT_BIN=""
 for candidate in timeout /system/bin/timeout; do
   if command -v "$candidate" >/dev/null 2>&1; then
@@ -122,14 +120,11 @@ else
   echo "load failed: no timeout utility for the ${LOAD_TIMEOUT}s module_init limit"
   rc=1
 fi
-# TERM does not stop init_module(2) while module_init() runs: the load can finish after the budget
-# and only then does the loader die, so 124 may arrive with the module up.  The same nodes the
-# pre-check above looks for say which it was; a loaded module is a success, reported as late.
-LATE=""
-if [ "$rc" = 124 ] && { [ -e "$PROC_NODE" ] || [ -d "$SYS_MODULE" ]; }; then
+# TERM is acted on only when init_module(2) returns to userspace, so a slow module_init() can
+# finish after the timeout fires and 124 arrives with the module up. That is a success.
+if [ "$rc" = 124 ] && { [ -e /proc/susfs_path ] || [ -d /sys/module/susfs_guard_lkm ]; }; then
   echo "load took longer than ${LOAD_TIMEOUT}s but the module is up."
   rc=0
-  LATE=", late"
 fi
 if [ "$rc" = 124 ]; then
   echo "load timed out after ${LOAD_TIMEOUT}s"
@@ -155,11 +150,11 @@ if [ "$rc" = 0 ]; then
   # The nodes exist now (expose_proc=1); put back what the WebUI saved last boot.
   /system/bin/sh "$MODDIR/toggle.sh" apply
   if [ "$MODE" = custom ]; then
-    set_description "✅ custom load ($KMI$LATE) | kernel $REL"
+    set_description "✅ custom load ($KMI) | kernel $REL"
   elif [ "$MODE" = ksud ]; then
-    set_description "✅ ksud-detected ($KMI$LATE) | kernel $REL"
+    set_description "✅ ksud-detected ($KMI) | kernel $REL"
   else
-    set_description "✅ auto-detected ($KMI$LATE) | kernel $REL"
+    set_description "✅ auto-detected ($KMI) | kernel $REL"
   fi
 elif [ "$rc" = 17 ]; then
   # EEXIST: the module refused to stack on a susfs that is already up (a built-in susfs, or a

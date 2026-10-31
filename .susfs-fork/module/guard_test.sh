@@ -166,7 +166,7 @@ check "unsettled boot disables the module" disabled
 check "unsettled boot loads nothing" '! loaded'
 check "unsettled boot clears the marker" '! armed'
 check "trip reason is recorded" 'grep -q "ended early" "$M/guard.tripped"'
-check "trip is shown on the module card" 'described "Disabled · bootloop guard tripped"'
+check "trip is shown on the module card" 'described "Disabled | bootloop guard tripped"'
 check "trip disables other modules by default" '[ -f "$T/modules/other_a/disable" ]'
 check "trip disables a module with a space in its name" '[ -f "$T/modules/with space/disable" ]'
 check "trip lists the modules it disabled" '[ "$(sort "$M/guard.disabled" | tr "\n" ,)" = "other_a,with space," ]'
@@ -623,7 +623,7 @@ fresh
 load
 check "no boot id loads nothing" '! loaded'
 check "no boot id does not arm" '! armed'
-check "no boot id is shown on the module card" 'described "Not loaded · "'
+check "no boot id is shown on the module card" 'described "Not loaded | "'
 
 # A probe that cannot run, or a SUSFS that already answers, loads nothing.
 fresh
@@ -646,7 +646,7 @@ fresh
 mkdir "$M/guard.armed.tmp"
 load
 check "unwritable marker loads nothing" '! loaded'
-check "unwritable marker is shown on the module card" 'described "Not loaded · "'
+check "unwritable marker is shown on the module card" 'described "Not loaded | "'
 
 # A loader that fails leaves the marker armed, so a crash inside it is caught next boot.
 fresh
@@ -678,44 +678,44 @@ check "description is plain text after a trip" '! grep -q "[&]" "$M/module.prop"
 card() { sed -n 's/^description=//p' "$M/module.prop"; }
 fresh
 load
-check "card of a plain load" '[ "$(card)" = "Active · boot load · android15-6.6 · SUSFS 2.3.0" ]'
+check "card of a plain load" '[ "$(card)" = "Active | boot load | android15-6.6 | SUSFS 2.3.0" ]'
 fresh
 : >"$M/early_load"
 : >"$T/hook"
 load
-check "card of an early load" '[ "$(card)" = "Active · early load · android15-6.6 · SUSFS 2.3.0" ]'
+check "card of an early load" '[ "$(card)" = "Active | early load | android15-6.6 | SUSFS 2.3.0" ]'
 fresh
 : >"$M/early_load"
 load
-check "early load needs the hook as well as the marker" '[ "$(card)" = "Active · boot load · android15-6.6 · SUSFS 2.3.0" ]'
+check "early load needs the hook as well as the marker" '[ "$(card)" = "Active | boot load | android15-6.6 | SUSFS 2.3.0" ]'
 fresh
 printf '%s\n' '[   12.3] susfs_guard_lkm: sus_mount init failed -22 - that feature stays off' \
   '[   12.4] susfs_guard_lkm: kstat init failed -2 - that feature stays off' \
   '[   12.5] susfs_guard_lkm: sus_mount init failed -22 - that feature stays off' >"$T/dmesg.out"
 load
-check "card of a load with layers off" '[ "$(card)" = "Degraded · kstat, sus_mount off · android15-6.6 · SUSFS 2.3.0" ]'
+check "card of a load with layers off" '[ "$(card)" = "Degraded | kstat, sus_mount off | android15-6.6 | SUSFS 2.3.0" ]'
 fresh
 for n in a b c d e; do echo "[ 1.0] susfs_guard_lkm: l_$n init failed -1 - that feature stays off" >>"$T/dmesg.out"; done
 load
-check "card names three layers and counts the rest" 'card | grep -q "^Degraded · l_a, l_b, l_c +2 off · "'
+check "card names three layers and counts the rest" 'card | grep -q "^Degraded | l_a, l_b, l_c +2 off | "'
 fresh
 echo 7 >"$T/load_rc"
 load
-check "card of a failed loader" '[ "$(card)" = "Not loaded · the loader failed with error 7 · android15-6.6 · SUSFS 2.3.0" ]'
+check "card of a failed loader" '[ "$(card)" = "Not loaded | the loader failed with error 7 | android15-6.6 | SUSFS 2.3.0" ]'
 fresh
 echo 124 >"$T/load_rc"
 load
-check "card of a load that timed out" '[ "$(card)" = "Not loaded · the load did not finish in 60s · android15-6.6 · SUSFS 2.3.0" ]'
+check "card of a load that timed out" '[ "$(card)" = "Not loaded | the load did not finish in 60s | android15-6.6 | SUSFS 2.3.0" ]'
 fresh
 printf 'select_kmi() { return 1; }\n' >"$M/kmi.sh"
 echo 1 >"$T/load_rc"
 echo "6.6.30-android15-8-g0123456-ab1" >"$T/osrelease"
 load
-check "card of a kernel with no build" '[ "$(card)" = "Not loaded · no build for kernel 6.6.30-android15-8-g0123456-ab1 · SUSFS 2.3.0" ]'
+check "card of a kernel with no build" '[ "$(card)" = "Not loaded | no build for kernel 6.6.30-android15-8-g0123456-ab1 | SUSFS 2.3.0" ]'
 fresh
 echo 0 >"$T/probe_rc"
 load
-check "card when SUSFS already answers" 'card | grep -q "^Standing by · SUSFS already answers"'
+check "card when SUSFS already answers" 'card | grep -q "^Standing by | SUSFS already answers"'
 check "cards carry nothing sed would treat specially" '! card | grep -q "[&#\\]"'
 
 echo "guard_test ($SH): $pass passed, $fail failed"

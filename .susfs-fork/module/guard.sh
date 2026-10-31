@@ -69,7 +69,7 @@ guard_card() {
   line=$1
   shift
   for part in "$@"; do
-    [ -z "$part" ] || line="$line · $part"
+    [ -z "$part" ] || line="$line | $part"
   done
   guard_describe "$line"
 }

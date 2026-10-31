@@ -39,7 +39,23 @@ class LoadSh(unittest.TestCase):
         self.mod = base / "mod"
         (self.mod / "lib").mkdir(parents=True)
         (self.mod / "bin").mkdir()
-        for name in ("load.sh", "kmi.sh", "toggle.sh"):
+        self.node = base / "proc_susfs_path"
+        self.tlog = base / "timeout.log"
+        self.dlog = base / "timeout_dmesg.log"
+        # The script keeps its paths as literals, so the copy under test gets the scratch ones.
+        paths = {
+            "/proc/susfs_path": self.node,
+            "/sys/module/susfs_guard_lkm": base / "no_such_dir",
+            "/proc/sys/kernel/osrelease": base / "osrelease",
+            "/data/adb/susfsload_timeout.log": self.tlog,
+            "/data/adb/susfsload_timeout_dmesg.log": self.dlog,
+        }
+        text = (ROOT / "module" / "load.sh").read_text(encoding="utf-8").replace("\r\n", "\n")
+        for literal, scratch in paths.items():
+            assert literal in text, literal
+            text = text.replace(literal, scratch.as_posix())
+        (self.mod / "load.sh").write_text(text, encoding="utf-8", newline="\n")
+        for name in ("kmi.sh", "toggle.sh"):
             data = (ROOT / "module" / name).read_bytes().replace(b"\r\n", b"\n")
             (self.mod / name).write_bytes(data)
         put(self.mod / "kmis", KMI + "\n")
@@ -56,18 +72,10 @@ class LoadSh(unittest.TestCase):
             self.mod / "bin" / "susfs_insmod",
             '[ -n "$FAKE_NODE" ] && : > "$FAKE_NODE"\nexit "$FAKE_RC"\n',
         )
-        self.node = base / "proc_susfs_path"
-        self.tlog = base / "timeout.log"
-        self.dlog = base / "timeout_dmesg.log"
 
     def run_load(self, rc, node_up=False):
         env = {
             "PATH": f"{self.stubs.as_posix()}:/usr/bin:/bin:/mingw64/bin",
-            "SUSFS_PROC_NODE": self.node.as_posix(),
-            "SUSFS_SYS_MODULE": (self.node.parent / "no_such_dir").as_posix(),
-            "SUSFS_OSRELEASE": (self.node.parent / "osrelease").as_posix(),
-            "SUSFS_TIMEOUT_LOG": self.tlog.as_posix(),
-            "SUSFS_TIMEOUT_DMESG_LOG": self.dlog.as_posix(),
             "FAKE_RC": str(rc),
             "FAKE_NODE": self.node.as_posix() if node_up else "",
         }
@@ -89,8 +97,6 @@ class LoadSh(unittest.TestCase):
         rc, desc = self.run_load(0, node_up=True)
         self.assertEqual(rc, 0)
         self.assertIn(f"auto-detected ({KMI})", desc)
-        self.assertNotIn("late", desc)
-
     def test_eexist_is_not_a_failure(self):
         rc, desc = self.run_load(17)
         self.assertEqual(rc, 0)
@@ -110,8 +116,9 @@ class LoadSh(unittest.TestCase):
     def test_timeout_after_module_came_up_is_a_late_success(self):
         rc, desc = self.run_load(124, node_up=True)
         self.assertEqual(rc, 0, "the module is loaded: not a failure")
-        self.assertIn("late", desc)
+        self.assertIn("auto-detected", desc)
         self.assertNotIn("timed out", desc)
+        self.assertIn("but the module is up", (self.mod / "load.log").read_text())
         self.assertFalse(self.tlog.exists(), "no timeout report for a load that worked")
 
 
