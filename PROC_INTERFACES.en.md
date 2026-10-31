@@ -18,6 +18,7 @@ Write commands **return `len` on success, a negative errno on failure**.
 | [`/proc/susfs_enable_log`](#procsusfs_enable_log) | runtime log switch | `0` / `1` |
 | [`/proc/susfs_avc_spoof`](#procsusfs_avc_spoof) | hide KernelSU traces in the SELinux AVC audit log | `0` / `1` |
 | [`/proc/susfs_selinux_hide`](#procsusfs_selinux_hide) | whether the running KernelSU build carries its own `selinux_hide` | read-only |
+| [`/proc/susfs_selinux_ctx`](#procsusfs_selinux_ctx) | hide an admin-chosen list of SELinux context types from apps (off until a type is added) | `add <type>` / `del <type>` / `clear` |
 | [`/proc/susfs_hide_modules`](#procsusfs_hide_modules) | drop **other kernel modules** from `/proc/modules` by name | `add <name>` / `del <name>` / `set <name>…` / `clear` |
 | [`/proc/susfs_hide_mounts`](#procsusfs_hide_mounts) | which mounts count as "ours" (the set of mounts to hide) | `add <prefix>` / `del <prefix>` / `set <prefix>…` / `reset` / `clear` |
 | [`/proc/susfs_path`](#procsusfs_path) | the sus_path rule table -- **`cat` is the listing** | `add <path>` / `del <path>` / `clear` |
@@ -156,6 +157,41 @@ This module does not implement an override: what `selinux_hide` answers from -
 `backup_sepolicy` - is a KernelSU-internal object whose lifetime KernelSU itself owns and frees
 when its own copy of the feature is off, so a second one here would mean re-implementing that
 whole mechanism. The WebUI shows this node's state and nothing else for this feature.
+
+---
+
+## /proc/susfs_selinux_ctx
+
+Hides an admin-chosen list of SELinux context **types** (not full contexts - the third field of
+`user:role:type:level`, e.g. `adbroot` for a type a custom ROM's sepolicy adds) from three places
+an app can ask "does this type exist": writing `/sys/fs/selinux/context`, writing
+`/sys/fs/selinux/access` (what `SELinux.checkSELinuxAccess()` and `selinux_check_access()` call
+into), and writing `/proc/self/attr/current` or a sibling attr. Applies only to the processes
+sus_path already hides from (an app uid KernelSU would umount modules for, or an isolated uid) -
+su tooling and system processes are unaffected.
+
+Empty and off at module load. The three hooks arm themselves the moment the list stops being
+empty, and disarm when it goes back to empty - there is no separate enable switch.
+
+**Read**:
+
+```
+armed=1 types=1
+adbroot
+hits: context=0 access=0 setattr=2
+```
+
+**Write**:
+
+```sh
+echo "add adbroot"  > /proc/susfs_selinux_ctx   # hide this type, arm the hooks if this is the first one
+echo "del adbroot"  > /proc/susfs_selinux_ctx    # stop hiding it (not listed -> -ENOENT)
+echo clear          > /proc/susfs_selinux_ctx    # hide nothing, disarm the hooks
+```
+
+Do not add a type any real root-side process transitions into for actual work (`su`/`ksu` and the
+like): the gate only knows *who* is asking, not *why*, so hiding such a type would hide it from
+su tooling too.
 
 ---
 

@@ -18,6 +18,7 @@
 | [`/proc/susfs_enable_log`](#procsusfs_enable_log) | 运行期日志开关 | `0` / `1` |
 | [`/proc/susfs_avc_spoof`](#procsusfs_avc_spoof) | 隐藏 SELinux AVC 审计日志 | `0` / `1` |
 | [`/proc/susfs_selinux_hide`](#procsusfs_selinux_hide) | 正在运行的 KernelSU 是否自带 `selinux_hide` | 只读 |
+| [`/proc/susfs_selinux_ctx`](#procsusfs_selinux_ctx) | 按管理员配置的列表对 App 隐藏指定的 SELinux 上下文类型（列表为空时关闭） | `add <类型>` / `del <类型>` / `clear` |
 | [`/proc/susfs_hide_modules`](#procsusfs_hide_modules) | 按名字把**其它内核模块**从 `/proc/modules` 去掉 | `add <名字>` / `del <名字>` / `set <名字>…` / `clear` |
 | [`/proc/susfs_hide_mounts`](#procsusfs_hide_mounts) | 哪些挂载算"我们的"（决定隐藏的挂载集合） | `add <前缀>` / `del <前缀>` / `set <前缀>…` / `reset` / `clear` |
 | [`/proc/susfs_path`](#procsusfs_path) | sus_path 规则表——**`cat` 就是清单** | `add <路径>` / `del <路径>` / `clear` |
@@ -155,6 +156,39 @@ native_supported=1 native_running=0
 本模块不提供覆盖实现：`selinux_hide`所依赖的 `backup_sepolicy` 是 KernelSU 内部对象，其生命周
 期由 KernelSU 自己管理，在它自身功能关闭时会释放该备份,所以在此重做一套等于重新实现整套机制。
 WebUI 对该功能只展示此节点的状态，不提供开关。
+
+---
+
+## /proc/susfs_selinux_ctx
+
+按管理员配置的列表隐藏指定的 SELinux 上下文**类型**（不是完整上下文，而是
+`user:role:type:level` 里的第三段，比如某些定制 ROM sepolicy 自带的 `adbroot`）。覆盖 App 能
+问出"这个类型存不存在"的三个入口：写 `/sys/fs/selinux/context`、写 `/sys/fs/selinux/access`
+(`SELinux.checkSELinuxAccess()`、`selinux_check_access()` 最终都会走到这里)、以及写
+`/proc/self/attr/current` 或其同类属性。只对 sus_path 本来就会隐藏的那些进程生效（KernelSU 会
+为其卸载模块的 App uid，或 isolated uid）——su 相关工具和系统进程不受影响。
+
+模块加载时列表为空、三个钩子都不挂载。列表从空变为非空时自动挂载，变回空时自动卸载，没有独立
+的开关。
+
+**读取**：
+
+```
+armed=1 types=1
+adbroot
+hits: context=0 access=0 setattr=2
+```
+
+**写入**：
+
+```sh
+echo "add adbroot"  > /proc/susfs_selinux_ctx   # 隐藏该类型；如果是第一条则挂载钩子
+echo "del adbroot"  > /proc/susfs_selinux_ctx   # 取消隐藏（未列出 -> -ENOENT）
+echo clear          > /proc/susfs_selinux_ctx   # 清空列表、卸载钩子
+```
+
+不要把任何真正给 root 侧进程使用的类型（`su`/`ksu` 之类）加进这份列表：这里的门控只看"是谁在
+问"，不看"为什么问"，把这类类型加进去会连带把它从 su 工具自己眼前也隐藏掉。
 
 ---
 
