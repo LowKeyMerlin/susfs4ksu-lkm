@@ -328,10 +328,15 @@ static int kstat_table_grow(void)
 	if (!buf)
 		return -ENOMEM;
 
-	spin_lock_irqsave(&kstat_table_lock, flags);
+	/* The copy is made before the spinlock: entries are only ever written by the five table helpers
+	 * below, and each of their callers holds kstat_lock (supercall, /proc write; exit runs after the
+	 * probes are gone), so nothing changes the old buffer while it is copied and the IRQ-off section
+	 * shrinks to the pointer swap. */
 	old = kstat_entries;
 	if (nkstat)
 		memcpy(buf, old, nkstat * sizeof(*buf));
+
+	spin_lock_irqsave(&kstat_table_lock, flags);
 	kstat_entries = buf;
 	kstat_cap = cap;
 	spin_unlock_irqrestore(&kstat_table_lock, flags);
