@@ -17,6 +17,7 @@
 | [`/proc/susfs_open_redirect`](#procsusfs_open_redirect) | `open()` 重定向（含反向面：`d_path`/`statfs`/`maps`/`fdinfo`） | `add_open_redirect` / `del` / `clear` |
 | [`/proc/susfs_enable_log`](#procsusfs_enable_log) | 运行期日志开关 | `0` / `1` |
 | [`/proc/susfs_avc_spoof`](#procsusfs_avc_spoof) | 隐藏 SELinux AVC 审计日志 | `0` / `1` |
+| [`/proc/susfs_selinux_hide`](#procsusfs_selinux_hide) | 正在运行的 KernelSU 是否自带 `selinux_hide` | 只读 |
 | [`/proc/susfs_hide_modules`](#procsusfs_hide_modules) | 按名字把**其它内核模块**从 `/proc/modules` 去掉 | `add <名字>` / `del <名字>` / `set <名字>…` / `clear` |
 | [`/proc/susfs_hide_mounts`](#procsusfs_hide_mounts) | 哪些挂载算"我们的"（决定隐藏的挂载集合） | `add <前缀>` / `del <前缀>` / `set <前缀>…` / `reset` / `clear` |
 | [`/proc/susfs_path`](#procsusfs_path) | sus_path 规则表——**`cat` 就是清单** | `add <路径>` / `del <路径>` / `clear` |
@@ -137,6 +138,23 @@ echo clear                                                      > /proc/susfs_op
 ```
 0 (su_sid=2907 priv_app_sid=2504 enter=0 hits=0)
 ```
+
+---
+
+## /proc/susfs_selinux_hide
+
+只读。报告 `ksu_selinux_hide_running` 能否通过 kallsyms 解析，即正在运行的 KernelSU 是否自带
+`kernel/feature/selinux_hide.c`，与用户是否开启它无关。tiann/KernelSU、SukiSU-Ultra、BakaSU、
+KernelSU-Next、backslashxx 均自带；不带该功能的分支或非 KernelSU 管理器会报告
+`native_supported=0`。
+
+```
+native_supported=1 native_running=0
+```
+
+本模块不提供覆盖实现：`selinux_hide`所依赖的 `backup_sepolicy` 是 KernelSU 内部对象，其生命周
+期由 KernelSU 自己管理，在它自身功能关闭时会释放该备份,所以在此重做一套等于重新实现整套机制。
+WebUI 对该功能只展示此节点的状态，不提供开关。
 
 ---
 

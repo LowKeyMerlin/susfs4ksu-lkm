@@ -232,9 +232,16 @@ jobs:
           # The saved WebUI choice must reach the nodes at load, then set/get/bad input behave.
           for fact in toggle_enable_log_after_boot=0 toggle_avc_spoof_after_boot=1 \
                       toggle_load_log=0 toggle_set_enable_log_rc=0 toggle_set_avc_spoof_rc=0 \
-                      "toggle_get=enable_log=1 avc_spoof=0 " toggle_bad_value_rc=64; do
+                      toggle_bad_value_rc=64 toggle_set_selinux_hide_rc=64; do
             grep -qxF "ANDROID $fact" /tmp/guest.out || { echo "DIFF: wanted 'ANDROID $fact'"; grep '^ANDROID toggle_' /tmp/guest.out; exit 1; }
           done
+          # toggle_get's selinux_hide field and the node's own line are fork-dependent (native or
+          # none), only their shape is checked; whichever it is, it must never be "unavailable"
+          # once the module is loaded.
+          grep -qE '^ANDROID toggle_get=enable_log=1 avc_spoof=0 selinux_hide=(native|none) $' /tmp/guest.out \
+            || { echo "DIFF: unexpected toggle_get line"; grep '^ANDROID toggle_get=' /tmp/guest.out; exit 1; }
+          grep -qE '^ANDROID selinux_hide_node=native_supported=[01] native_running=[01]$' /tmp/guest.out \
+            || { echo "DIFF: unexpected selinux_hide_node line"; grep '^ANDROID selinux_hide_node=' /tmp/guest.out; exit 1; }
       - name: Run the priority filter in the guest
         run: |
           source .susfs-fork/android/lib.sh

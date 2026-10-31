@@ -48,6 +48,11 @@ touch /data/adb/modules/susfs_guard_lkm/early_load
 
 管理器中的模块页面有两个开关：内核日志（`/proc/susfs_enable_log`）和 AVC 日志伪装（`/proc/susfs_avc_spoof`）。开关会立即写入对应节点，并记录在 `/data/adb/susfs_guard_lkm/toggles`；下次加载成功后由加载器恢复。从未动过的开关保持模块自身的默认值。规则不在此范围内，仍由管理器下发。
 
+还有一行 `selinux_hide` 状态，没有开关。如果已安装的 root 管理器自带的内核补丁本来就带
+`selinux_hide`，这里会显示出来，本模块不会去碰它——在这里重做一套会和管理器自己的实现互相干扰。
+如果管理器不带该功能，这里会变成一条警告，提示需要 KernelSU 或其支持的分支才能使用此功能；本
+模块本身不实现它（原因见接口文档中的 `/proc/susfs_selinux_hide`）。
+
 ## 接口文档
 
 全部 `/proc` 控制节点，见 **[PROC_INTERFACES.md](PROC_INTERFACES.md)**。

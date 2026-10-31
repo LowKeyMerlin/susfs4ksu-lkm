@@ -9,6 +9,8 @@
   @media (prefers-color-scheme: dark) { body { color: #ddd; background: #121212; } }
   label { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid #8884; }
   small { display: block; opacity: .7; }
+  small.warn { opacity: 1; color: #a33; font-weight: 600; }
+  @media (prefers-color-scheme: dark) { small.warn { color: #e88; } }
   #msg { margin-top: 16px; min-height: 1.4em; }
 </style>
 </head>
@@ -48,6 +50,29 @@ function parse(out) {
   return state;
 }
 
+// selinux_hide has no switch: see susfs_selinux_hide.c for why this module does not offer one.
+// "native" means the installed root manager's own kernel patch already answers this, so a
+// second one here would fight it. "none" and "unavailable" are both warnings: this module has
+// no override of its own, so there is nothing backing the feature either way.
+var SELINUX_HIDE_TEXT = {
+  native: { text: "handled by your root manager (kernel patch has selinux_hide built in)", warn: false },
+  none: { text: "Requires KernelSU or a supported fork (SukiSU-Ultra, BakaSU, KernelSU-Next, backslashxx) for this feature. This module does not implement it on its own.", warn: true },
+  unavailable: { text: "/proc/susfs_selinux_hide missing (module not loaded)", warn: true }
+};
+
+function renderSelinuxHide(value) {
+  var info = SELINUX_HIDE_TEXT[value] || SELINUX_HIDE_TEXT.unavailable;
+  var label = document.createElement("label");
+  var text = document.createElement("span");
+  text.textContent = "SELinux hide";
+  var note = document.createElement("small");
+  if (info.warn) note.className = "warn";
+  note.textContent = info.text;
+  text.appendChild(note);
+  label.appendChild(text);
+  return label;
+}
+
 function render(state) {
   var rows = document.getElementById("rows");
   rows.textContent = "";
@@ -75,6 +100,7 @@ function render(state) {
     label.appendChild(box);
     rows.appendChild(label);
   });
+  rows.appendChild(renderSelinuxHide(state.selinux_hide));
 }
 
 function refresh() {

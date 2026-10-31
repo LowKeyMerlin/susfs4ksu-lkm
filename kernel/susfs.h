@@ -149,6 +149,10 @@ bool susfs_log_enabled(void);
 int susfs_avc_spoof_init(void);
 void susfs_avc_spoof_exit(void);
 
+int susfs_selinux_hide_init(void);
+void susfs_selinux_hide_exit(void);
+bool susfs_selinux_hide_native_supported(void);
+
 int susfs_supercall_init(void);
 void susfs_supercall_exit(void);
 /* True when the sys_call_table hook could not arm and the supercall is delivered

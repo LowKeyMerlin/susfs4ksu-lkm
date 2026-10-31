@@ -57,10 +57,24 @@ def main():
         e = Env(sh, Path(d))
         e.node("enable_log", "1\n")
         e.node("avc_spoof", "0 (su_sid=2907 priv_app_sid=2504 enter=0 hits=0)\n")
+        e.node("selinux_hide", "native_supported=0 native_running=0\n")
 
-        # get reads the first word only and reports a missing or odd node as unavailable
+        # get reads the first word only and reports a missing or odd node as unavailable;
+        # selinux_hide is read-only and never appears in the saved config (see below)
         rc, out, _ = e.run("get")
-        assert rc == 0 and out.split() == ["enable_log=1", "avc_spoof=0"], out
+        assert rc == 0 and out.split() == ["enable_log=1", "avc_spoof=0", "selinux_hide=none"], out
+        e.node("selinux_hide", "native_supported=1 native_running=1\n")
+        assert "selinux_hide=native" in e.run("get")[1]
+        (e.proc / "susfs_selinux_hide").unlink()
+        assert "selinux_hide=unavailable" in e.run("get")[1]
+        put(e.proc / "susfs_selinux_hide", "garbage\n")
+        assert "selinux_hide=unavailable" in e.run("get")[1]
+        e.node("selinux_hide", "native_supported=0 native_running=0\n")
+
+        # selinux_hide is not a settable key: refused like any other unknown key, nothing saved
+        before = e.saved()
+        rc, _, err = e.run("set", "selinux_hide", "1")
+        assert rc == 64 and "usage" in err and e.saved() == before
         put(e.proc / "susfs_avc_spoof", "garbage\n")
         assert "avc_spoof=unavailable" in e.run("get")[1]
         (e.proc / "susfs_avc_spoof").unlink()

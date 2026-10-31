@@ -49,11 +49,25 @@ remember() {
   mv "$tmp" "$CONF"
 }
 
+# Read-only: selinux_hide is never a key is_key()/write_node() accept, so "set selinux_hide ..."
+# is refused the same way an unknown key is. There is nothing to write - see susfs_selinux_hide.c.
+read_selinux_hide() {
+  n=$(node_path selinux_hide)
+  [ -r "$n" ] || { echo unavailable; return; }
+  read -r line _ < "$n" 2>/dev/null
+  case "$line" in
+    native_supported=1*) echo native ;;
+    native_supported=0*) echo none ;;
+    *) echo unavailable ;;
+  esac
+}
+
 case $1 in
   get)
     for k in enable_log avc_spoof; do
       echo "$k=$(read_node "$k")"
     done
+    echo "selinux_hide=$(read_selinux_hide)"
     ;;
   set)
     is_key "$2" && is_value "$3" || { echo "usage: toggle.sh set enable_log|avc_spoof 0|1" >&2; exit 64; }

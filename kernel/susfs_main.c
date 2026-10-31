@@ -50,6 +50,7 @@ static const char *const susfs_self_hide_paths[] = {
     "/proc/susfs_open_redirect",
     "/proc/susfs_enable_log",
     "/proc/susfs_avc_spoof",
+    "/proc/susfs_selinux_hide",
     SUSFS_HIDE_MODULES_NODE,
     SUSFS_HIDE_MOUNTS_NODE,
     /* sus_path's own interface (the rule listing): it goes through the same table it
@@ -315,6 +316,8 @@ static struct susfs_layer {
     { "open_redirect",	susfs_open_redirect_init,	susfs_open_redirect_exit, false, SUSFS_FEAT_OPEN_REDIRECT },
     { "enable_log",	susfs_enable_log_init,		susfs_enable_log_exit,	false, SUSFS_FEAT_ENABLE_LOG },
     { "avc_spoof",	susfs_avc_spoof_init,		susfs_avc_spoof_exit,	false, SUSFS_FEAT_AVC_SPOOF },
+    /* Read-only detection, nothing to arm: NOT fatal either way. */
+    { "selinux_hide",	susfs_selinux_hide_init,	susfs_selinux_hide_exit, false, -1 },
     { "supercall",	susfs_supercall_init,		susfs_supercall_exit,	false, -1 },
     { "hide_syms",	susfs_hide_syms_init,		susfs_hide_syms_exit,	false, SUSFS_FEAT_HIDE_SYMS },
     /* Last, so that the numbers above do not move. NOT fatal: without it the getpriority and ioprio

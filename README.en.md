@@ -48,6 +48,8 @@ Use early loading when SUSFS rules or original kstat snapshots must be configure
 
 The module page in the manager has two switches, the kernel log (`/proc/susfs_enable_log`) and the AVC log spoof (`/proc/susfs_avc_spoof`). A switch is written to its node at once and remembered in `/data/adb/susfs_guard_lkm/toggles`; the loader puts it back after the next successful load. A switch you never touched keeps the module's own default. Rules are not part of this, they still come from the manager.
 
+There is also a status line for `selinux_hide`, with no switch. If the installed root manager's own kernel patch already carries `selinux_hide`, it says so and this module leaves it alone - a second implementation here would fight the one your manager already runs. If it does not, the line turns into a warning telling you to use KernelSU or a supported fork for this feature; this module does not implement its own (see `/proc/susfs_selinux_hide` in the interface docs for why).
+
 ## Interface docs
 
 All `/proc` control nodes: see **[PROC_INTERFACES.en.md](PROC_INTERFACES.en.md)**.

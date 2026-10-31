@@ -49,6 +49,9 @@ say "toggle_set_avc_spoof_rc=$?"
 say "toggle_get=$(/system/bin/sh ./toggle.sh get | tr '\n' ' ')"
 /system/bin/sh ./toggle.sh set avc_spoof 2 2>/dev/null
 say "toggle_bad_value_rc=$?"
+say "selinux_hide_node=$(cat /proc/susfs_selinux_hide 2>&1)"
+/system/bin/sh ./toggle.sh set selinux_hide 1 2>/dev/null
+say "toggle_set_selinux_hide_rc=$?"
 # The watcher in service.sh would reboot the guest if the framework restarted often, which is not
 # what the tests after this one are meant to find. A trip is still logged in guard.log.
 GUARD_REBOOT=true /system/bin/sh ./service.sh
