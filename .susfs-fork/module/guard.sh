@@ -98,7 +98,7 @@ guard_layers_off() {
 
 # What the module card says after the loader ran. $1 is the loader's exit status.
 guard_status() {
-  base=$(sed -n 's/^susfsBase=//p' "$MODDIR/module.prop" 2>/dev/null | head -n 1 | tr -c 'A-Za-z0-9._-' '?')
+  base=$(sed -n 's/^susfsBase=//p' "$MODDIR/module.prop" 2>/dev/null | head -n 1 | tr -cd 'A-Za-z0-9._-')
   [ -z "$base" ] || base="SUSFS $base"
   rel=$(cat "$GUARD_OSRELEASE_FILE" 2>/dev/null)
   kmi=$(guard_kmi "$rel")
