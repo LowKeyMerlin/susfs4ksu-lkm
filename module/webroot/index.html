@@ -26,7 +26,7 @@
   body {
     margin: 0; background: var(--bg); color: var(--text);
     font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+    padding: 0 env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
   }
   main { max-width: 600px; margin: 0 auto; padding: 0 20px 56px; }
   [hidden] { display: none !important; }
@@ -34,10 +34,10 @@
   button:focus-visible, input:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
 
   /* The state, one word, on a band of its own. The dot and the strip under it take the colour of the
-   * worst finding. The band runs past the column to both screen edges. */
-  body { overflow-x: clip; }
-  .masthead { position: relative; isolation: isolate; padding: 26px 0 20px; color: var(--head-text); }
-  .masthead::before { content: ""; position: absolute; z-index: -1; inset: 0 -100vmax; background: var(--head-bg); border-bottom: 3px solid var(--rail, var(--head-line)); }
+   * worst finding. The band is a plain full-width block outside the column, so nothing in the page
+   * is ever wider than the screen. */
+  .masthead { padding-top: env(safe-area-inset-top); background: var(--head-bg); color: var(--head-text); border-bottom: 3px solid var(--rail, var(--head-line)); }
+  .masthead .inner { max-width: 600px; margin: 0 auto; padding: 26px 20px 20px; }
   .brand { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; font: 600 11px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase; }
   .brand .edition { padding: 4px 7px; border-radius: 4px; background: var(--head-line); letter-spacing: .08em; }
   .brand .by { margin-left: auto; color: var(--head-muted); font-weight: 500; letter-spacing: .04em; text-transform: none; }
@@ -118,8 +118,8 @@
 </style>
 </head>
 <body>
-<main>
-  <header class="masthead" id="masthead">
+<header class="masthead" id="masthead">
+  <div class="inner">
     <div class="brand">
       <span class="name">SUSFS</span>
       <span class="edition">LKM Edition</span>
@@ -127,7 +127,9 @@
     </div>
     <h1><span class="dot"></span><span id="state">Reading</span></h1>
     <div class="ident" id="ident"><span>Reading module state</span></div>
-  </header>
+  </div>
+</header>
+<main>
 
   <div class="tabs" role="tablist" aria-label="Sections">
     <button role="tab" id="tab-status" aria-controls="panel-status" aria-selected="true">Status</button>
