@@ -35,6 +35,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/list.h>
+#include <linux/hash.h>	/* hash_64/hash_ptr for the lookup filter */
 #include <linux/spinlock.h>
 #include <linux/namei.h>
 #include <linux/fs.h>
@@ -195,10 +196,71 @@ static DEFINE_MUTEX(sus_path_pending_lock);
 static void sus_path_pending_work(struct work_struct *w);
 static DECLARE_DELAYED_WORK(sus_path_pending_wq, sus_path_pending_work);
 
+/*
+ * Lookup filter.  sus_path_inode_hidden() runs from inode_permission and inode_getattr, so for
+ * every path component of every process once a rule exists; taking sus_path_lock and walking the
+ * table there put a global lock on the whole system's path walk.  An entry can only match an inode
+ * by pointer or by i_ino, so two bits per entry (one per key) are enough to rule a lookup out
+ * without the lock.  A set bit means "maybe": the exact test below still decides, so a collision or
+ * a stale bit costs one slow lookup and can never hide or reveal anything.
+ *
+ * Bits are set while the entry is published, under sus_path_lock, before the add returns.  They are
+ * not cleared on removal; sus_path_filter_trim() rebuilds the words once enough removals have piled
+ * up, replacing each word whole so a live entry's bit is never absent from a reader's view.
+ */
+#define SUS_PATH_FILTER_SHIFT 14
+#define SUS_PATH_FILTER_BITS (1U << SUS_PATH_FILTER_SHIFT)
+static unsigned long sus_path_filter[BITS_TO_LONGS(SUS_PATH_FILTER_BITS)];
+static unsigned int sus_path_filter_stale;      /* guarded by sus_path_lock */
+
+static inline unsigned int sus_path_filter_ino_bit(u64 ino)
+{
+    return hash_64(ino, SUS_PATH_FILTER_SHIFT);
+}
+
+static inline unsigned int sus_path_filter_ptr_bit(const struct inode *inode)
+{
+    return hash_ptr(inode, SUS_PATH_FILTER_SHIFT);
+}
+
+/* sus_path_lock held; for an entry that has just gained its inode. */
+static void sus_path_filter_add(const struct sus_path_entry *e)
+{
+    set_bit(sus_path_filter_ino_bit(e->ino), sus_path_filter);
+    set_bit(sus_path_filter_ptr_bit(e->inode), sus_path_filter);
+}
+
+static inline bool sus_path_filter_maybe(const struct inode *inode)
+{
+    return test_bit(sus_path_filter_ptr_bit(inode), sus_path_filter) ||
+           test_bit(sus_path_filter_ino_bit((u64)inode->i_ino), sus_path_filter);
+}
+
+/* sus_path_lock held, after an entry left the table. */
+static void sus_path_filter_trim(void)
+{
+    unsigned long fresh[BITS_TO_LONGS(SUS_PATH_FILTER_BITS)] = { 0 };
+    struct sus_path_entry *e;
+    unsigned int i;
+
+    if (++sus_path_filter_stale < 32 || sus_path_filter_stale < sus_path_count)
+        return;
+    list_for_each_entry(e, &sus_path_list, list) {
+        if (!e->inode)
+            continue;
+        __set_bit(sus_path_filter_ino_bit(e->ino), fresh);
+        __set_bit(sus_path_filter_ptr_bit(e->inode), fresh);
+    }
+    for (i = 0; i < ARRAY_SIZE(fresh); i++)
+        WRITE_ONCE(sus_path_filter[i], fresh[i]);
+    sus_path_filter_stale = 0;
+}
+
 static void sus_path_retire_entry(struct sus_path_entry *e, struct list_head *doomed)
 {
     list_move_tail(&e->list, doomed);
     sus_path_count--;
+    sus_path_filter_trim();
     if (e->inode)
         list_add_tail(&e->retiring_list, &sus_path_retiring);
     else
@@ -681,6 +743,7 @@ static int sus_path_resolve_pending(void)
             slot->ino = (u64)inode->i_ino;
             strscpy(slot->name, name, sizeof(slot->name));
             slot->inode = inode;
+            sus_path_filter_add(slot);
             inode = NULL;               /* the table holds the reference now */
             atomic_dec(&sus_path_n_pending);
             resolved++;
@@ -1168,6 +1231,10 @@ static bool sus_path_inode_hidden(struct inode *inode)
     u64 dev;
 
     if (!inode || !READ_ONCE(sus_path_count))
+        return false;
+
+    /* No bit for this inode in the filter: no rule can match it, and the lock is never touched. */
+    if (!sus_path_filter_maybe(inode))
         return false;
 
     /* See sus_path_resolver: the resolving task must not be answered by its own table,
@@ -2516,6 +2583,7 @@ static int sus_path_publish_entry(struct sus_path_entry *e, bool merge_pending)
             cur->orig_iop = e->orig_iop;
             e->orig_iop = NULL;
             cur->inode = e->inode;
+            sus_path_filter_add(cur);
             e->inode = NULL;
             atomic_dec(&sus_path_n_pending);
             sus_path_relax_mode(cur);
@@ -2529,9 +2597,10 @@ static int sus_path_publish_entry(struct sus_path_entry *e, bool merge_pending)
     }
     list_add_tail(&e->list, &sus_path_list);
     sus_path_count++;
-    if (e->inode)
+    if (e->inode) {
+        sus_path_filter_add(e);
         sus_path_relax_mode(e);
-    else
+    } else
         atomic_inc(&sus_path_n_pending);
 out:
     spin_unlock(&sus_path_lock);
