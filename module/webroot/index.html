@@ -79,7 +79,7 @@
   .row .text { flex: 1; min-width: 0; }
   .row .title { font-weight: 600; }
   .row .note { margin-top: 2px; color: var(--muted); font-size: 13.5px; }
-  .row.locked .title::after { content: "BRENE"; margin-left: 8px; font: 600 10px var(--mono); letter-spacing: .1em; padding: 2px 5px; border: 1px solid var(--line); border-radius: 3px; color: var(--muted); vertical-align: 2px; }
+  .row.locked .title::after { content: "MANAGED"; margin-left: 8px; font: 600 10px var(--mono); letter-spacing: .1em; padding: 2px 5px; border: 1px solid var(--line); border-radius: 3px; color: var(--muted); vertical-align: 2px; }
 
   .switch { position: relative; flex: none; width: 44px; height: 24px; }
   .switch input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
@@ -469,13 +469,14 @@ var TOGGLES = [
 function renderToggles() {
   var box = $("toggles");
   box.textContent = "";
-  var locked = state.facts.brene === "1";
   TOGGLES.forEach(function (t) {
     var v = state.toggles[t.key];
+    var owner = state.facts["owner_" + t.key] || "";
+    var locked = owner !== "";
     var row = el("div", "row" + (locked ? " locked" : ""));
     var text = el("div", "text");
     text.appendChild(el("div", "title", t.title));
-    var note = locked ? "Set by BRENE at every boot, so it is shown here and changed there." : (v === "0" || v === "1" ? t.note : "Available once the module is loaded.");
+    var note = locked ? "Set at every boot by the module " + owner + ", so it is shown here and changed there." : (v === "0" || v === "1" ? t.note : "Available once the module is loaded.");
     text.appendChild(el("div", "note", note));
     var sw = el("label", "switch");
     var input = el("input");

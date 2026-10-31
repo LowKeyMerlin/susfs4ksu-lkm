@@ -38,7 +38,7 @@ WRAPPER = "load.sh"
 INSTALLER = "customize.sh"
 ADDED = {name: name for name in (
     "guard.sh", "service.sh", "status.sh", "check.sh", "early.sh", "hide_mounts.sh", "boot-completed.sh",
-    "scope.sh")}
+    "scope.sh", "clients.sh")}
 LOADER = "load.upstream.sh"
 INSTALLER_UPSTREAM = "customize.upstream.sh"
 # What upstream's script of that name becomes in the zip.

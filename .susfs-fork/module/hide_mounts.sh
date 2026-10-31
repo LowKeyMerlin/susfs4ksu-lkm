@@ -8,7 +8,7 @@
 #   hide_mounts.sh remove <path>   take a path from both
 # The list holds one absolute path per line, '#' starts a comment. Adding a path rescans the
 # mounts, so ones that exist already are picked up. This does not touch the
-# hide_sus_mnts_for_non_su_procs switch, which belongs to the manager (BRENE sets it).
+# hide_sus_mnts_for_non_su_procs switch, which belongs to whichever module sends SUSFS commands.
 NODE=${HIDE_NODE:-/proc/susfs_hide_mounts}
 LIST=${HIDE_LIST:-/data/adb/susfs_guard_lkm/hide_mounts.txt}
 LEGACY=${HIDE_LEGACY:-/data/adb/hide_module_mounts.txt}

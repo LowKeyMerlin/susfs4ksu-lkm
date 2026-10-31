@@ -15,6 +15,8 @@ TIMEOUT_LOG=${SUSFS_TIMEOUT_LOG:-/data/adb/susfsload_timeout.log}
 DMESG=${SUSFS_DMESG:-dmesg}
 GETENFORCE=${SUSFS_GETENFORCE:-getenforce}
 NAME=susfs_guard_lkm
+# shellcheck source=/dev/null
+. "$MODDIR/clients.sh"
 
 # Keeps the output to one line per check and free of the separator.
 clean() { printf '%s' "$1" | tr '\n|' '  '; }
@@ -66,7 +68,9 @@ else
   out guard ok "Bootloop guard is quiet" "No failed boot is on record."
 fi
 
-if [ -f "$MODDIR/early_load" ] && [ -f "$EARLY_HOOK" ]; then
+early_on=0
+[ -f "$MODDIR/early_load" ] && [ -f "$EARLY_HOOK" ] && early_on=1
+if [ "$early_on" = 1 ]; then
   out early_load ok "Early load is set up" "The module loads before the manager's own boot stage."
 else
   out early_load info "Loads at the manager's boot stage" "Early load needs the post-fs-data hook and the early_load marker. Without it, SUSFS commands sent by the manager before the module loads are lost."
@@ -76,43 +80,24 @@ if [ -s "$TIMEOUT_LOG" ]; then
   out load_timeout warn "A load timed out before" "$TIMEOUT_LOG holds the report of the last time the load took over a minute."
 fi
 
-# Another module that hides mounts or ships its own SUSFS can fight this one for the same hooks.
-others=""
-for dir in "$MODULES_DIR"/*/; do
-  [ -d "$dir" ] || continue
-  id=${dir%/}
-  id=${id##*/}
-  [ "$id" != "$NAME" ] || continue
-  [ ! -f "$dir/disable" ] || continue
-  [ ! -f "$dir/remove" ] || continue
-  # BRENE is a front end that sends commands to this module, not a second SUSFS. Its name says
-  # SuSFS, so it has to be skipped by id.
-  case $id in brene*) continue ;; esac
-  if grep -qiE '^(id|name)=.*(susfs|resusfs)' "$dir/module.prop" 2>/dev/null; then
-    others="$others $id"
-  fi
-done
+# A second SUSFS in the kernel can fight this one for the same hooks. A module that only sends
+# SUSFS commands is a client of this one, and is reported below.
+others=$(cl_providers | tr '\n' ' ')
 if [ -n "$others" ]; then
-  out conflicts warn "Another SUSFS module is enabled" "Found:${others}. Two modules that hide the same mounts can undo each other. Keep one."
+  out conflicts warn "Another SUSFS kernel module is enabled" "Found: ${others}. Two implementations that hide the same mounts can undo each other. Keep one."
 else
-  out conflicts ok "No other SUSFS module found" "No other enabled module ships SUSFS."
+  out conflicts ok "No other SUSFS kernel module found" "No other enabled module ships SUSFS kernel code."
 fi
 
-# BRENE sends its settings in post-fs-data. A module that loads later never receives them, and
-# nothing shows it, so compare what BRENE wants with what the kernel holds.
-BRENE_CONF=${SUSFS_BRENE_CONF:-/data/adb/brene/config.sh}
-if [ -d "$SYS_MODULE" ] && [ -r "$BRENE_CONF" ]; then
-  differ=""
-  for pair in enable_avc_log_spoofing:avc_spoof enable_log:enable_log; do
-    want=$(grep -a "^config_${pair%%:*}=" "$BRENE_CONF" | tail -n 1 | cut -d= -f2 | tr -cd '01')
-    read -r have _ <"$PROC/susfs_${pair##*:}" 2>/dev/null
-    [ -n "$want" ] && [ -n "$have" ] && [ "$want" != "$have" ] || continue
-    differ="$differ ${pair%%:*} (BRENE $want, kernel $have);"
-  done
-  if [ -n "$differ" ]; then
-    out brene_sync warn "BRENE settings did not reach the kernel" "Different:${differ} BRENE sends them before this module loads. Set up early load, or set them under Options."
+# A module that sends its SUSFS commands in post-fs-data runs before this one loads, unless early
+# load is on, and the kernel drops what it receives with nobody to answer.
+clients=$(cl_clients | tr '\n' ' ')
+if [ -n "$clients" ]; then
+  early_clients=$(cl_early_clients | tr '\n' ' ')
+  if [ -n "$early_clients" ] && [ "$early_on" = 0 ]; then
+    out clients warn "SUSFS commands may be sent too early" "Sent in post-fs-data by: ${early_clients}. This module loads after them, so they are lost. Turn on early load."
   else
-    out brene_sync ok "BRENE settings match the kernel" "AVC spoofing and kernel logging are as BRENE has them."
+    out clients ok "Other modules send SUSFS commands" "Found: ${clients}. Their commands arrive after this module has loaded."
   fi
 fi
 

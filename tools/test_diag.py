@@ -31,9 +31,11 @@ class Scratch(unittest.TestCase):
         self.modules = self.base / "modules"
         self.mod = self.modules / "susfs_guard_lkm"
         self.mod.mkdir(parents=True)
-        for name in ("status.sh", "check.sh", "scope.sh", "early.sh", "hide_mounts.sh"):
+        for name in ("status.sh", "check.sh", "scope.sh", "early.sh", "hide_mounts.sh", "clients.sh"):
             data = (OVERLAY / name).read_bytes().replace(b"\r\n", b"\n")
             (self.mod / name).write_bytes(data)
+        data = (ROOT / "module" / "toggle.sh").read_bytes().replace(b"\r\n", b"\n")
+        (self.mod / "toggle.sh").write_bytes(data)
         data = (ROOT / "module" / "early-dispatch.sh").read_bytes().replace(b"\r\n", b"\n")
         (self.mod / "early-dispatch.sh").write_bytes(data)
         put(self.mod / "module.prop",
@@ -53,7 +55,6 @@ class Scratch(unittest.TestCase):
         self.enforce = self.base / "getenforce"
         self.enforce.write_text("#!/bin/sh\necho Enforcing\n")
         self.enforce.chmod(0o755)
-        self.brene_conf = self.base / "brene.conf"
         self.node = self.base / "hide_node"
         self.hide_list = self.base / "state" / "hide_mounts.txt"
         self.legacy = self.base / "legacy.txt"
@@ -68,8 +69,9 @@ class Scratch(unittest.TestCase):
             "SUSFS_TIMEOUT_LOG": (self.base / "timeout.log").as_posix(),
             "SUSFS_DMESG": self.dmesg.as_posix(),
             "SUSFS_GETENFORCE": self.enforce.as_posix(),
-            "SUSFS_BRENE_CONF": self.brene_conf.as_posix(),
             "SUSFS_BIN": (self.base / "no-such-tool").as_posix(),
+            "TOGGLE_PROC": self.proc.as_posix(),
+            "TOGGLE_CONF": (self.base / "toggles").as_posix(),
             "HIDE_NODE": self.node.as_posix(),
             "HIDE_LIST": self.hide_list.as_posix(),
             "HIDE_LEGACY": self.legacy.as_posix(),
@@ -113,6 +115,69 @@ class Status(Scratch):
         self.assertEqual(out["early_load"], "0")
 
 
+class Owners(Scratch):
+    """A setting belongs to the module whose boot script runs its SUSFS command, whatever that
+    module is called."""
+
+    def other(self, name, script):
+        d = self.modules / name
+        d.mkdir()
+        put(d / "module.prop", f"id={name}\nname={name}\n")
+        put(d / "post-fs-data.sh", script)
+        return d
+
+    def facts(self):
+        return dict(l.split("=", 1) for l in self.run_script("status.sh").splitlines())
+
+    def test_nothing_is_owned_without_another_module(self):
+        out = self.facts()
+        self.assertEqual((out["owner_enable_log"], out["owner_avc_spoof"], out["susfs_clients"]), ("", "", ""))
+
+    def test_the_module_running_the_command_owns_that_setting_only(self):
+        self.other("some_manager", "BIN=susfs\n${BIN} enable_log 1\n")
+        out = self.facts()
+        self.assertEqual(out["owner_enable_log"], "some_manager")
+        self.assertEqual(out["owner_avc_spoof"], "")
+        self.assertEqual(out["susfs_clients"], "some_manager")
+
+    def test_the_avc_command_belongs_to_the_avc_toggle(self):
+        self.other("another", "ksu_susfs enable_avc_log_spoofing 1\n")
+        out = self.facts()
+        self.assertEqual((out["owner_avc_spoof"], out["owner_enable_log"]), ("another", ""))
+
+    def test_a_comment_a_variable_name_or_a_disabled_module_owns_nothing(self):
+        self.other("quoted", "#ksu_susfs enable_log 1\n")
+        self.other("variable", 'if [ "${config_enable_log}" = 1 ]; then echo susfs; fi\n')
+        off = self.other("off", "ksu_susfs enable_log 1\n")
+        (off / "disable").write_text("")
+        self.assertEqual(self.facts()["owner_enable_log"], "")
+
+    def test_a_name_alone_owns_nothing(self):
+        (self.modules / "brene").mkdir()
+        self.assertEqual(self.facts()["owner_enable_log"], "")
+
+    def set_node(self, key, value):
+        put(self.proc / f"susfs_{key}", f"{value}\n")
+
+    def read(self, key):
+        return (self.proc / f"susfs_{key}").read_text().strip()
+
+    def test_apply_leaves_an_owned_setting_to_its_owner(self):
+        self.set_node("enable_log", 0)
+        self.set_node("avc_spoof", 0)
+        put(self.base / "toggles", "enable_log=1\navc_spoof=1\n")
+        self.other("some_manager", "SUSFS_BIN=/data/adb/ksu/bin/susfs\n${SUSFS_BIN} enable_log 0\n")
+        self.run_script("toggle.sh", "apply")
+        self.assertEqual((self.read("enable_log"), self.read("avc_spoof")), ("0", "1"))
+
+    def test_apply_writes_everything_when_nothing_is_owned(self):
+        self.set_node("enable_log", 0)
+        self.set_node("avc_spoof", 0)
+        put(self.base / "toggles", "enable_log=1\navc_spoof=1\n")
+        self.run_script("toggle.sh", "apply")
+        self.assertEqual((self.read("enable_log"), self.read("avc_spoof")), ("1", "1"))
+
+
 class Checks(Scratch):
     def test_healthy_device_has_no_warning(self):
         (self.mod / "early_load").write_text("")
@@ -150,39 +215,60 @@ class Checks(Scratch):
         (self.mod / "guard.tripped").write_text("2 boots in a row ended early\n")
         self.assertEqual(self.checks()["guard"][0], "fail")
 
-    def test_overlapping_module_is_a_warning_unless_disabled(self):
-        other = self.modules / "resusfs"
-        other.mkdir()
-        put(other / "module.prop", "id=resusfs\nname=ReSUSFS\n")
-        self.assertEqual(self.checks()["conflicts"][0], "warn")
-        (other / "disable").write_text("")
+    def other(self, name, files=None):
+        d = self.modules / name
+        d.mkdir()
+        put(d / "module.prop", f"id={name}\nname={name}\n")
+        for rel, text in (files or {}).items():
+            put(d / rel, text)
+        return d
+
+    def kernel_object(self, d, payload):
+        (d / "lkm").mkdir(exist_ok=True)
+        (d / "lkm" / "x.ko").write_bytes(payload)
+
+    def test_a_second_susfs_kernel_module_is_a_warning_unless_disabled(self):
+        d = self.other("another_impl")
+        self.kernel_object(d, b"\x7fELF\x00susfs_add_sus_path\x00")
+        found = self.checks()["conflicts"]
+        self.assertEqual(found[0], "warn")
+        self.assertIn("another_impl", found[2])
+        (d / "disable").write_text("")
         self.assertEqual(self.checks()["conflicts"][0], "ok")
 
-    def test_brene_is_a_companion_not_a_conflict(self):
-        other = self.modules / "brene"
-        other.mkdir()
-        put(other / "module.prop", "id=brene\nname=.BRENE - SuSFS\n")
+    def test_a_kernel_module_without_susfs_code_is_not_a_conflict(self):
+        d = self.other("mount_thing")
+        self.kernel_object(d, b"\x7fELF\x00redirect_path\x00")
         self.assertEqual(self.checks()["conflicts"][0], "ok")
 
-    def brene(self, avc, log, node_avc, node_log):
-        # BRENE's file starts with blanks and sometimes NULs, which makes grep call it binary.
-        self.brene_conf.write_bytes(b"\x00\x00   \nconfig_enable_log=%s\nconfig_enable_avc_log_spoofing=%s\n" % (log, avc))
-        (self.proc / "susfs_avc_spoof").write_bytes(node_avc + b" (su_sid=76 enter=0 hits=0)\n")
-        (self.proc / "susfs_enable_log").write_bytes(node_log + b"\n")
+    def test_a_name_that_says_susfs_is_not_a_conflict_by_itself(self):
+        self.other("susfs_helper")
+        self.assertEqual(self.checks()["conflicts"][0], "ok")
 
-    def test_brene_settings_that_never_reached_the_kernel_are_a_warning(self):
-        self.brene(b"1", b"0", b"0", b"1")
-        sync = self.checks()["brene_sync"]
-        self.assertEqual(sync[0], "warn")
-        self.assertIn("enable_avc_log_spoofing (BRENE 1, kernel 0)", sync[2])
-        self.assertIn("enable_log (BRENE 0, kernel 1)", sync[2])
+    def test_clients_sending_before_the_module_loads_are_a_warning(self):
+        self.other("mgr", {"post-fs-data.sh": "SUSFS_BIN=/data/adb/ksu/bin/susfs\n${SUSFS_BIN} enable_log 1\n"})
+        found = self.checks()["clients"]
+        self.assertEqual(found[0], "warn")
+        self.assertIn("mgr", found[2])
 
-    def test_brene_settings_that_match_are_fine(self):
-        self.brene(b"1", b"0", b"1", b"0")
-        self.assertEqual(self.checks()["brene_sync"][0], "ok")
+    def test_clients_are_fine_once_early_load_is_on(self):
+        self.other("mgr", {"post-fs-data.sh": "SUSFS_BIN=/data/adb/ksu/bin/susfs\n${SUSFS_BIN} enable_log 1\n"})
+        (self.mod / "early_load").write_text("")
+        self.hook.write_text("")
+        self.assertEqual(self.checks()["clients"][0], "ok")
 
-    def test_no_brene_means_no_brene_check(self):
-        self.assertNotIn("brene_sync", self.checks())
+    def test_a_client_that_sends_later_needs_no_early_load(self):
+        self.other("mgr", {"service.sh": "susfs_bin add_sus_path /x\n"})
+        self.assertEqual(self.checks()["clients"][0], "ok")
+
+    def test_a_comment_or_a_disabled_module_is_not_a_client(self):
+        self.other("quoted", {"post-fs-data.sh": "# ksu_susfs enable_log 1\n"})
+        d = self.other("off", {"post-fs-data.sh": "ksu_susfs enable_log 1\n"})
+        (d / "disable").write_text("")
+        self.assertNotIn("clients", self.checks())
+
+    def test_no_client_means_no_client_check(self):
+        self.assertNotIn("clients", self.checks())
 
     def test_unrelated_module_is_not_a_conflict(self):
         other = self.modules / "zygisk_thing"
@@ -304,15 +390,6 @@ class Facts(Scratch):
         self.assertEqual((out["susfs_version"], out["susfs_variant"]), ("v2.3.0", "GKI-LKM"))
         self.assertEqual(out["features"], "SUS_PATH,SUS_MOUNT")
         self.assertEqual((out["mount_prefixes"], out["mounts_hidden"]), ("3/64", "1886"))
-
-    def test_brene_is_reported_only_while_it_is_enabled(self):
-        def brene():
-            return dict(l.split("=", 1) for l in self.run_script("status.sh").splitlines())["brene"]
-        self.assertEqual(brene(), "0")
-        (self.modules / "brene").mkdir()
-        self.assertEqual(brene(), "1")
-        (self.modules / "brene" / "disable").write_text("")
-        self.assertEqual(brene(), "0")
 
     def test_missing_tool_and_node_leave_the_facts_empty(self):
         out = dict(l.split("=", 1) for l in self.run_script("status.sh").splitlines())

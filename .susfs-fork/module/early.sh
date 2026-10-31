@@ -4,8 +4,8 @@
 #   early.sh status   print early_load=<0|1>
 #   early.sh on       install the post-fs-data hook if it is missing, then set the marker
 #   early.sh off      remove the marker; the hook stays and exits at once without it
-# Without this a manager that sets SUSFS options in post-fs-data (BRENE does) talks to a kernel
-# that has no module yet, and those settings are lost.
+# Without this a module that sets SUSFS options in post-fs-data talks to a kernel that has no
+# module yet, and those settings are lost.
 MODDIR=${0%/*}
 HOOK=${SUSFS_EARLY_HOOK:-/data/adb/post-fs-data.d/00-susfs-guard-lkm.sh}
 

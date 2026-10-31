@@ -10,6 +10,17 @@
 PROC=${TOGGLE_PROC:-/proc}
 CONF=${TOGGLE_CONF:-/data/adb/susfs_guard_lkm/toggles}
 
+# Another module may run the same SUSFS command at every boot; apply leaves that one to it, so a
+# value kept here cannot flip the setting for the moment before the other module overrides it.
+# The helper ships beside this script; without it nothing counts as owned.
+MODDIR=${0%/*}
+if [ -r "$MODDIR/clients.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$MODDIR/clients.sh"
+else
+  cl_toggle_owner() { :; }
+fi
+
 is_key() {
   case $1 in
     enable_log|avc_spoof) return 0 ;;
@@ -81,6 +92,7 @@ case $1 in
     # non-zero at EOF but still fills k/v, so without it that line would be dropped.
     while IFS='=' read -r k v || [ -n "$k" ]; do
       is_key "$k" && is_value "$v" || continue
+      [ -z "$(cl_toggle_owner "$k")" ] || continue
       write_node "$k" "$v" || echo "toggle: $k=$v not applied" >&2
     done < "$CONF"
     exit 0
