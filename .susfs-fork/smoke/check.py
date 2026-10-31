@@ -298,8 +298,8 @@ UNLOAD_EXPECTED = [
 # Growth of memory the kernel cannot reclaim, in kB.  Measured over a second identical round, so
 # warm-up is not counted; a leak per call grows with the thousands of calls a round makes.
 SLAB_LIMITS = [
-    ("soak_slab_growth_kb", 4096, "unreclaimable slab grew over a second identical soak round"),
-    ("unload_slab_growth_kb", 2048, "unreclaimable slab grew over three unload and reload cycles"),
+    ("soak_slab_growth_kb", 1024, "unreclaimable slab grew over a second identical soak round"),
+    ("unload_slab_growth_kb", 512, "unreclaimable slab grew over three unload and reload cycles"),
 ]
 
 
