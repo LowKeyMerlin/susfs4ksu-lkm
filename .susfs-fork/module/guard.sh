@@ -48,6 +48,9 @@ GUARD_DISABLED="$MODDIR/guard.disabled"
 : "${GUARD_BOOT_ID_FILE:=/proc/sys/kernel/random/boot_id}"
 : "${GUARD_SYS_MODULE:=/sys/module/susfs_guard_lkm}"
 : "${GUARD_OSRELEASE_FILE:=/proc/sys/kernel/osrelease}"
+: "${GUARD_DMESG:=dmesg}"
+# The hook that loads the module before the manager's own post-fs-data stage.
+: "${GUARD_EARLY_HOOK:=/data/adb/post-fs-data.d/00-susfs-guard-lkm.sh}"
 
 guard_log() {
   echo "guard: $*"
@@ -58,6 +61,72 @@ guard_describe() {
   prop="$MODDIR/module.prop"
   [ -f "$prop" ] || return 0
   sed -i "s#^description=.*#description=$1#" "$prop" 2>/dev/null
+}
+
+# A card line: a state word, then facts, separated by a middle dot. Empty facts are left out.
+# No '#', '&' or backslash may reach guard_describe, which hands the text to sed.
+guard_card() {
+  line=$1
+  shift
+  for part in "$@"; do
+    [ -z "$part" ] || line="$line · $part"
+  done
+  guard_describe "$line"
+}
+
+# The KMI this kernel runs, from the same sources the loader uses. Needs kmi.sh sourced.
+guard_kmi() {
+  k=$(select_kmi_override "$MODDIR" 2>/dev/null) || k=""
+  [ -n "$k" ] || k=$(select_kmi "$1" "$MODDIR" 2>/dev/null) || k=""
+  if [ -z "$k" ] && command -v select_kmi_from_ksud >/dev/null 2>&1; then
+    k=$(select_kmi_from_ksud "$MODDIR" 2>/dev/null) || k=""
+  fi
+  printf '%s' "$k" | tr -c 'A-Za-z0-9._-' '?'
+}
+
+# Layers the module could not start, which it reports in the kernel log and leaves off. At most
+# three names, then a count.
+guard_layers_off() {
+  all=$("$GUARD_DMESG" 2>/dev/null |
+    sed -n 's/.* \([a-z0-9_]*\) init failed -\{0,1\}[0-9]* - that feature stays off.*/\1/p' | sort -u)
+  [ -n "$all" ] || return 0
+  n=$(printf '%s\n' "$all" | wc -l | tr -d ' ')
+  shown=$(printf '%s\n' "$all" | head -n 3 | tr '\n' ',' | sed 's/,$//; s/,/, /g')
+  [ "$n" -le 3 ] || shown="$shown +$((n - 3))"
+  printf '%s' "$shown"
+}
+
+# What the module card says after the loader ran. $1 is the loader's exit status.
+guard_status() {
+  base=$(sed -n 's/^susfsBase=//p' "$MODDIR/module.prop" 2>/dev/null | head -n 1 | tr -c 'A-Za-z0-9._-' '?')
+  [ -z "$base" ] || base="SUSFS $base"
+  rel=$(cat "$GUARD_OSRELEASE_FILE" 2>/dev/null)
+  kmi=$(guard_kmi "$rel")
+  case $1 in
+    0)
+      if [ ! -d "$GUARD_SYS_MODULE" ]; then
+        guard_card "Standing by" "another SUSFS is active (built in, or from another module)" "$base"
+        return 0
+      fi
+      off=$(guard_layers_off)
+      if [ -n "$off" ]; then
+        guard_card "Degraded" "$off off" "$kmi" "$base"
+      elif [ -f "$MODDIR/early_load" ] && [ -f "$GUARD_EARLY_HOOK" ]; then
+        guard_card "Active" "early load" "$kmi" "$base"
+      else
+        guard_card "Active" "boot load" "$kmi" "$base"
+      fi
+      ;;
+    124) guard_card "Not loaded" "the load did not finish in 60s" "$kmi" "$base" ;;
+    *)
+      if [ -z "$kmi" ]; then
+        shown=$(printf '%s' "$rel" | tr -c 'A-Za-z0-9._+-' '?')
+        guard_card "Not loaded" "no build for kernel ${shown:-unknown}" "$base"
+      else
+        guard_card "Not loaded" "the loader failed with error $1" "$kmi" "$base"
+      fi
+      ;;
+  esac
 }
 
 guard_boot_id() {
@@ -112,9 +181,9 @@ guard_trip() {
   note=
   if [ "$(guard_scope)" = all ]; then
     guard_disable_others
-    note=" All other modules were disabled too."
+    note="other modules disabled too"
   fi
-  guard_describe "disabled by the bootloop guard: $1.$note Enable the module again to retry."
+  guard_card "Disabled" "bootloop guard tripped: $1" "$note" "enable the module again to retry"
   sync
 }
 
@@ -161,7 +230,7 @@ guard_check() {
   cur=$(guard_boot_id)
   if [ -z "$cur" ]; then
     guard_log "cannot identify the boot"
-    guard_describe "not loaded: the bootloop guard cannot identify this boot"
+    guard_card "Not loaded" "the bootloop guard cannot identify this boot"
     return 1
   fi
   if [ -f "$GUARD_ARMED" ]; then
@@ -328,7 +397,7 @@ guard_kernel() {
   # The description is edited with sed, so keep only plain characters.
   shown=$(printf '%s' "$rel" | tr -c 'A-Za-z0-9._+-' '?')
   guard_log "kernel release $shown is not of the form <version>.<patch>-$os-<generation>"
-  guard_describe "not loaded: kernel release $shown is not a standard GKI release"
+  guard_card "Not loaded" "kernel release $shown is not a standard GKI release"
   return 1
 }
 

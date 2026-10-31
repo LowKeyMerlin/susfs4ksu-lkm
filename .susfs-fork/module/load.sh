@@ -25,13 +25,13 @@ guard_probe
 case $? in
   0)
     echo "SUSFS already answers, nothing to load."
-    guard_describe "already present (SUSFS answers on this kernel)"
+    guard_card "Standing by" "SUSFS already answers on this kernel (built in, or loaded earlier)"
     exit 0
     ;;
   1) ;;
   *)
     echo "the probe could not run"
-    guard_describe "not loaded: cannot tell whether SUSFS is already present"
+    guard_card "Not loaded" "cannot tell whether SUSFS is already present"
     exit 0
     ;;
 esac
@@ -42,12 +42,15 @@ guard_kernel || exit 0
 
 guard_arm || {
   echo "cannot write the guard marker"
-  guard_describe "not loaded: the bootloop guard cannot write its state"
+  guard_card "Not loaded" "the bootloop guard cannot write its state"
   exit 0
 }
 
 "$GUARD_SH" "$MODDIR/load.upstream.sh"
 rc=$?
+# The upstream loader words the card its own way, this is the one the fork shows. A module that
+# loaded but is unloaded below because it does not answer is described by guard_trip instead.
+guard_status "$rc"
 
 # A module that loaded but does not answer only adds risk, so unload and disable it. The marker
 # is still armed, so a crash during the unload is caught on the next boot.
