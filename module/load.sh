@@ -150,6 +150,13 @@ if [ "$rc" = 0 ]; then
   else
     set_description "✅ auto-detected ($KMI) | kernel $REL"
   fi
+elif [ "$rc" = 17 ]; then
+  # EEXIST: the module refused to stack on a susfs that is already up (a built-in susfs, or a
+  # fork whose nodes the pre-check above does not see).  Same outcome as that pre-check, not a
+  # failure to flag - see susfs_builtin_present() in susfs_main.c.
+  echo "susfs already present (init_module EEXIST); nothing to do."
+  set_description "already present (built-in or loaded earlier)"
+  rc=0
 else
   echo "susfs_insmod failed: $rc"
   set_description "❌ load failed [$MODE] ($KMI): susfs_insmod rc=$rc | kernel $REL"

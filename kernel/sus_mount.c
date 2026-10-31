@@ -252,24 +252,6 @@ static void (*pfn_ida_free)(struct ida *ida, unsigned int id);
 #endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-/* The kernel's 6.12+ unique mount-id counter, read but never incremented so a marked mount
- * can be given a plausible mnt_id_unique.  Resolved from kallsyms (GKI enables
- * CONFIG_KALLSYMS_ALL) and optional: without it the unique id is left as the kernel assigned it.
- * sus_mount_sus_id_ctr is our own monotonic offset, the analogue of upstream's sus_mnt_id_ctr
- * (commit 7d91da2).
- *
- * The symbol's own C type differs by version and the cast below does not track it - verified
- * harmless, not assumed: on 6.12 it is `static atomic64_t mnt_id_ctr`, incremented lock-free
- * with atomic64_inc_return(); on 6.18 the allocator moved to mnt_id_xa and mnt_id_ctr became a
- * plain `static u64`, incremented as `++mnt_id_ctr` under mnt_id_xa's xa_lock (fs/namespace.c).
- * Casting its address to atomic64_t* and reading with atomic64_read() is still exactly right on
- * both: CONFIG_64BIT's atomic64_t is `struct { s64 counter; }` (include/linux/types.h), so the
- * read touches the same 8 bytes at the same offset as a direct u64 load either way, and
- * atomic64_read() is a plain relaxed load (no cmpxchg loop), so no lock is needed to read it
- * race-free - matching the already-approximate, lock-free design this function documents below. */
-static atomic64_t *sus_mount_mnt_id_ctr;
-static atomic64_t sus_mount_sus_id_ctr = ATOMIC64_INIT(0);
-
 /* ---- unique ids of the mounts we have marked ----
  *
  * listmount(2)/statmount(2) (6.8+, so only these two KMIs) name a mount by its 64-bit
@@ -277,9 +259,12 @@ static atomic64_t sus_mount_sus_id_ctr = ATOMIC64_INIT(0);
  * mount from those two calls we have to recognise its unique id, so every id we mark is recorded
  * here when the mark happens and tested when the two syscalls return.
  *
- * Sorted for a binary search.  Never recycled: the kernel's unique id is a monotonic 64-bit
- * counter that is never reused (fs/namespace.c), so a recorded id can never later name a different
- * mount - unlike the idmap, this table needs no teardown when a filesystem is unmounted.  Bounded
+ * Sorted for a binary search.  Only ids the kernel itself assigned are recorded, never crafted
+ * ones: the kernel's unique id is a monotonic 64-bit counter that is never reused (fs/namespace.c),
+ * so a recorded id can never later name a different mount - unlike the idmap, this table needs no
+ * teardown when a filesystem is unmounted.  This is also why the id is never rewritten in place:
+ * ns->mounts is an rb-tree keyed on mnt_id_unique (mnt_add_to_ns()), so changing the key of a
+ * mount already in it would break every later lookup and insert in that namespace.  Bounded
  * at the same ceiling as the idmap; a full table only means the newest marked mount stays visible
  * to listmount/statmount (logged once), never a crash or a wrong-mount match. */
 #define SUS_MOUNT_UNIQ_MAX 1024
@@ -346,22 +331,6 @@ static bool sus_mount_uniq_has(u64 uid)
         found = true;
     spin_unlock_irqrestore(&uniq_lock, flags);
     return found;
-}
-
-/* Craft a plausible mnt_id_unique for a mount we just marked.  Upstream (7d91da2) does the same in
- * its mount allocators: read the live counter and add our own monotonically, so the marked mount's
- * unique id sits in the live range with no gap a detector can threshold on.  Reading (not
- * incrementing) mnt_id_ctr is deliberate - the next few legitimate mounts may share the same unique
- * id, which upstream accepts and which does no harm while the mount is hidden or umounted for the
- * target.  Only the 64-bit unique id is touched; the 32-bit mnt_id stays the real KSU-range id. */
-static void sus_mount_craft_unique(struct mount *r)
-{
-    if (sus_mount_mnt_id_ctr)
-        r->mnt_id_unique = atomic64_read(sus_mount_mnt_id_ctr) +
-                           atomic64_inc_return(&sus_mount_sus_id_ctr);
-    /* Record whatever id this mount now carries - the crafted one, or the kernel's own when
-     * mnt_id_ctr is unresolved - so listmount/statmount hide the same mount the scan marked. */
-    sus_mount_uniq_add(r->mnt_id_unique);
 }
 #endif
 
@@ -1373,15 +1342,6 @@ static int sus_mount_listmount_ret(struct kretprobe_instance *ri, struct pt_regs
     /* One gate test for the whole array: a reader we never hide costs nothing more than this. */
     if (!sus_mount_hidden_reader())
         return 0;
-    /* Only a result that did NOT fill the caller's buffer is a complete enumeration.  Upstream skips
-     * our mounts inline and so keeps filling the buffer with real ones; dropping them here after the
-     * fact cannot, so on a full buffer the next real mounts were never written and lowering the count
-     * would make the caller stop paging early and lose them.  kls->nr_mnt_ids is the buffer size
-     * (do_listmount counts down a local copy), so a full page is left as the kernel built it. */
-    if (ret >= (long)kls->nr_mnt_ids) {
-        atomic_inc(&n_listmount_full);
-        return 0;
-    }
     atomic_inc(&n_listmount_hits);
     for (i = 0; i < ret; i++) {
         if (sus_mount_uniq_has(ids[i])) {
@@ -1392,8 +1352,20 @@ static int sus_mount_listmount_ret(struct kretprobe_instance *ri, struct pt_regs
             ids[w] = ids[i];
         w++;
     }
-    if (w != ret)
-        regs->regs[0] = (unsigned long)w;	/* the syscall copies and returns this many */
+    if (w == ret)
+        return 0;			/* nothing of ours on this page */
+    /* The caller pages by the last id it received (SYSCALL_DEFINE4(listmount): the next call
+     * resumes at mnt_find_id_at(ns, last_mnt_id + 1)) and stops only when a call returns 0.  So
+     * lowering the count is safe: the last id we keep is the highest real id in the page, and the
+     * next page resumes just past it, re-scanning and re-dropping any of ours that sorted after it.
+     * The one exception is a FULL page that was entirely ours (w == 0): returning 0 there would
+     * read as "enumeration finished" and the caller would stop before the real mounts that follow,
+     * so that one page is left as the kernel built it.  A non-full w == 0 is a true end of list. */
+    if (w == 0 && ret >= (long)kls->nr_mnt_ids) {
+        atomic_inc(&n_listmount_full);
+        return 0;
+    }
+    regs->regs[0] = (unsigned long)w;		/* the syscall copies and returns this many */
     return 0;
 }
 
@@ -2605,9 +2577,10 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long 
             replaced[n_replaced++] = r->mnt_id;
         r->mnt_id = new_id;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-        /* 6.12+ also exposes a unique 64-bit id (statx STATX_MNT_ID_UNIQUE, listmount, statmount);
-         * craft it so the marked mount leaves no gap in that series either. */
-        sus_mount_craft_unique(r);
+        /* 6.12+ also names mounts by a 64-bit unique id (listmount, statmount).  Upstream crafts
+         * one at allocation (7d91da2); this mount is already in ns->mounts, keyed on that id, so it
+         * keeps the kernel's own (already in range, no gap) and the id is only recorded. */
+        sus_mount_uniq_add(r->mnt_id_unique);
 #endif
         /* After the id is replaced, exactly like upstream: the climb starts at a
          * mount that now carries a KSU-range id and stops at the first ancestor
@@ -2787,9 +2760,6 @@ int susfs_sus_mount_init(void)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
     sus_mount_namespace_sem = (struct rw_semaphore *)find_kernel_symbol_exact("namespace_sem");
     pfn_put_mnt_ns = (void *)find_kernel_symbol_exact("put_mnt_ns");
-    sus_mount_mnt_id_ctr = (atomic64_t *)find_kernel_symbol_exact("mnt_id_ctr");
-    if (!sus_mount_mnt_id_ctr)
-        pr_warn("sus_mount: mnt_id_ctr not resolved - mnt_id_unique of marked mounts keeps its gap, detectable on 6.12+ unless the mounts are hidden or umounted for the target\n");
 #endif
 
     err = security_secctx_to_secid(param_su_ctx, strlen(param_su_ctx), &su_sid);

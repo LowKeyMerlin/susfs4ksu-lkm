@@ -75,9 +75,9 @@ Needs verification or a port (narrow):
 1. ksu-conflict: detect built-in susfs at load, refuse to arm, fail-closed.
 2. ksu-forks: per-fork symbol and transport map in `abi_known.json`.
 3. p1-capacity: dynamic rule storage replacing the fixed arrays, with the LKM reader/unload rules.
-4. p1-612: done except the 16K fixup fold. mnt_id_unique crafting, statx mnt_id masks and
-   listmount/statmount hiding are implemented (see the p1-612 outcome and listmount/statmount
-   sections); the 16K fold stays build-gated.
+4. p1-612: done except the 16K fixup fold. statx mnt_id masks and listmount/statmount hiding are
+   implemented; mnt_id_unique crafting was tried and removed as unsafe for an LKM (see the p1-612
+   outcome and listmount/statmount sections); the 16K fold stays build-gated.
 5. p2-refactor: ed8a832 semantics onto our derived process state.
 6. p4-selinux: selinux_hide as a new file with fork detection.
 7. p5-webui: module WebUI toggles.
@@ -90,7 +90,12 @@ edits those commits patched.
 
 ## p1-capacity outcome
 
-The three accumulating rule tables now grow instead of refusing rules at a fixed cap:
+The three accumulating rule tables now grow on demand instead of refusing rules at the old small
+fixed caps (32/64/64), up to a hard ceiling of 1024 entries each. The ceiling is there because every
+hooked read walks the table linearly (kstat with IRQs off), so an unbounded table would also mean an
+unbounded per-call cost and pinned kernel memory from a runaway root-side script; a full table
+answers -ENOSPC, and an allocation failure while growing answers -ENOMEM (no longer folded into
+-ENOSPC):
 
 - sus_kstat: growable array, reallocated under the writer mutex and swapped under the reader
   spinlock (readers already copy out under that spinlock). Freed on unload after the drain.
@@ -128,14 +133,19 @@ rcu_barrier because the callback runs kernel code, not module code.
 
 ## p1-612 outcome
 
-- mnt_id_unique crafting (done): a marked mount is given a plausible 64-bit unique id
-  (atomic64_read(mnt_id_ctr) + a private counter), the same shape as upstream 7d91da2, so
-  statx(STATX_MNT_ID_UNIQUE) no longer shows the gap.
+- mnt_id_unique crafting (removed): c71bdb0 gave each marked mount atomic64_read(mnt_id_ctr) + a
+  private counter, the shape of upstream 7d91da2. Upstream does that in its allocators, before the
+  mount is inserted; the module rewrote it on mounts already in ns->mounts, which on 6.12+ is an
+  rb-tree keyed on mnt_id_unique (mnt_add_to_ns(), 6.12:1139, 6.18:1092). Rewriting the key in place
+  breaks mnt_find_id_at() for statmount, listmount paging and the /proc/mounts seq position, and
+  the crafted values also collided with the ids the kernel's counter handed to the next real
+  mounts. The mount now keeps the id the kernel gave it at allocation, which is already in range
+  with no gap, and the id is only recorded for the listmount/statmount filter.
 - statx mask handling (verified, no change): the two mask bits land different values in the single
-  stx_mnt_id field, and our two mechanisms are complementary. STATX_MNT_ID returns the KSU-range
-  mnt_id, which the statx return-probe maps to the original via sus_mount_shown_for(). STATX_MNT_ID_
-  UNIQUE returns the crafted unique id; sus_mount_shown_for((int)id) finds no map and leaves it
-  intact, so the crafted value stands. Neither clobbers the other.
+  stx_mnt_id field. STATX_MNT_ID returns the KSU-range mnt_id, which the statx return-probe maps to
+  the original via sus_mount_shown_for(). STATX_MNT_ID_UNIQUE returns the kernel's own unique id,
+  which sus_mount_shown_for((int)id) finds no map for and leaves intact; that id is still hidden
+  from enumeration by the listmount/statmount probes.
 - listmount/statmount hiding (now implemented, see its own section below). The earlier note that a
   return probe "lacks the per-mount struct context" was wrong: it does not need the struct, only the
   64-bit mnt_id_unique, which we already record when we mark a mount.
@@ -157,18 +167,16 @@ against `android16-6.12` (6.12.96) for the same files:
   `struct mount *` is never dereferenced.
 - `mnt_id_xa` is `static`, resolved via kallsyms like every other static data symbol this module
   reads.
-- `mnt_id_ctr` changed type from 6.12's `atomic64_t` to 6.18's plain `u64` (now incremented under
-  `mnt_id_xa`'s own `xa_lock` instead of atomically). `sus_mount_craft_unique()`'s
-  `atomic64_read()` on the cast pointer is still correct on both: `CONFIG_64BIT`'s `atomic64_t` is
-  `struct { s64 counter; }`, bit-identical in layout to a bare `u64` at the same address, and
-  `atomic64_read()` is a plain relaxed load that needs no lock to read race-free.
+- `ns->mounts` is an rb-tree ordered by `mnt_id_unique` on both trees (`mnt_add_to_ns()`), so the
+  module must never write that field on a mount already inserted. This audit originally covered
+  `mnt_id_ctr`'s type change (6.12 `atomic64_t`, 6.18 plain `u64`) for the crafting read; the
+  crafting is removed, so `mnt_id_ctr` is no longer resolved or read at all.
 - The allocation range `sus_mount_ida_alloc()` uses (`[DEFAULT_KSU_MNT_ID, INT_MAX-1]`) is a
   strict subset of the kernel's own `xa_limit_31b = [0, INT_MAX]`, so a marked mount's id is
   always one the kernel's own allocator could have produced.
 
-No bug found. One comment in `sus_mount.c` was wrong (it described `mnt_id_ctr` as always
-`atomic64_t`, which is only true through 6.12) and has been corrected to state the verified,
-version-dependent type and why the cast is still safe.
+The xarray points found no bug. The crafting did have one (in-place rewrite of an rb-tree key,
+found in review afterwards) and was removed; see the p1-612 outcome.
 
 ## WildKernels and pershoot audit: nothing to port
 
@@ -230,11 +238,11 @@ implemented in `sus_mount.c` under `#if >= 6.12` (the only KMIs with these 6.8+ 
 How it works:
 
 - A bounded sorted table (`sus_mount_uniq[]`, 1024 slots, `uniq_lock`) records the 64-bit
-  `mnt_id_unique` of every mount we mark - written in `sus_mount_craft_unique()` (the scan) and in
-  the `attach_recursive_mnt` return handler (mounts that appear later). The unique id is a monotonic
-  counter the kernel never reuses (`fs/namespace.c`: `atomic64_inc_return(&mnt_id_ctr)` on 6.12,
-  `++mnt_id_ctr` on 6.18), so a recorded id can never later name a different mount and the table
-  needs no teardown on umount. It persists across disable/re-enable on purpose: the re-scan skips
+  `mnt_id_unique` of every mount we mark - recorded in the scan and in the `attach_recursive_mnt`
+  return handler (mounts that appear later). Only the kernel's own ids are recorded, never crafted
+  ones: the unique id is a monotonic counter the kernel never reuses (`fs/namespace.c`:
+  `atomic64_inc_return(&mnt_id_ctr)` on 6.12, `++mnt_id_ctr` on 6.18), so a recorded id can never
+  later name a different mount and the table needs no teardown on umount. It persists across disable/re-enable on purpose: the re-scan skips
   already-marked mounts, so clearing it would lose them.
 - A kretprobe on `do_listmount` drops our ids from `kls->kmnt_ids` and lowers the returned count
   before the syscall copies the array to userspace. This is the same effect as upstream's hunk (a
@@ -255,10 +263,13 @@ Why it is regress-safe:
   the exception return restores that same `pt_regs`, so writing `regs->regs[0]` changes the effective
   return (confirmed in `arch/arm64/kernel/probes/kprobes.c` on both trees).
 - A return probe can only remove entries after the kernel built the page, not skip them inline as
-  upstream does. If the buffer filled (`ret == nr_mnt_ids`) the next real mounts were never written,
-  so lowering the count would make the caller page early and lose them - compaction is therefore
-  skipped on a full buffer (fail-open, counted as `listmount full=`). The common "read every mount"
-  call passes a large buffer and is unaffected.
+  upstream does. That is still complete: the caller pages by the last id it received
+  (`mnt_find_id_at(ns, last_mnt_id + 1)`) and stops only on a 0 return, so after compaction the
+  highest real id kept is where the next page resumes, and any of ours that sorted after it are
+  re-scanned and re-dropped. A small buffer therefore cannot page past the filter. The one page left
+  as the kernel built it is a FULL page that was entirely ours: lowering its count to 0 would read
+  as end-of-list and lose the real mounts after it (counted as `listmount full=`). A non-full
+  all-ours page is a true end of list and returns 0.
 - The gate (`sus_mount_hidden_reader`) is the umount predicate, so su, the manager and su-granted
   apps are never touched. It is safe from the preempt-disabled handler: across all five supported
   forks `ksu_uid_should_umount()` takes only `rcu_read_lock()` and a `kref_put`/`kfree_rcu`, never a

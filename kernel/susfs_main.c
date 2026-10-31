@@ -265,6 +265,7 @@ enum susfs_layer_id {
     SUSFS_L_SUPERCALL,
     SUSFS_L_HIDE_SYMS,
     SUSFS_L_PRIORITY_FILTER,
+    SUSFS_L_SELINUX_HIDE,
     SUSFS_L_COUNT,
 };
 
@@ -316,13 +317,13 @@ static struct susfs_layer {
     { "open_redirect",	susfs_open_redirect_init,	susfs_open_redirect_exit, false, SUSFS_FEAT_OPEN_REDIRECT },
     { "enable_log",	susfs_enable_log_init,		susfs_enable_log_exit,	false, SUSFS_FEAT_ENABLE_LOG },
     { "avc_spoof",	susfs_avc_spoof_init,		susfs_avc_spoof_exit,	false, SUSFS_FEAT_AVC_SPOOF },
-    /* Read-only detection, nothing to arm: NOT fatal either way. */
-    { "selinux_hide",	susfs_selinux_hide_init,	susfs_selinux_hide_exit, false, -1 },
     { "supercall",	susfs_supercall_init,		susfs_supercall_exit,	false, -1 },
     { "hide_syms",	susfs_hide_syms_init,		susfs_hide_syms_exit,	false, SUSFS_FEAT_HIDE_SYMS },
-    /* Last, so that the numbers above do not move. NOT fatal: without it the getpriority and ioprio
+    /* New layers are appended, so that the numbers above do not move. NOT fatal: without it the getpriority and ioprio
      * calls answer the kernel's own way and the command is refused like an unknown one. */
     { "priority_filter",	susfs_priority_filter_init,	susfs_priority_filter_exit, false, SUSFS_FEAT_PRIORITY_FILTER },
+    /* Read-only detection, nothing to arm: NOT fatal either way. */
+    { "selinux_hide",	susfs_selinux_hide_init,	susfs_selinux_hide_exit, false, -1 },
 };
 
 /* Diagnostic: make one layer's init fail, by 1-based index, to exercise the rollback path
@@ -335,6 +336,7 @@ static struct susfs_layer {
  *   1 fp_hook   2 ksu_umount_gate  3 ksu_allow_gate  4 lsm_hook   5 sus_path
  *   6 create_gate  7 opath  8 dirent  9 uname  10 kstat  11 sus_map  12 sus_mount
  *   13 cmdline  14 open_redirect  15 enable_log  16 avc_spoof  17 supercall  18 hide_syms  19 priority_filter
+ *   20 selinux_hide
  */
 static int fail_layer;
 module_param_named(fail_layer, fail_layer, int, 0644);
@@ -381,6 +383,7 @@ static const struct {
     { SUSFS_L_SUPERCALL, true },
     { SUSFS_L_HIDE_SYMS, false },
     { SUSFS_L_PRIORITY_FILTER, false },
+    { SUSFS_L_SELINUX_HIDE, false },
 };
 
 static int susfs_load_layer(int id, bool fatal)

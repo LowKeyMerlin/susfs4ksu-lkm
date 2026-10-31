@@ -57,6 +57,18 @@ def fetch_branch(kmi, paths, out):
                 )
                 shutil.rmtree(tmp, ignore_errors=True)
                 return False
+        else:
+            # A reused clone is pinned at the commit it was made from; bring it to the branch tip
+            # so an audit never reads stale source.  --update-head-ok: HEAD is this branch, and a
+            # no-checkout clone has no work tree for the ref move to disturb.
+            r = git(
+                "fetch", "--no-tags", "--depth", "1", "--filter=blob:none", "--update-head-ok",
+                "origin", f"+refs/heads/{kmi}:refs/heads/{kmi}", cwd=tmp,
+            )
+            if r.returncode:
+                head = git("rev-parse", "--short", "HEAD", cwd=tmp).stdout.decode().strip()
+                print(f"{kmi}: refresh failed, reading the cached clone at {head}: "
+                      f"{r.stderr.decode(errors='replace').strip()[:200]}")
         # One fetch for every wanted blob: without it each git show below pulls its blob in a
         # separate round trip to the server, which is minutes per branch for a few dozen files.
         oids = {}
@@ -66,6 +78,10 @@ def fetch_branch(kmi, paths, out):
                 print(f"{kmi}: no {p}")
             else:
                 oids[p] = r.stdout.decode().strip()
+        if not oids:
+            # A bare `git fetch origin` would pull every branch's default refspec.
+            print(f"{kmi}: 0/{len(paths)} files")
+            return True
         r = git(
             "fetch", "--no-tags", "--no-write-fetch-head", "--filter=blob:none",
             "origin", *sorted(set(oids.values())), cwd=tmp,

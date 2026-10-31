@@ -12,11 +12,19 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "module" / "toggle.sh"
-GIT_SH = Path("C:/Program Files/Git/bin/sh.exe")
-
-
 def find_sh():
-    return shutil.which("sh") or (str(GIT_SH) if GIT_SH.exists() else None)
+    sh = shutil.which("sh")
+    if sh:
+        return sh
+    # Git for Windows ships sh.exe in <root>/bin; find <root> from wherever git is installed
+    # (git.exe sits in <root>/cmd or <root>/mingw64/bin) instead of assuming the default path.
+    git = shutil.which("git")
+    if git:
+        for root in Path(git).resolve().parents[1:3]:
+            cand = root / "bin" / "sh.exe"
+            if cand.exists():
+                return str(cand)
+    return None
 
 
 def put(path, text):
@@ -51,8 +59,9 @@ class Env:
 def main():
     sh = find_sh()
     if not sh:
-        print("toggle test skipped: no sh on this host")
-        return
+        # A failure, not a skip: exiting 0 here would report a pass without checking anything.
+        print("toggle test FAILED: no sh on this host (install Git for Windows or run on Linux)")
+        return 1
     with tempfile.TemporaryDirectory() as d:
         e = Env(sh, Path(d))
         e.node("enable_log", "1\n")
@@ -128,7 +137,14 @@ def main():
         (e.proc / "susfs_avc_spoof").unlink()
         rc, _, err = e.run("apply")
         assert rc == 0 and "not applied" in err, (rc, err)
+
+        # apply keeps a last line that has no trailing newline (a hand-edited file)
+        e.node("avc_spoof", "0\n")
+        put(e.conf, "enable_log=1\navc_spoof=1")
+        assert e.run("apply")[0] == 0
+        assert e.read("avc_spoof").strip() == "1", "the unterminated last line was dropped"
     print("toggle test ok")
+    return 0
 
 
 if __name__ == "__main__":

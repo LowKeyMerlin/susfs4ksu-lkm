@@ -26,6 +26,7 @@
 #include <linux/slab.h>		/* kmalloc(GFP_ATOMIC), kvmalloc/kvfree_rcu for the rule table */
 #include <linux/rcupdate.h>	/* the rule table is RCU-published */
 #include <linux/overflow.h>	/* struct_size() for the flex-array table */
+#include <linux/kernel.h>	/* min() for the capped growth */
 #include <linux/task_work.h>	/* the map_files reference is released from task_work */
 #include <linux/mutex.h>	/* map_ctl_lock: serialises probe arming */
 #include <linux/proc_fs.h>	/* proc_create() for /proc/susfs_map */
@@ -41,13 +42,16 @@
 #include "susfs_fp_hook.h"	/* susfs_fp_drain: wait out in-flight wrappers */
 
 #define SUS_MAP_INIT_CAP 64
+/* 16x the old fixed SUS_MAP_MAX.  Every maps/smaps line a hidden reader reads walks this table, so
+ * the ceiling bounds that walk as well as the memory; a full table answers -ENOSPC. */
+#define SUS_MAP_MAX_CAP 1024
 
 struct sus_map_entry {
     unsigned long target_ino;
     dev_t target_dev;
 };
 
-/* RCU-published backing store, grown on demand so there is no fixed rule ceiling.  The used
+/* RCU-published backing store, grown on demand up to SUS_MAP_MAX_CAP.  The used
  * count lives inside the table: a reader that dereferenced an older, smaller table reads that
  * table's own frozen count and so can never index past its end.  Slots are still published one
  * at a time with release semantics (target_ino last, 0 = free), so add/delete/reuse act in
@@ -151,10 +155,13 @@ static int sus_map_add_full(unsigned long ino, dev_t dev, bool *added)
         spin_unlock_irqrestore(&map_table_lock, flags);
 
         kvfree(spare);
-        spare = kvmalloc(struct_size(spare, e, cur_cap * 2), GFP_KERNEL);
+        if (cur_cap >= SUS_MAP_MAX_CAP)
+            return -ENOSPC;
+        cur_cap = min(cur_cap * 2, SUS_MAP_MAX_CAP);
+        spare = kvmalloc(struct_size(spare, e, cur_cap), GFP_KERNEL);
         if (!spare)
             return -ENOMEM;
-        spare->cap = cur_cap * 2;
+        spare->cap = cur_cap;
         spare->n = 0;
     }
 }

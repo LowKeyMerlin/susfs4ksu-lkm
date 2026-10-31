@@ -39,6 +39,9 @@ For each feature's supercall and `/proc` write:
 - `clear`, then add again (buffer kept across clear, re-grows).
 - Under KASAN: the reallocation path (`kstat_table_grow`) must show no use-after-free when a reader
   (a stat syscall on a marked inode from an app) runs concurrently with the writer.
+- Ceiling: add past `SUS_KSTAT_MAX_CAP` (1024); the add is refused with `-ENOSPC` and the earlier
+  rules keep working. A grow allocation failure (fault injection) is reported as `-ENOMEM`, distinct
+  from the full-table `-ENOSPC`.
 - `rmmod` after a large table: no leak (kmemleak), no WARN; buffer freed after the drain.
 
 ### 3b. sus_map (RCU flex-array, lock-free readers)
@@ -47,6 +50,7 @@ For each feature's supercall and `/proc` write:
 - Concurrency: a tight loop reading `/proc/<pid>/maps` of a marked process while another thread adds
   rules across a grow boundary. Under KASAN + PROVE_RCU, the old-table free must not race the
   lock-free reader. Expect zero splats.
+- Ceiling: add past `SUS_MAP_MAX_CAP` (1024); the add is refused with `-ENOSPC`, earlier rules keep hiding.
 - Delete back below a doubling boundary (table does not shrink) and confirm readers stay correct.
 - No duplicate after a delete: add A, add B, `del A`, add B again. `/proc/susfs_map` must list B
   once, and after `del B` the mapping must be visible again (before the fix a second copy of B
@@ -66,15 +70,23 @@ For each feature's supercall and `/proc` write:
   rule missed (the live-count gate is raised before a new rule's slot is filled).
 - OOM on grow: inject an allocation failure in `or_grow_locked`; `add` must return `-ENOMEM` with the
   table unchanged (no half-added rule, live count not bumped).
+- Ceiling: fill past `SUS_OR_MAX_CAP` (1024) live rules; the add is refused with `-ENOSPC` (distinct
+  from the OOM `-ENOMEM`), earlier redirects keep firing.
 - `rmmod` after churn: table and free list freed, no splat, no leak.
 
-## 4. mnt_id_unique (6.12+)
+## 4. mnt_id_unique, listmount and statmount (6.12+)
 
-- On a marked mount, `statx(STATX_MNT_ID_UNIQUE)` returns a plausible id with no gap versus
-  neighbouring mounts; `statx(STATX_MNT_ID)` still maps to the original id.
-- `mnt_id_ctr` unresolved (simulate by denying the symbol): marked mounts keep their id, the feature
-  logs the fail-safe message, and nothing crashes.
-- su-domain caller sees the real ids (the gate short-circuits).
+- `statx(STATX_MNT_ID)` on a marked mount maps to the original id; `statx(STATX_MNT_ID_UNIQUE)`
+  returns the kernel's own unique id (not crafted, so no rb-tree key is ever rewritten). The su-domain
+  caller sees the real mnt_id (the gate short-circuits).
+- `listmount(2)` from a hidden reader does not return any marked mount's unique id, at any buffer
+  size including 1 (page through to the end and confirm none appears); a su-granted app still sees
+  them. A full page that is entirely marked mounts is the one allowed leak - construct it only if
+  feasible and confirm real mounts after it are still returned (no early end-of-list).
+- `statmount(2)` on a marked mount's unique id returns `-ENOENT` for a hidden reader, the same as an
+  unknown id; a su-granted app gets the real details.
+- `do_listmount`/`do_statmount` inlined (simulate by denying the symbol): the probes do not arm, the
+  syscalls are left unfiltered, and nothing crashes.
 
 ## 5. Unload safety (all features)
 

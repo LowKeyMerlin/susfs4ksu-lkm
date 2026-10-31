@@ -65,8 +65,11 @@
 #include "susfs_kprobe.h"
 #include "susfs_or_entry.h"	/* susfs_or_entry_armed(): the forward direction lives there now */
 
-/* Initial slot count; the table doubles from here when every slot is live (or_grow_locked). */
+/* Initial slot count; the table doubles from here when every slot is live (or_grow_locked), up to
+ * SUS_OR_MAX_CAP (16x the old fixed SUS_OR_MAX).  Every open a reader makes walks the table, so the
+ * ceiling bounds that walk as well as the memory; a full table answers -ENOSPC. */
 #define SUS_OR_INIT_CAP 64
+#define SUS_OR_MAX_CAP 1024
 /* The ABI fields are char[256]; matching that width stops a legal long path from being truncated into a rule for a
  * different path. */
 #define OR_PATH_MAX 256
@@ -998,7 +1001,7 @@ static struct sus_or_table *or_table_alloc(int cap)
 	struct sus_or_table *t;
 	int i;
 
-	t = kvmalloc(struct_size(t, e, cap), GFP_KERNEL);
+	t = kvzalloc(struct_size(t, e, cap), GFP_KERNEL);
 	if (!t)
 		return NULL;
 	t->nor = 0;
@@ -1017,7 +1020,7 @@ static struct sus_or_table *or_grow_locked(void)
 	struct sus_or_table *old = or_table_locked();
 	struct sus_or_table *fresh;
 	unsigned int *free2;
-	int cap = old->cap * 2;
+	int cap = min(old->cap * 2, SUS_OR_MAX_CAP);
 
 	fresh = or_table_alloc(cap);
 	if (!fresh)
@@ -1093,7 +1096,6 @@ int susfs_open_redirect_init(void)
 
 void susfs_open_redirect_exit(void)
 {
-
 	/* Stop being reachable from the syscall table first: the hook pointer is cleared before the
 	 * probes come down, so no entry that is still installed can call into this layer's exit. */
 	susfs_or_entry_exit();
@@ -1298,15 +1300,20 @@ static int or_add(const char *target, const char *redirected, int scheme)
 
 	/* Capacity is secured before anything is retired, so a failure leaves the table exactly as it
 	 * was.  A rewrite reclaims its own slot below, so only a NEW rule with every slot live needs a
-	 * bigger table; or_lock is held (a mutex), so that growth may sleep.  The only failure left is
-	 * OOM. */
+	 * bigger table; or_lock is held (a mutex), so that growth may sleep.  The failures left are the
+	 * SUS_OR_MAX_CAP ceiling and OOM. */
 	{
 		struct sus_or_table *t = or_table_locked();
 
-		if (!e && !or_free_n && t->nor >= t->cap && !or_grow_locked()) {
-			path_put(&rp);
-			path_put(&tp);
-			return -ENOMEM;
+		if (!e && !or_free_n && t->nor >= t->cap) {
+			int err = t->cap >= SUS_OR_MAX_CAP ? -ENOSPC :
+				  !or_grow_locked() ? -ENOMEM : 0;
+
+			if (err) {
+				path_put(&rp);
+				path_put(&tp);
+				return err;
+			}
 		}
 	}
 
@@ -1427,8 +1434,8 @@ static void or_clear_all(void)
 	bool any = false;
 	int i;
 
-	/* The table has no fixed ceiling now, so the per-slot "I marked this one" set is an allocated
-	 * bitmap rather than a word.  or_lock is held throughout (no concurrent grow), so `t` is stable
+	/* The table is grown on demand (up to SUS_OR_MAX_CAP), so the per-slot "I marked this one" set
+	 * is an allocated bitmap rather than a word.  or_lock is held throughout (no concurrent grow), so `t` is stable
 	 * and GFP_KERNEL is fine. */
 	marked = bitmap_zalloc(t->nor, GFP_KERNEL);
 	if (!marked) {

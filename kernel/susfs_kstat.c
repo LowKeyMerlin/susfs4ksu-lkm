@@ -81,9 +81,12 @@
 #define KSTAT_AUTO_SPOOF_FULL_CLONE (KSTAT_AUTO_SPOOF | \
 	KSTAT_SPOOF_NLINK | KSTAT_SPOOF_SIZE)
 
-/* First allocation holds this many rules; the table doubles from here as rules are added, so there
- * is no fixed ceiling the way the old SUS_KSTAT_MAX array imposed. */
+/* First allocation holds this many rules; the table doubles from here as rules are added, up to
+ * SUS_KSTAT_MAX_CAP (32x the old fixed SUS_KSTAT_MAX).  The ceiling is not about memory alone:
+ * every hooked stat walks the table linearly with IRQs off, so an unbounded table would make that
+ * walk unbounded too.  A full table answers -ENOSPC, like the old fixed array did. */
 #define SUS_KSTAT_INIT_CAP 16
+#define SUS_KSTAT_MAX_CAP 1024
 /* Upstream's target_pathname is char[256]: a shorter buffer truncates a legal long path into a wrong rule. */
 #define KSTAT_PATH_MAX 256
 
@@ -324,6 +327,10 @@ static int kstat_table_grow(void)
 	unsigned long flags;
 	int cap = kstat_cap ? kstat_cap * 2 : SUS_KSTAT_INIT_CAP;
 
+	if (kstat_cap >= SUS_KSTAT_MAX_CAP)
+		return -ENOSPC;
+	if (cap > SUS_KSTAT_MAX_CAP)
+		cap = SUS_KSTAT_MAX_CAP;
 	buf = kvmalloc_array(cap, sizeof(*buf), GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
@@ -345,15 +352,19 @@ static int kstat_table_grow(void)
 	return 0;
 }
 
-/* Append a fully-prepared entry, growing the table first if it is full.
- * Returns the new index, or -ENOMEM when the table could not grow. */
+/* Append a fully-prepared entry, growing the table first if it is full.  Returns the new index,
+ * -ENOSPC at SUS_KSTAT_MAX_CAP, or -ENOMEM when the table could not grow. */
 static int kstat_table_append(const struct sus_kstat_entry *src)
 {
 	unsigned long flags;
-	int idx = -1;
+	int idx = -ENOSPC;
+	int err;
 
-	if (nkstat >= kstat_cap && kstat_table_grow())
-		return -ENOMEM;
+	if (nkstat >= kstat_cap) {
+		err = kstat_table_grow();
+		if (err)
+			return err;
+	}
 
 	spin_lock_irqsave(&kstat_table_lock, flags);
 	if (nkstat < kstat_cap) {
@@ -2508,7 +2519,7 @@ static int susfs_kstat_add(const char *path)
 		return 0;
 	}
 	idx = kstat_table_append(&tmp);
-	return idx < 0 ? -ENOSPC : 0;
+	return idx < 0 ? idx : 0;
 }
 
 static void susfs_kstat_del(const char *path)
@@ -2599,7 +2610,7 @@ static int susfs_kstat_add_statically(char **argv, int argc)
 		return 0;
 	}
 	idx = kstat_table_append(&tmp);
-	return idx < 0 ? -ENOSPC : 0;
+	return idx < 0 ? idx : 0;
 }
 
 /* statically-add from the supercall ABI struct (is_statically=1): copy the caller's 12 spoofed
@@ -2637,7 +2648,7 @@ static int susfs_kstat_add_statically_abi(struct st_susfs_sus_kstat *info)
 		return 0;
 	}
 	idx = kstat_table_append(&tmp);
-	return idx < 0 ? -ENOSPC : 0;
+	return idx < 0 ? idx : 0;
 }
 
 /* supercall: CMD_SUSFS_ADD_SUS_KSTAT / UPDATE / STATICALLY */

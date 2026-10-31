@@ -29,11 +29,6 @@
 
 static bool *ksu_selinux_hide_running_ptr;
 
-bool susfs_selinux_hide_native_supported(void)
-{
-	return ksu_selinux_hide_running_ptr != NULL;
-}
-
 static int selinux_hide_proc_show(struct seq_file *m, void *v)
 {
 	seq_printf(m, "native_supported=%d native_running=%d\n",
