@@ -1411,7 +1411,8 @@ static int sus_mount_root_entry(struct kretprobe_instance *ri, struct pt_regs *r
     return sus_mount_uniq_has(id) ? 0 : 1;
 }
 
-/* -ENOENT is final for statmount: retry_statmount() only loops on -EOVERFLOW. */
+/* -ENOENT is final for statmount: retry_statmount() (fs/namespace.c, 6.12 and 6.18) only loops on
+ * -EAGAIN (it doubles its string buffer and retries), so -ENOENT ends the call. */
 static int sus_mount_root_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
     if ((long)regs_return_value(regs) != 0)

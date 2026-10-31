@@ -822,6 +822,7 @@ static int kstat_fdinfo_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 static struct kretprobe krp_kstat_fdinfo[KSTAT_FDINFO_MAX];
 static int n_kstat_fdinfo;
+static bool kstat_fdinfo_tried;
 
 /* Under the lock and exiting flag of the maps hook: the same callers arm both. */
 static void kstat_fdinfo_arm(void)
@@ -830,10 +831,13 @@ static void kstat_fdinfo_arm(void)
 	int i, n, rc;
 
 	mutex_lock(&kstat_maps_ctl_lock);
-	if (kstat_maps_exiting || n_kstat_fdinfo) {
+	/* One attempt: a lookup or registration that failed once fails the same way on the next rule,
+	 * which would only repeat the kallsyms scan and the warnings below. */
+	if (kstat_maps_exiting || n_kstat_fdinfo || kstat_fdinfo_tried) {
 		mutex_unlock(&kstat_maps_ctl_lock);
 		return;
 	}
+	kstat_fdinfo_tried = true;
 	n = ksu_find_symbol_all("seq_show", addrs, KSTAT_FDINFO_MAX);
 	if (n <= 0)
 		pr_warn("susfs_kstat: seq_show not found - fdinfo prints the real mount id and inode\n");

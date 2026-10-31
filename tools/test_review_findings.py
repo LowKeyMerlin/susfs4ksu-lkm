@@ -32,7 +32,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.dirname(HERE)
 
-HARNESS = r'''
+HARNESS = r"""
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -164,7 +164,7 @@ int main(void)
 	       scenarios, tail_leaks, prefix_errors, writes_when_none, fault_leaks);
 	return 0;
 }
-'''
+"""
 
 
 def strip_comments(text):
@@ -181,7 +181,9 @@ def extract_listmount_ret():
     text = read("kernel/sus_mount.c")
     m = re.search(r"static int sus_mount_listmount_ret\(.*?\n\}\n", text, flags=re.S)
     if not m:
-        raise AssertionError("sus_mount_listmount_ret() not found in kernel/sus_mount.c")
+        raise AssertionError(
+            "sus_mount_listmount_ret() not found in kernel/sus_mount.c"
+        )
     return m.group(0)
 
 
@@ -200,8 +202,22 @@ class ListmountCompaction(unittest.TestCase):
         with open(os.path.join(tmp, "h.c"), "w", encoding="utf-8") as f:
             f.write(HARNESS)
         exe = os.path.join(tmp, "h.exe")
-        subprocess.run([gcc, "-O1", "-Wall", "-Werror", "-Wno-unused-function", "-Wno-unused-variable",
-                        "-I", tmp, "-o", exe, os.path.join(tmp, "h.c")], check=True)
+        subprocess.run(
+            [
+                gcc,
+                "-O1",
+                "-Wall",
+                "-Werror",
+                "-Wno-unused-function",
+                "-Wno-unused-variable",
+                "-I",
+                tmp,
+                "-o",
+                exe,
+                os.path.join(tmp, "h.c"),
+            ],
+            check=True,
+        )
         out = subprocess.run([exe], check=True, capture_output=True, text=True).stdout
         cls.result = dict(re.findall(r"(\w+)=(\d+)", out))
         cls.raw = out.strip()
@@ -211,8 +227,12 @@ class ListmountCompaction(unittest.TestCase):
 
     def test_listmount_tail_cleared(self):
         self.assertGreater(self.num("scenarios"), 10000)
-        self.assertEqual(self.num("tail_leaks"), 0,
-                         "hidden ids left in the caller's array past the returned count: " + self.raw)
+        self.assertEqual(
+            self.num("tail_leaks"),
+            0,
+            "hidden ids left in the caller's array past the returned count: "
+            + self.raw,
+        )
         self.assertEqual(self.num("fault_leaks"), 0, self.raw)
 
     def test_listmount_prefix_correct(self):
@@ -227,7 +247,11 @@ class FstatfsRawFd(unittest.TestCase):
         text = strip_comments(read("kernel/susfs_kstat.c"))
         body = re.search(r"susfs_kstatfs_answer\(.*?\n\}\n", text, flags=re.S)
         self.assertIsNotNone(body, "susfs_kstatfs_answer() not found")
-        self.assertIn("fget_raw(", body.group(0), "fstatfs by fd must accept O_PATH like fdget_raw()")
+        self.assertIn(
+            "fget_raw(",
+            body.group(0),
+            "fstatfs by fd must accept O_PATH like fdget_raw()",
+        )
         self.assertNotRegex(body.group(0), r"\bfget\(")
 
     def test_no_fget_on_user_fd_anywhere(self):
@@ -235,11 +259,28 @@ class FstatfsRawFd(unittest.TestCase):
         kdir = os.path.join(SRC, "kernel")
         for name in sorted(os.listdir(kdir)):
             if name.endswith(".c"):
-                for n, line in enumerate(strip_comments(read(f"kernel/{name}")).splitlines(), 1):
+                for n, line in enumerate(
+                    strip_comments(read(f"kernel/{name}")).splitlines(), 1
+                ):
                     if re.search(r"(?<![\w.])fget\(", line):
                         bad.append(f"{name}:{n}: {line.strip()}")
-        self.assertEqual(bad, [], "fget() rejects O_PATH descriptors; the syscalls these stand in for "
-                                  "use fdget_raw() or fdget(): check each")
+        self.assertEqual(
+            bad,
+            [],
+            "fget() rejects O_PATH descriptors; the syscalls these stand in for "
+            "use fdget_raw() or fdget(): check each",
+        )
+
+
+class FdinfoArm(unittest.TestCase):
+    def test_fdinfo_arm_is_attempted_once(self):
+        """When no seq_show can be probed, every later rule add used to repeat the kallsyms scan and
+        the warnings; the attempt is made once."""
+        text = strip_comments(read("kernel/susfs_kstat.c"))
+        body = re.search(r"static void kstat_fdinfo_arm\(void\)\n\{.*?\n\}\n", text, flags=re.S)
+        self.assertIsNotNone(body)
+        self.assertRegex(body.group(0), r"if \(kstat_maps_exiting \|\| n_kstat_fdinfo \|\| kstat_fdinfo_tried\)")
+        self.assertRegex(body.group(0), r"kstat_fdinfo_tried = true;")
 
 
 class BuildHygiene(unittest.TestCase):
@@ -254,8 +295,9 @@ class BuildHygiene(unittest.TestCase):
             if not name.endswith(".c"):
                 continue
             text = read(f"kernel/{name}")
-            if re.search(r"\bSUSFS_LOG[A-Z]\(", strip_comments(text)) and \
-                    not re.search(r'#\s*include\s+"susfs_log\.h"', text):
+            if re.search(r"\bSUSFS_LOG[A-Z]\(", strip_comments(text)) and not re.search(
+                r'#\s*include\s+"susfs_log\.h"', text
+            ):
                 missing.append(name)
         self.assertEqual(missing, [])
 
