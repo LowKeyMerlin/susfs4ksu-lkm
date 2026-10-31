@@ -253,6 +253,8 @@ rules: 1/64
 ino=123456 dev=65099
 ```
 
+`rules: <active>/<capacity>`: the capacity is the table's current size, which starts at 64 and doubles as rules are added, up to 1024.
+
 **Write**:
 
 ```sh

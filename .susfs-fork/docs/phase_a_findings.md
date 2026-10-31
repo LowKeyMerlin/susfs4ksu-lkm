@@ -244,11 +244,18 @@ How it works:
   `atomic64_inc_return(&mnt_id_ctr)` on 6.12, `++mnt_id_ctr` on 6.18), so a recorded id can never
   later name a different mount and the table needs no teardown on umount. It persists across disable/re-enable on purpose: the re-scan skips
   already-marked mounts, so clearing it would lose them.
-- A kretprobe on `do_listmount` drops our ids from `kls->kmnt_ids` and lowers the returned count
-  before the syscall copies the array to userspace. This is the same effect as upstream's hunk (a
-  `continue` right after the loop's `is_path_reachable()` check), reached a different way. The id
-  test is by identity (`sus_mount_uniq_has`), a superset of upstream's KSU-range `mnt_id` test, so it
-  also hides mounts the `attach_recursive_mnt` path marked.
+- Inline filter, the same point as upstream's hunk (a `continue` right after the loop's
+  `is_path_reachable()` check). The `do_listmount` entry probe records the task and `&kls->root` in
+  a 16-slot table (`sus_mount_lm[]`, `lm_lock`) when the reader is hidden. While the task is listed,
+  an `is_path_reachable()` return probe forces 0 for a mount of ours, so the loop skips it and the
+  page fills with real mounts. The first call (orig against `&kls->root`, which decides `-EPERM` for
+  the whole listing) is told apart by its root argument and left alone. The `do_listmount` return
+  probe removes the slot.
+- Fallback compaction: the same return probe drops any of our ids still in `kls->kmnt_ids` and
+  lowers the count before the syscall copies the array out. With the inline filter working it finds
+  nothing.
+- The id test is by identity (`sus_mount_uniq_has`), a superset of upstream's KSU-range `mnt_id`
+  test, so it also hides mounts the `attach_recursive_mnt` path marked.
 - A kretprobe on `do_statmount` forces `-ENOENT` (its own answer for an unknown id) when the
   requested id is ours and the reader is hidden. Upstream does not hide statmount; this is a
   deliberate, documented widening, because hiding listmount alone leaves statmount as a one-call
@@ -262,24 +269,35 @@ Why it is regress-safe:
   runs the handler on the exception `pt_regs` (where x0 holds the function's just-returned value) and
   the exception return restores that same `pt_regs`, so writing `regs->regs[0]` changes the effective
   return (confirmed in `arch/arm64/kernel/probes/kprobes.c` on both trees).
-- A return probe can only remove entries after the kernel built the page, not skip them inline as
-  upstream does. That is still complete: the caller pages by the last id it received
-  (`mnt_find_id_at(ns, last_mnt_id + 1)`) and stops only on a 0 return, so after compaction the
-  highest real id kept is where the next page resumes, and any of ours that sorted after it are
-  re-scanned and re-dropped. A small buffer therefore cannot page past the filter. The one page left
-  as the kernel built it is a FULL page that was entirely ours: lowering its count to 0 would read
-  as end-of-list and lose the real mounts after it (counted as `listmount full=`). A non-full
-  all-ours page is a true end of list and returns 0.
+- `is_path_reachable()` is shared: `path_is_under()` (exported, used by openat2
+  `RESOLVE_BENEATH`/`RESOLVE_IN_ROOT`), `do_pivot_root()` and `do_statmount()` call it too. An
+  unscoped override would make those scoped lookups fail with `-EXDEV` under our mounts. The probe
+  only acts for a task listed in `sus_mount_lm[]`, which only `do_listmount` adds to, so those
+  callers are never changed. The table is cleared when the probes are unregistered: a call in flight
+  at that moment never runs its return handler, and its stale slot would otherwise filter that task's
+  later `is_path_reachable()` calls after a re-enable.
+- Compaction alone is not enough, which is why the inline filter exists. The caller pages from the
+  last id it received (`mnt_find_id_at(ns, last_mnt_id + 1)`) and stops on a 0 return. A partly-ours
+  page can safely come back short, but a FULL page that is entirely ours cannot be lowered to 0
+  without ending the enumeration, so it goes out as built (`listmount full=`). With a buffer of 1,
+  every one of our mounts is such a page. So when the inline filter is not live (probe did not arm,
+  `lm_full`, missed instances, or LTO inlined do_listmount's own call), a small buffer sees every
+  marked mount. `mount_stat` shows which mode is live: `listmount_inline ... (probe=1)` with
+  `filtered=` rising and `listmount dropped=0` is the inline mode.
+- Cost: a hidden reader's listmount pays one table scan per mount in the loop; every other
+  `is_path_reachable()` caller pays a 16-entry pointer scan and returns.
 - The gate (`sus_mount_hidden_reader`) is the umount predicate, so su, the manager and su-granted
   apps are never touched. It is safe from the preempt-disabled handler: across all five supported
   forks `ksu_uid_should_umount()` takes only `rcu_read_lock()` and a `kref_put`/`kfree_rcu`, never a
   mutex (read the fork sources to confirm, since the LKM substitute calls KernelSU here where
   built-in susfs would read a cheap `TIF_PROC_UMOUNTED` flag).
-- Fail-closed arming: `do_listmount`/`do_statmount` are static; if a build inlines them the probe
-  does not register and the syscall is left unfiltered, logged, never a crash.
+- Fail-open arming: `do_listmount`/`do_statmount` are static and `is_path_reachable()` has few
+  callers, so LTO may inline any of them. A probe that does not register leaves its path unfiltered,
+  logged, never a crash. The QEMU smoke asserts all three arm on 6.12 and 6.18 (`lm_probes=1,1,1`),
+  and `tools/verify-gki.sh` checks the same on a device.
 
 Unvalidated: nothing here has been built or booted. New counters are on `mount_stat`
-(`uniq:`, `listmount:`, `statmount:`).
+(`uniq:`, `listmount:`, `listmount_inline:`, `statmount:`).
 
 ## fdinfo inotify SUS_MOUNT branch (b): blocked, not a regression
 

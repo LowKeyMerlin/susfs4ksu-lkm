@@ -363,6 +363,11 @@ echo 'set /data/adb/ /data/local/tmp/' > /proc/susfs_hide_mounts 2>/dev/null
 sleep 1
 head -2 "$P/mount_stat" 2>/dev/null | sed 's/^/  /'
 grep -q 'show_probes=3/3' "$P/mount_stat" 2>/dev/null && ok "show_probes=3/3" || bad "the mount probes did not all arm"
+# Only 6.12+ builds print these.  A 0 here means LTO inlined the function and that path is not hidden.
+for f in listmount listmount_inline statmount; do
+    l=$(grep "^$f: " "$P/mount_stat" 2>/dev/null) || continue
+    case "$l" in *"(probe=1)"*) ok "$f probe armed" ;; *) bad "$f probe did not arm: $l" ;; esac
+done
 
 sec "10. leave the device usable"
 if [ "$RESTORE" = "1" ]; then

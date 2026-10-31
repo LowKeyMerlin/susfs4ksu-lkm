@@ -421,11 +421,12 @@ static int susfs_load_layer(int id, bool fatal)
     return 0;
 }
 
-/* A susfs-enabled KernelSU fork compiles susfs into the kernel image.  A built-in susfs and this
- * module would both own the SUSFS_MAGIC reboot command and both publish the /proc/susfs_* nodes, so
- * the two must never run together.  A built-in susfs defines its fs/susfs.c entry points as vmlinux
- * symbols; this module's own functions are module-owned and find_kernel_symbol_exact() refuses
- * those, so a hit here means a built-in susfs and nothing else.  Checked once, at load, before any
+/* A susfs-enabled KernelSU fork compiles susfs in, usually into the kernel image but possibly into
+ * kernelsu.ko.  Either one and this module would both own the SUSFS_MAGIC reboot command and both
+ * publish the /proc/susfs_* nodes, so the two must never run together.  The markers are upstream's
+ * fs/susfs.c entry points, which this module does not define under those names, so the lookup
+ * covers module-owned symbols too (ksu_kallsyms_lookup_name(), not the vmlinux-only exact
+ * resolver) and a hit means another susfs and nothing else.  Checked once, at load, before any
  * layer arms. */
 static bool susfs_builtin_present(void)
 {
@@ -437,8 +438,8 @@ static bool susfs_builtin_present(void)
     int i;
 
     for (i = 0; i < (int)ARRAY_SIZE(markers); i++) {
-        if (find_kernel_symbol_exact(markers[i])) {
-            pr_warn("susfs_guard_lkm: built-in susfs detected (%s is in the kernel image) - refusing to load so the two do not both own SUSFS_MAGIC or /proc/susfs_*\n",
+        if (ksu_kallsyms_lookup_name(markers[i])) {
+            pr_warn("susfs_guard_lkm: built-in susfs detected (%s is in kallsyms) - refusing to load so the two do not both own SUSFS_MAGIC or /proc/susfs_*\n",
                     markers[i]);
             return true;
         }

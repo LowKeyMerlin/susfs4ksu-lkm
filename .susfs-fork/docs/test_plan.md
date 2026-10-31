@@ -79,14 +79,31 @@ For each feature's supercall and `/proc` write:
 - `statx(STATX_MNT_ID)` on a marked mount maps to the original id; `statx(STATX_MNT_ID_UNIQUE)`
   returns the kernel's own unique id (not crafted, so no rb-tree key is ever rewritten). The su-domain
   caller sees the real mnt_id (the gate short-circuits).
-- `listmount(2)` from a hidden reader does not return any marked mount's unique id, at any buffer
-  size including 1 (page through to the end and confirm none appears); a su-granted app still sees
-  them. A full page that is entirely marked mounts is the one allowed leak - construct it only if
-  feasible and confirm real mounts after it are still returned (no early end-of-list).
+- Probes armed: on both 6.12 and 6.18 images `mount_stat` shows `(probe=1)` on the `listmount`,
+  `listmount_inline` and `statmount` lines (the QEMU smoke asserts this as `lm_probes=1,1,1`). A 0
+  means LTO inlined that function on this build; record which, it decides the next two bullets.
+- With the inline filter armed (`listmount_inline ... probe=1`): `listmount(2)` from a hidden reader
+  returns no marked mount's unique id at any buffer size, including 1. Page through to the end and
+  confirm none appears and every real mount does. Expect `filtered` to rise and `listmount
+  dropped` to stay 0; `dropped > 0` here means do_listmount's call to is_path_reachable() was
+  inlined while the out-of-line copy still exists, so the probe armed but did not see the loop.
+- Fallback only (`listmount_inline ... probe=0`): pages that were partly marked mounts come back
+  short, and a full page that is entirely marked mounts is returned unfiltered (`listmount full`
+  rises). That page is the known leak in this mode, and buffer size 1 reaches it on every marked
+  mount. Confirm real mounts after it are still returned (no early end-of-list).
+- Not scoped too wide: while a hidden reader lists, `openat2(RESOLVE_BENEATH)` and
+  `RESOLVE_IN_ROOT` under a marked mount from another task (and from the same task between
+  listmount calls) behave as before, and `pivot_root` is unaffected. `filtered` only rises during
+  listmount calls.
+- A su-granted app and root see every mount through listmount, and `filtered` does not rise.
 - `statmount(2)` on a marked mount's unique id returns `-ENOENT` for a hidden reader, the same as an
   unknown id; a su-granted app gets the real details.
-- `do_listmount`/`do_statmount` inlined (simulate by denying the symbol): the probes do not arm, the
-  syscalls are left unfiltered, and nothing crashes.
+- Concurrency: 32 hidden readers listing at once with buffer size 1 overflow the 16 `lm` slots
+  (`lm_full` rises) and the overflowed calls fall back to compaction; nothing crashes. Disable the
+  mount layer mid-listing and enable it again: the slots are cleared, and openat2 under a marked
+  mount from those tasks still works afterwards.
+- `do_listmount`/`do_statmount`/`is_path_reachable` inlined (simulate by denying the symbol): that
+  probe does not arm, the rest keep working, and nothing crashes.
 
 ## 5. Unload safety (all features)
 
@@ -108,6 +125,6 @@ For each feature's supercall and `/proc` write:
 
 ## Deferred (tracked, not in this cycle)
 
-listmount/statmount full enumeration hiding, the 16K fixup fold, and the get_anon_bdev minor-gap
-hook (8879282) are build-gated items recorded in phase_a_findings.md; they are out of scope for this
-test pass.
+The 16K fixup fold and the get_anon_bdev minor-gap hook (8879282) are build-gated items recorded in
+phase_a_findings.md; they are out of scope for this test pass. listmount/statmount hiding is written
+but has not been built or booted, so section 4 is its first run.

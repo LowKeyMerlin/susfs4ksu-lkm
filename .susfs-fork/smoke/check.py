@@ -307,6 +307,13 @@ def judge(lines, qemu_rc, ksu_cfg=None):
         got = facts.get(key)
         if not (got is not None and got.lstrip("-").isdigit() and int(got) > 0):
             problems.append(f"{shows}: expected {key}>0, got {got if got is not None else 'nothing'}")
+    # The module builds the listmount(2)/statmount(2) probes from 6.12, the first KMI with the syscalls.
+    m = re.match(r"(\d+)\.(\d+)", facts["kernel"])
+    want = "1,1,1" if m and (int(m[1]), int(m[2])) >= (6, 12) else "absent"
+    got = facts.get("lm_probes")
+    if got != want:
+        problems.append("the do_listmount, is_path_reachable and do_statmount probes armed where the kernel "
+                        f"has them: expected lm_probes={want}, got {got if got is not None else 'nothing'}")
     seen = crashed = False
     for line in lines:
         seen = seen or line.startswith("SMOKE kernel=")

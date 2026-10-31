@@ -30,5 +30,7 @@ new spelling to the gate's candidate list. This is deferred with the rest of the
 ## Conflict rule
 
 The module assumes a vanilla (non-susfs) fork. If the installed fork is itself susfs-enabled, a
-built-in susfs is in the kernel image; `susfs_main.c` detects that at load (vmlinux `susfs_*` entry
-points) and refuses to load, so the two never both own SUSFS_MAGIC or the /proc/susfs_* nodes.
+built-in susfs is in the kernel image or in kernelsu.ko; `susfs_main.c` detects either at load
+(upstream's `susfs_*` entry points, looked up in vmlinux and module kallsyms alike) and refuses to
+load, so the two never both own SUSFS_MAGIC or the /proc/susfs_* nodes. A susfs loaded after this
+module is not seen.

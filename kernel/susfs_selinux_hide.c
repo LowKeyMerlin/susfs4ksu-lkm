@@ -13,7 +13,8 @@
  * duplicate that whole mechanism and track every policy reload KernelSU does - not something
  * to hand-write without the fork's own kernel source and a device to boot it on.
  *
- * What this file does: resolve ksu_selinux_hide_running via kallsyms at load.  Its presence
+ * What this file does: resolve ksu_selinux_hide_running via kallsyms at load (vmlinux or
+ * kernelsu.ko, whichever provides it).  Its presence
  * means the running KernelSU build carries the feature AT ALL (compiled in), independent of
  * whether the user has it switched on - that is the one fact a caller (ksud, the WebUI) needs
  * to decide whether offering its own switch for the same thing would mean anything.  Read-only
@@ -61,8 +62,11 @@ static struct proc_dir_entry *selinux_hide_proc_entry;
 
 int susfs_selinux_hide_init(void)
 {
+	/* ksu_kallsyms_lookup_name(), not find_kernel_symbol_exact(): the latter refuses module-owned
+	 * symbols, so a KernelSU loaded as kernelsu.ko would always read as "not detected".  Same
+	 * resolver and same residual as ksu_umount_gate.c: an unloaded KernelSU leaves this dangling. */
 	ksu_selinux_hide_running_ptr =
-		(bool *)find_kernel_symbol_exact("ksu_selinux_hide_running");
+		(bool *)ksu_kallsyms_lookup_name("ksu_selinux_hide_running");
 	SUSFS_LOGI("selinux_hide: host feature %s\n",
 		   ksu_selinux_hide_running_ptr ?
 			   "detected (ksu_selinux_hide_running resolved)" : "not detected");

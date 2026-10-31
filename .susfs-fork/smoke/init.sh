@@ -478,6 +478,14 @@ say "kin_cleared_app=$(kwho "$(kin app $KS)" "$kin_before" "$kin_after")"
 # the first mount above it that is not, as upstream does in vfs_statfs; root keeps the real ones.
 # The VM has no KernelSU, so "umounted" is the app half of the gate, as for the rest of the module.
 kmsn() { sed -n 's/.*statfs: redirects=\([0-9]*\).*/\1/p' /sys/module/susfs_guard_lkm/parameters/mount_stat; }
+# The module has listmount/statmount probes from 6.12, the first KMI with the syscalls.  Each can
+# fail to arm if LTO inlined its function; "absent" means a kernel without them.
+kprobe_of() { sed -n "s/^$1: .*(probe=\([01]\)).*/\1/p" /sys/module/susfs_guard_lkm/parameters/mount_stat; }
+if grep -q '^listmount: ' /sys/module/susfs_guard_lkm/parameters/mount_stat 2>/dev/null; then
+  say "lm_probes=$(kprobe_of listmount),$(kprobe_of listmount_inline),$(kprobe_of statmount)"
+else
+  say "lm_probes=absent"
+fi
 mkdir -p /data/adb/ms /ms_bind
 kparent=$(ksb root statfs /data/adb)
 kroot_fs=$(ksb root statfs /)
