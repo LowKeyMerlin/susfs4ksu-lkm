@@ -1072,6 +1072,17 @@ static void sus_map_arm_show_wrappers(void)
 	}
 }
 
+/* Is the probe in map_probes[] that is @kp registered?  False for a probe the table does not hold. */
+static bool sus_map_probe_up(const struct kprobe *kp)
+{
+    int i;
+
+    for (i = 0; i < (int)N_MAP_PROBES; i++)
+        if (map_probes[i] == kp)
+            return map_probe_armed[i];
+    return false;
+}
+
 static int sus_map_register_probes(void)
 {
     int i, n = 0, first_err = 0;
@@ -1098,6 +1109,16 @@ static int sus_map_register_probes(void)
             continue;
         rc = register_kprobe(map_probes[i]);
         if (rc) {
+            /* __get_user_pages_remote is inlined into its callers on some kernels, so the symbol
+             * is absent (-ENOENT).  The outer get_user_pages_remote probe already short-circuits
+             * the same call and stops the inner layer from being reached, so with that probe up
+             * nothing is left unfiltered and this is not a warning. */
+            if (rc == -ENOENT && map_probes[i] == &kp_gup_remote_inner &&
+                sus_map_probe_up(&kp_gup_remote)) {
+                SUSFS_LOGI("sus_map: __get_user_pages_remote is absent on this kernel, get_user_pages_remote covers the same call\n");
+                susfs_kp_forget_addr(map_probes[i]);
+                continue;
+            }
             pr_warn("sus_map: register_kprobe(%s) failed %d - that listing is not filtered\n",
                     map_probes[i]->symbol_name, rc);
             /* This function is retried from the supercall that adds a rule (and it skips the

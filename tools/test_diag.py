@@ -214,6 +214,12 @@ class Checks(Scratch):
                  "[374.6] susfs_guard_lkm: priority_filter: 'com.example' is uid 10203\n")
         self.assertEqual(self.checks()["kernel_log"][0], "ok")
 
+    def test_a_probe_the_kernel_lacks_but_another_covers_is_not_a_warning(self):
+        # android16-6.12 inlines __get_user_pages_remote; get_user_pages_remote covers the same call.
+        self.log("[20.8] susfs_guard_lkm: sus_map: __get_user_pages_remote is absent on this kernel, "
+                 "get_user_pages_remote covers the same call\n")
+        self.assertEqual(self.checks()["kernel_log"][0], "ok")
+
     def test_other_drivers_warnings_are_not_the_modules(self):
         self.log("[8.3] qcom,fastrpc: Warning: fastrpc_notif_find_process failed\n")
         self.assertEqual(self.checks()["kernel_log"][0], "ok")
