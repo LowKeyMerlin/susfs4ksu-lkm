@@ -32,6 +32,15 @@ case $(cat "$MODDIR/guard.scope" 2>/dev/null) in
   *) echo "guard_scope=all" ;;
 esac
 
+# BRENE sets the kernel log and AVC spoof switches itself at every boot, so the page must not offer
+# its own copy of them.
+MODULES_DIR=${SUSFS_MODULES_DIR:-${MODDIR%/*}}
+if [ -d "$MODULES_DIR/brene" ] && [ ! -f "$MODULES_DIR/brene/disable" ] && [ ! -f "$MODULES_DIR/brene/remove" ]; then
+  echo "brene=1"
+else
+  echo "brene=0"
+fi
+
 # What the kernel side reports. The tool is the one the manager ships, so it may be missing.
 SUSFS_BIN=${SUSFS_BIN:-/data/adb/ksu/bin/ksu_susfs}
 if [ -x "$SUSFS_BIN" ]; then

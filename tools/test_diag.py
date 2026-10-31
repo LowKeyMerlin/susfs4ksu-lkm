@@ -290,6 +290,15 @@ class Facts(Scratch):
         self.assertEqual(out["features"], "SUS_PATH,SUS_MOUNT")
         self.assertEqual((out["mount_prefixes"], out["mounts_hidden"]), ("3/64", "1886"))
 
+    def test_brene_is_reported_only_while_it_is_enabled(self):
+        def brene():
+            return dict(l.split("=", 1) for l in self.run_script("status.sh").splitlines())["brene"]
+        self.assertEqual(brene(), "0")
+        (self.modules / "brene").mkdir()
+        self.assertEqual(brene(), "1")
+        (self.modules / "brene" / "disable").write_text("")
+        self.assertEqual(brene(), "0")
+
     def test_missing_tool_and_node_leave_the_facts_empty(self):
         out = dict(l.split("=", 1) for l in self.run_script("status.sh").splitlines())
         self.assertNotIn("features", out)
@@ -399,14 +408,14 @@ class Page(unittest.TestCase):
     def test_every_element_the_script_uses_exists(self):
         ids = set(re.findall(r'id="([\w-]+)"', PAGE))
         used = set(re.findall(r'getElementById\("([\w-]+)"\)', PAGE))
-        used |= {f"tab-{n}" for n in ("overview", "health", "options")}
-        used |= {f"panel-{n}" for n in ("overview", "health", "options")}
+        used |= {f"tab-{n}" for n in ("status", "checks", "controls")}
+        used |= {f"panel-{n}" for n in ("status", "checks", "controls")}
         self.assertFalse(used - ids, used - ids)
 
     def test_it_calls_scripts_that_ship(self):
         called = set(re.findall(r'run\("([\w.]+\.sh)"', PAGE))
         shipped = {p.name for p in OVERLAY.glob("*.sh")} | {p.name for p in (ROOT / "module").glob("*.sh")}
-        self.assertTrue({"status.sh", "check.sh", "toggle.sh"} <= called, called)
+        self.assertTrue({"status.sh", "check.sh", "toggle.sh", "scope.sh", "early.sh", "hide_mounts.sh"} <= called, called)
         self.assertFalse(called - shipped, called - shipped)
 
     def test_it_knows_every_level_the_checks_print(self):
@@ -414,9 +423,28 @@ class Page(unittest.TestCase):
             self.assertRegex(PAGE, rf"\b{level}:\s*\{{ label")
 
     def test_toggle_keys_are_the_ones_toggle_sh_accepts(self):
-        keys = set(re.findall(r'key: "(\w+)"', PAGE))
+        block = re.search(r"var TOGGLES = \[(.*?)\n\];", PAGE, re.S)[1]
+        keys = set(re.findall(r'key: "(\w+)"', block))
         accepted = set(re.search(r"is_key\(\) \{\s*case \$1 in\s*([\w|]+)\)", (ROOT / "module/toggle.sh").read_text())[1].split("|"))
-        self.assertTrue(keys <= accepted, (keys, accepted))
+        self.assertEqual(keys, accepted)
+
+    def test_scope_options_are_the_ones_scope_sh_accepts(self):
+        block = re.search(r"var SCOPES = \[(.*?)\n\];", PAGE, re.S)[1]
+        keys = set(re.findall(r'key: "(\w+)"', block))
+        self.assertEqual(keys, {"self", "all", "none"})
+        accepted = set(re.search(r"\n\s*(all\|self\|none)\)\s*;;", (OVERLAY / "scope.sh").read_text())[1].split("|"))
+        self.assertEqual(keys, accepted)
+
+    def test_a_typed_path_cannot_carry_shell_syntax(self):
+        # The path goes into a command line, so the page's pattern is the only guard.
+        pattern = re.search(r"var SAFE_PATH = /(.*)/;", PAGE)[1]
+        rx = re.compile(pattern)
+        for good in ("/system/etc/hosts", "/apex/com.android.art/bin/dex2oat64", "/a/b-c_d+e@f"):
+            self.assertTrue(rx.match(good), good)
+        for bad in ("system/etc", "/a b", "/a;reboot", "/a$(id)", "/a`id`", "/a|b", "/a&b", "/a\"b", "/a'b", "/a\nb", "/a>b", "/a*", ""):
+            self.assertIsNone(rx.match(bad), repr(bad))
+        # Every path the page sends has been through pathOk() first.
+        self.assertRegex(PAGE, r"if \(!pathOk\(p\)\)")
 
 
 if __name__ == "__main__":
