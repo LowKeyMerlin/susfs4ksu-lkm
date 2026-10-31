@@ -187,6 +187,14 @@
     </form>
     <p class="help" id="paths-help">Mounts under /data/adb are already covered. Name any other path a module mounts over, such as a hosts file.</p>
 
+    <div class="label">Hidden SELinux types</div>
+    <div class="list paths" id="ctxtypes"></div>
+    <form class="add" id="ctx-form" autocomplete="off">
+      <input id="ctx-input" type="text" inputmode="text" spellcheck="false" autocapitalize="off" placeholder="adbroot" aria-label="SELinux context type to hide">
+      <button class="btn" id="ctx-button" type="submit">Add</button>
+    </form>
+    <p class="help" id="ctx-help">Empty by default. A type a custom ROM's own sepolicy adds (not su/ksu, which this hides from su tooling too) stops resolving for apps once added here.</p>
+
     <div class="label">Handled elsewhere</div>
     <div class="list"><div class="row"><div class="text">
       <div class="title">SELinux hide</div>
@@ -241,7 +249,7 @@ var STATES = {
 };
 var RAIL = { ok: "var(--on-ok)", info: "var(--on-note)", warn: "var(--on-warn)", fail: "var(--on-fail)" };
 
-var state = { facts: {}, checks: [], toggles: {}, paths: [] };
+var state = { facts: {}, checks: [], toggles: {}, paths: [], ctxTypes: [] };
 var toastTimer = 0;
 function toast(text) {
   var t = $("toast");
@@ -321,6 +329,7 @@ function renderFacts() {
     kv(dl, "Features", names.length + " on", names.join(", ").toLowerCase().replace(/_/g, " "));
   }
   if (f.mount_prefixes) kv(dl, "Hidden mounts", f.mounts_hidden + " hidden", f.mount_prefixes.split("/")[0] + " of " + f.mount_prefixes.split("/")[1] + " paths in the list");
+  if (f.selinux_ctx_types && Number(f.selinux_ctx_types) > 0) kv(dl, "Hidden SELinux types", f.selinux_ctx_types + (f.selinux_ctx_types === "1" ? " type" : " types"), f.selinux_ctx_armed === "1" ? "Hooks armed" : "Hooks not armed - reload the module");
   var fails = Number(f.guard_fails) || 0;
   kv(dl, "Bootloop guard", f.guard_tripped === "1" ? "Tripped" : scopeLabel(f.guard_scope), f.guard_scope === "none" ? "Watch is off" : (fails ? fails + " early boot recorded" : "No early boots recorded"));
   kv(dl, "Module", f.disabled === "1" ? "Disabled" : "Enabled");
@@ -589,6 +598,54 @@ $("add-form").addEventListener("submit", function (e) {
   input.value = "";
 });
 
+// An SELinux type name, nothing else: the kernel side only ever compares this against the third
+// field of a context string, never treats it as a path or a shell token.
+var SAFE_TYPE = /^[A-Za-z0-9_]{1,63}$/;
+function ctxOk(t) { return SAFE_TYPE.test(t); }
+
+function renderCtxTypes() {
+  var box = $("ctxtypes");
+  box.textContent = "";
+  state.ctxTypes.forEach(function (t) {
+    var row = el("div", "path");
+    row.appendChild(el("code", "", t));
+    var b = el("button", "btn small", "Remove");
+    b.type = "button";
+    b.setAttribute("aria-label", "Stop hiding " + t);
+    b.addEventListener("click", function () { changeCtxType("remove", t, b); });
+    row.appendChild(b);
+    box.appendChild(row);
+  });
+  if (!state.ctxTypes.length) box.appendChild(el("div", "quiet", "Nothing hidden - hooks are off until a type is added."));
+}
+function loadCtxTypes() {
+  return run("selinux_ctx.sh", "list").then(function (r) {
+    state.ctxTypes = r.code === 0 ? r.out.split("\n").filter(Boolean) : [];
+    renderCtxTypes();
+  });
+}
+function changeCtxType(cmd, t, button) {
+  button.disabled = true;
+  run("selinux_ctx.sh", cmd + " " + t).then(function (r) {
+    button.disabled = false;
+    if (r.code !== 0) { failed("The list", r); return; }
+    return Promise.all([loadCtxTypes(), run("status.sh")]).then(function (all) {
+      state.facts = pairs(all[1].out);
+      renderFacts();
+      toast(cmd === "add" ? "Hiding " + t : "No longer hiding " + t);
+    });
+  });
+}
+$("ctx-form").addEventListener("submit", function (e) {
+  e.preventDefault();
+  var input = $("ctx-input");
+  var t = input.value.trim();
+  if (!ctxOk(t)) { toast("Use letters, digits and _ only"); return; }
+  if (state.ctxTypes.indexOf(t) >= 0) { toast("Already in the list"); return; }
+  changeCtxType("add", t, $("ctx-button"));
+  input.value = "";
+});
+
 var SELINUX_HIDE = {
   native: "Handled by your root manager's own kernel patch.",
   none: "Needs KernelSU or a supported fork. This module does not provide it alone.",
@@ -601,10 +658,11 @@ function boot() {
     $("ident").textContent = "Open this page from the root manager";
     return;
   }
-  Promise.all([run("status.sh"), run("toggle.sh", "get"), run("hide_mounts.sh", "list")]).then(function (r) {
+  Promise.all([run("status.sh"), run("toggle.sh", "get"), run("hide_mounts.sh", "list"), run("selinux_ctx.sh", "list")]).then(function (r) {
     state.facts = pairs(r[0].out);
     state.toggles = pairs(r[1].out);
     state.paths = r[2].code === 0 ? r[2].out.split("\n").filter(Boolean) : [];
+    state.ctxTypes = r[3].code === 0 ? r[3].out.split("\n").filter(Boolean) : [];
     $("selinux-note").textContent = SELINUX_HIDE[state.toggles.selinux_hide] || SELINUX_HIDE.unavailable;
     $("copy").disabled = false;
     renderMasthead();
@@ -613,6 +671,7 @@ function boot() {
     renderScope();
     renderToggles();
     renderPaths();
+    renderCtxTypes();
     return runChecks();
   });
 }
