@@ -51,6 +51,7 @@ class Scratch(unittest.TestCase):
         self.enforce = self.base / "getenforce"
         self.enforce.write_text("#!/bin/sh\necho Enforcing\n")
         self.enforce.chmod(0o755)
+        self.brene_conf = self.base / "brene.conf"
 
     def env(self):
         return {
@@ -62,6 +63,7 @@ class Scratch(unittest.TestCase):
             "SUSFS_TIMEOUT_LOG": (self.base / "timeout.log").as_posix(),
             "SUSFS_DMESG": self.dmesg.as_posix(),
             "SUSFS_GETENFORCE": self.enforce.as_posix(),
+            "SUSFS_BRENE_CONF": self.brene_conf.as_posix(),
         }
 
     def run_script(self, name):
@@ -137,12 +139,38 @@ class Checks(Scratch):
         self.assertEqual(self.checks()["guard"][0], "fail")
 
     def test_overlapping_module_is_a_warning_unless_disabled(self):
-        other = self.modules / "brene_x"
+        other = self.modules / "resusfs"
         other.mkdir()
-        put(other / "module.prop", "id=brene_x\nname=BRENE mount hider\n")
+        put(other / "module.prop", "id=resusfs\nname=ReSUSFS\n")
         self.assertEqual(self.checks()["conflicts"][0], "warn")
         (other / "disable").write_text("")
         self.assertEqual(self.checks()["conflicts"][0], "ok")
+
+    def test_brene_is_a_companion_not_a_conflict(self):
+        other = self.modules / "brene"
+        other.mkdir()
+        put(other / "module.prop", "id=brene\nname=.BRENE - SuSFS\n")
+        self.assertEqual(self.checks()["conflicts"][0], "ok")
+
+    def brene(self, avc, log, node_avc, node_log):
+        # BRENE's file starts with blanks and sometimes NULs, which makes grep call it binary.
+        self.brene_conf.write_bytes(b"\x00\x00   \nconfig_enable_log=%s\nconfig_enable_avc_log_spoofing=%s\n" % (log, avc))
+        (self.proc / "susfs_avc_spoof").write_bytes(node_avc + b" (su_sid=76 enter=0 hits=0)\n")
+        (self.proc / "susfs_enable_log").write_bytes(node_log + b"\n")
+
+    def test_brene_settings_that_never_reached_the_kernel_are_a_warning(self):
+        self.brene(b"1", b"0", b"0", b"1")
+        sync = self.checks()["brene_sync"]
+        self.assertEqual(sync[0], "warn")
+        self.assertIn("enable_avc_log_spoofing (BRENE 1, kernel 0)", sync[2])
+        self.assertIn("enable_log (BRENE 0, kernel 1)", sync[2])
+
+    def test_brene_settings_that_match_are_fine(self):
+        self.brene(b"1", b"0", b"1", b"0")
+        self.assertEqual(self.checks()["brene_sync"][0], "ok")
+
+    def test_no_brene_means_no_brene_check(self):
+        self.assertNotIn("brene_sync", self.checks())
 
     def test_unrelated_module_is_not_a_conflict(self):
         other = self.modules / "zygisk_thing"
@@ -154,9 +182,41 @@ class Checks(Scratch):
         self.enforce.write_text("#!/bin/sh\necho Permissive\n")
         self.assertEqual(self.checks()["selinux"][0], "fail")
 
-    def test_module_warning_in_the_kernel_log_is_a_warning(self):
-        Path(str(self.dmesg) + ".out").write_text("[2.0] susfs_guard_lkm: path hook warn: skipped\n")
+    def log(self, text):
+        Path(str(self.dmesg) + ".out").write_text(text)
+
+    # These two lines are from a Pixel-class android16-6.12 kernel, where the module loaded and
+    # two hooks were not in place.
+    def test_hooks_the_module_could_not_place_are_a_warning(self):
+        self.log("[20.8] susfs_guard_lkm: sus_map: register_kprobe(__get_user_pages_remote) failed -2 - that listing is not filtered\n"
+                 "[59.2] susfs_guard_lkm: susfs_hide_syms: kallsyms m->private is not a struct kallsym_iter - the mirror drifted; /proc/kallsyms is NOT being filtered\n")
+        kernel_log = self.checks()["kernel_log"]
+        self.assertEqual(kernel_log[0], "warn")
+        self.assertIn("2 line(s)", kernel_log[2])
+        self.assertIn("__get_user_pages_remote", kernel_log[2])
+
+    def test_boot_time_notes_about_empty_rule_lists_are_not_warnings(self):
+        self.log("[5.4] susfs_guard_lkm: sus_map: no rules, hook not installed\n"
+                 "[5.4] susfs_guard_lkm: spoof_cmdline: no fake bootconfig, not armed\n"
+                 "[20.9] susfs_guard_lkm: sus_map: skipped walk_page_range walk for ino=1 dev=2 uid=3\n"
+                 "[374.6] susfs_guard_lkm: priority_filter: 'com.example' is uid 10203\n")
+        self.assertEqual(self.checks()["kernel_log"][0], "ok")
+
+    def test_other_drivers_warnings_are_not_the_modules(self):
+        self.log("[8.3] qcom,fastrpc: Warning: fastrpc_notif_find_process failed\n")
+        self.assertEqual(self.checks()["kernel_log"][0], "ok")
+
+    def test_a_log_of_megabytes_is_read(self):
+        line = "[374.6] susfs_guard_lkm: priority_filter: 'com.example.app' is uid 10203\n"
+        self.log(line * 30000 + "[400.0] susfs_guard_lkm: sus_map: register_kprobe(x) failed -2 - that listing is not filtered\n")
         self.assertEqual(self.checks()["kernel_log"][0], "warn")
+
+    # Android's sh has no printf builtin, so a log held in a variable and handed to printf fails
+    # there once it passes the 128 KB argument limit. The host shells here have the builtin and
+    # would not show it.
+    def test_the_log_is_never_held_in_a_variable(self):
+        src = (OVERLAY / "check.sh").read_text()
+        self.assertNotRegex(src, r'=\$\("\$DMESG"[^|\n]*\)')
 
     def test_separator_in_a_message_cannot_split_the_record(self):
         put(self.mod / "module.prop", "description=a|b\nline two\n")

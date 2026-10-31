@@ -20,7 +20,14 @@ NAME=susfs_guard_lkm
 clean() { printf '%s' "$1" | tr '\n|' '  '; }
 out() { printf '%s|%s|%s|%s\n' "$1" "$2" "$(clean "$3")" "$(clean "$4")"; }
 
-kernel_log=$("$DMESG" 2>/dev/null)
+# The log is read through pipes and never held in a variable: with logging on it passes 2 MB, and
+# Android's sh has no printf builtin, so a variable that large breaks the argument limit.
+modlog() { "$DMESG" 2>/dev/null | grep "$NAME:"; }
+
+# What the module prints when a hook could not be placed and the feature is partly or wholly off.
+# Lines about an empty rule list are normal at boot.
+WARN_RE='failed|NOT |not filtered|keeps (showing|printing|returning)|did not|drifted|not found|not resolved|not installed|not recogni[sz]ed'
+problems() { modlog | grep -v -e 'that feature stays off' -e ': no rules' | grep -E "$WARN_RE"; }
 
 if [ -d "$SYS_MODULE" ]; then
   out loaded ok "Module is loaded" "The kernel module is running."
@@ -30,7 +37,7 @@ else
 fi
 
 # A layer that fails to start leaves the module up with that feature off, which nothing else shows.
-off=$(printf '%s\n' "$kernel_log" |
+off=$(modlog |
   sed -n 's/.* \([a-z0-9_]*\) init failed -\{0,1\}[0-9]* - that feature stays off.*/\1/p' | sort -u | tr '\n' ' ')
 if [ -n "$off" ]; then
   out layers warn "Some features are off" "These layers could not start: ${off}. The rest of the module works. Check the kernel log for the reason."
@@ -77,20 +84,42 @@ for dir in "$MODULES_DIR"/*/; do
   [ "$id" != "$NAME" ] || continue
   [ ! -f "$dir/disable" ] || continue
   [ ! -f "$dir/remove" ] || continue
-  if grep -qiE '^(id|name)=.*(susfs|brene|resusfs)' "$dir/module.prop" 2>/dev/null; then
+  # BRENE is a front end that sends commands to this module, not a second SUSFS. Its name says
+  # SuSFS, so it has to be skipped by id.
+  case $id in brene*) continue ;; esac
+  if grep -qiE '^(id|name)=.*(susfs|resusfs)' "$dir/module.prop" 2>/dev/null; then
     others="$others $id"
   fi
 done
 if [ -n "$others" ]; then
-  out conflicts warn "Other SUSFS or mount-hiding modules are enabled" "Found:${others}. Two modules that hide the same mounts can undo each other. Keep one."
+  out conflicts warn "Another SUSFS module is enabled" "Found:${others}. Two modules that hide the same mounts can undo each other. Keep one."
 else
-  out conflicts ok "No overlapping module found" "No other enabled module declares SUSFS, BRENE or ReSUSFS."
+  out conflicts ok "No other SUSFS module found" "No other enabled module ships SUSFS."
+fi
+
+# BRENE sends its settings in post-fs-data. A module that loads later never receives them, and
+# nothing shows it, so compare what BRENE wants with what the kernel holds.
+BRENE_CONF=${SUSFS_BRENE_CONF:-/data/adb/brene/config.sh}
+if [ -d "$SYS_MODULE" ] && [ -r "$BRENE_CONF" ]; then
+  differ=""
+  for pair in enable_avc_log_spoofing:avc_spoof enable_log:enable_log; do
+    want=$(grep -a "^config_${pair%%:*}=" "$BRENE_CONF" | tail -n 1 | cut -d= -f2 | tr -cd '01')
+    read -r have _ <"$PROC/susfs_${pair##*:}" 2>/dev/null
+    [ -n "$want" ] && [ -n "$have" ] && [ "$want" != "$have" ] || continue
+    differ="$differ ${pair%%:*} (BRENE $want, kernel $have);"
+  done
+  if [ -n "$differ" ]; then
+    out brene_sync warn "BRENE settings did not reach the kernel" "Different:${differ} BRENE sends them before this module loads. Set up early load, or set them under Options."
+  else
+    out brene_sync ok "BRENE settings match the kernel" "AVC spoofing and kernel logging are as BRENE has them."
+  fi
 fi
 
 # Failed layer starts are reported above, so they are not counted again here.
-bad=$(printf '%s\n' "$kernel_log" | grep -v 'that feature stays off' | grep -ciE "$NAME:.*(warn|bug|oops|panic|fail)")
+bad=$(problems | grep -c '')
 if [ "${bad:-0}" -gt 0 ]; then
-  out kernel_log warn "The kernel log has module warnings" "$bad line(s) from $NAME mention a warning or failure. Run dmesg | grep $NAME."
+  first=$(problems | head -n 2 | sed "s/^[^]]*\] *$NAME: //" | tr '\n' ';')
+  out kernel_log warn "The kernel log has module warnings" "$bad line(s), first: $first Filter the output of dmesg for $NAME to see all of them."
 else
   out kernel_log ok "The kernel log is clean" "No warning from the module."
 fi
