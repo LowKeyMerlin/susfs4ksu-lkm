@@ -30,6 +30,7 @@
 #include <linux/tracepoint.h>
 #include <trace/events/syscalls.h>
 #include <asm/syscall.h>
+#include <linux/sched/task_stack.h>	/* task_pt_regs(), for the fstat check */
 #include <linux/uaccess.h>
 #include <linux/syscalls.h>
 #include <linux/slab.h>
@@ -1307,13 +1308,37 @@ bool sus_path_rules_present(void)
     return READ_ONCE(sus_path_count) > 0;
 }
 
+/* fstat(2) of a descriptor the caller already holds is not a path lookup, and the built-in
+ * SUSFS never hides it.  It matters: every app process inherits the zygote's open framework and
+ * overlay APKs, and an app zygote re-stats all of them before each fork (Android's
+ * FileDescriptorInfo::CreateFromFd aborts the process on a failed fstat).  A rule on one of those
+ * files turned that into "Unable to stat <fd>" and the zygote died, taking down every isolated
+ * service of the app with it.  Hiding stays for stat/fstatat/statx on a path, and open() of a
+ * hidden file is still refused by inode_permission, so no new descriptor can be obtained.
+ * Numbers: arm64 fstat is 80; AArch32 has fstat 108 and fstat64 197 (arch/arm/tools/syscall.tbl). */
+#define SUS_PATH_NR_FSTAT		80
+#define SUS_PATH_NR_FSTAT_COMPAT	108
+#define SUS_PATH_NR_FSTAT64_COMPAT	197
+
+static bool sus_path_in_fstat(void)
+{
+    long nr;
+
+    if (current->flags & PF_KTHREAD)
+        return false;
+    nr = syscall_get_nr(current, task_pt_regs(current));
+    if (is_compat_task())
+        return nr == SUS_PATH_NR_FSTAT_COMPAT || nr == SUS_PATH_NR_FSTAT64_COMPAT;
+    return nr == SUS_PATH_NR_FSTAT;
+}
+
 static int sus_path_inode_getattr(const struct path *path)
 {
     struct inode *inode;
 
     if (path && path->dentry) {
         inode = d_inode(path->dentry);
-        if (sus_path_inode_hidden(inode)) {
+        if (sus_path_inode_hidden(inode) && !sus_path_in_fstat()) {
             atomic_inc(&n_enoent_getattr);
             return -ENOENT;
         }
