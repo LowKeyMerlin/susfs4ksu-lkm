@@ -75,7 +75,9 @@ Needs verification or a port (narrow):
 1. ksu-conflict: detect built-in susfs at load, refuse to arm, fail-closed.
 2. ksu-forks: per-fork symbol and transport map in `abi_known.json`.
 3. p1-capacity: dynamic rule storage replacing the fixed arrays, with the LKM reader/unload rules.
-4. p1-612: mnt_id_unique crafting, statx mnt_id masks, listmount/statmount hiding, 16K fixup fold.
+4. p1-612: done except the 16K fixup fold. mnt_id_unique crafting, statx mnt_id masks and
+   listmount/statmount hiding are implemented (see the p1-612 outcome and listmount/statmount
+   sections); the 16K fold stays build-gated.
 5. p2-refactor: ed8a832 semantics onto our derived process state.
 6. p4-selinux: selinux_hide as a new file with fork detection.
 7. p5-webui: module WebUI toggles.
@@ -134,9 +136,10 @@ rcu_barrier because the callback runs kernel code, not module code.
   mnt_id, which the statx return-probe maps to the original via sus_mount_shown_for(). STATX_MNT_ID_
   UNIQUE returns the crafted unique id; sus_mount_shown_for((int)id) finds no map and leaves it
   intact, so the crafted value stands. Neither clobbers the other.
-- listmount/statmount full enumeration hiding and the 16K fixup fold remain build-gated: the
-  listmount/statmount return-probe lacks the per-mount struct context needed to drop a marked mount
-  from the enumeration, and the 16K fold needs 16K-page handling that cannot be validated blind.
+- listmount/statmount hiding (now implemented, see its own section below). The earlier note that a
+  return probe "lacks the per-mount struct context" was wrong: it does not need the struct, only the
+  64-bit mnt_id_unique, which we already record when we mark a mount.
+- the 16K fixup fold remains build-gated: it needs 16K-page handling that cannot be validated blind.
 
 ## 6.18 mnt_id_xa audit (previously build-gated, now source-confirmed)
 
@@ -217,6 +220,74 @@ Specific candidates checked, each a mechanical reason, not a guess:
 
 Net result: both repos' current fixes target the built-in compile-time architecture this module
 does not share. No patch, workaround or code change is needed from either source right now.
+
+## listmount(2)/statmount(2) hiding (implemented, unvalidated)
+
+The three remaining gaps were (a) listmount/statmount, (b) the fdinfo inotify SUS_MOUNT branch, (c)
+the anon-bdev minor. Only (a) can be made regress-safe with the module's probe primitives; it is now
+implemented in `sus_mount.c` under `#if >= 6.12` (the only KMIs with these 6.8+ syscalls).
+
+How it works:
+
+- A bounded sorted table (`sus_mount_uniq[]`, 1024 slots, `uniq_lock`) records the 64-bit
+  `mnt_id_unique` of every mount we mark - written in `sus_mount_craft_unique()` (the scan) and in
+  the `attach_recursive_mnt` return handler (mounts that appear later). The unique id is a monotonic
+  counter the kernel never reuses (`fs/namespace.c`: `atomic64_inc_return(&mnt_id_ctr)` on 6.12,
+  `++mnt_id_ctr` on 6.18), so a recorded id can never later name a different mount and the table
+  needs no teardown on umount. It persists across disable/re-enable on purpose: the re-scan skips
+  already-marked mounts, so clearing it would lose them.
+- A kretprobe on `do_listmount` drops our ids from `kls->kmnt_ids` and lowers the returned count
+  before the syscall copies the array to userspace. This is the same effect as upstream's hunk (a
+  `continue` right after the loop's `is_path_reachable()` check), reached a different way. The id
+  test is by identity (`sus_mount_uniq_has`), a superset of upstream's KSU-range `mnt_id` test, so it
+  also hides mounts the `attach_recursive_mnt` path marked.
+- A kretprobe on `do_statmount` forces `-ENOENT` (its own answer for an unknown id) when the
+  requested id is ours and the reader is hidden. Upstream does not hide statmount; this is a
+  deliberate, documented widening, because hiding listmount alone leaves statmount as a one-call
+  oracle for any id a detector already holds.
+
+Why it is regress-safe:
+
+- The `struct klistmount` mirror is byte-identical on android16-6.12 and android17-6.18 (verified
+  against both sources); only `kmnt_ids`/`nr_mnt_ids` are read and only the count in x0 is written.
+- Overriding the return value in a kretprobe handler is sound on arm64: `kretprobe_brk_handler()`
+  runs the handler on the exception `pt_regs` (where x0 holds the function's just-returned value) and
+  the exception return restores that same `pt_regs`, so writing `regs->regs[0]` changes the effective
+  return (confirmed in `arch/arm64/kernel/probes/kprobes.c` on both trees).
+- A return probe can only remove entries after the kernel built the page, not skip them inline as
+  upstream does. If the buffer filled (`ret == nr_mnt_ids`) the next real mounts were never written,
+  so lowering the count would make the caller page early and lose them - compaction is therefore
+  skipped on a full buffer (fail-open, counted as `listmount full=`). The common "read every mount"
+  call passes a large buffer and is unaffected.
+- The gate (`sus_mount_hidden_reader`) is the umount predicate, so su, the manager and su-granted
+  apps are never touched. It is safe from the preempt-disabled handler: across all five supported
+  forks `ksu_uid_should_umount()` takes only `rcu_read_lock()` and a `kref_put`/`kfree_rcu`, never a
+  mutex (read the fork sources to confirm, since the LKM substitute calls KernelSU here where
+  built-in susfs would read a cheap `TIF_PROC_UMOUNTED` flag).
+- Fail-closed arming: `do_listmount`/`do_statmount` are static; if a build inlines them the probe
+  does not register and the syscall is left unfiltered, logged, never a crash.
+
+Unvalidated: nothing here has been built or booted. New counters are on `mount_stat`
+(`uniq:`, `listmount:`, `statmount:`).
+
+## fdinfo inotify SUS_MOUNT branch (b): blocked, not a regression
+
+Upstream's `inotify_fdinfo()` SUS_MOUNT branch re-resolves a watched file's path with `d_path()` then
+`kern_path()` to print the inode as seen WITHOUT the KSU mount. `kern_path()` sleeps, and our only
+hook there is a kretprobe (preempt disabled), so this cannot be ported with the current primitives.
+What is already covered: `sus_mount`'s fdinfo probe rewrites the `mnt_id`, and `susfs_kstat`'s
+`kstat_fdinfo_inotify()` rewrites the printed ino/sdev from the kstat table. Only the SUS_MOUNT
+kern_path re-resolution is missing, and an fdinfo without it is no worse than upstream built without
+that branch. Recorded as the one standing gap in `parity.json` (the fdinfo `missing` site).
+
+## anon-bdev minor, commit 8879282 (c): deliberate non-port
+
+Its prerequisite static key `susfs_is_sdcard_android_data_not_decrypted` is driven upstream by a
+kthread + fsnotify group + delayed_work watching `/data/media/0` ("code straightly borrowed from
+KernelSU's pkg_observer.c"), which the event-driven-only rule forbids and the LKM does not have, so
+the branch would never fire. Independently, `get_anon_bdev()` runs for every anonymous superblock
+system-wide; upstream pays nothing when the key is off, but a kprobe would add cost to every call for
+a first-boot-before-FBE-decryption window that is marginal. Recorded under "triaged" in parity.json.
 
 ## Closing outcomes (p0, p1-618, p3, p4, p5)
 

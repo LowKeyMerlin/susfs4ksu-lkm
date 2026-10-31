@@ -270,6 +270,84 @@ static void (*pfn_ida_free)(struct ida *ida, unsigned int id);
 static atomic64_t *sus_mount_mnt_id_ctr;
 static atomic64_t sus_mount_sus_id_ctr = ATOMIC64_INIT(0);
 
+/* ---- unique ids of the mounts we have marked ----
+ *
+ * listmount(2)/statmount(2) (6.8+, so only these two KMIs) name a mount by its 64-bit
+ * mnt_id_unique, not by the 32-bit mnt_id the show_* hooks and the idmap filter on.  To hide a
+ * mount from those two calls we have to recognise its unique id, so every id we mark is recorded
+ * here when the mark happens and tested when the two syscalls return.
+ *
+ * Sorted for a binary search.  Never recycled: the kernel's unique id is a monotonic 64-bit
+ * counter that is never reused (fs/namespace.c), so a recorded id can never later name a different
+ * mount - unlike the idmap, this table needs no teardown when a filesystem is unmounted.  Bounded
+ * at the same ceiling as the idmap; a full table only means the newest marked mount stays visible
+ * to listmount/statmount (logged once), never a crash or a wrong-mount match. */
+#define SUS_MOUNT_UNIQ_MAX 1024
+static u64 sus_mount_uniq[SUS_MOUNT_UNIQ_MAX];
+static int n_uniq;
+static DEFINE_SPINLOCK(uniq_lock);
+static atomic_t n_uniq_full = ATOMIC_INIT(0);
+
+static void sus_mount_uniq_add(u64 uid)
+{
+    unsigned long flags;
+    int lo, hi, pos;
+
+    if (!uid)
+        return;
+    spin_lock_irqsave(&uniq_lock, flags);
+    lo = 0; hi = n_uniq;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+
+        if (sus_mount_uniq[mid] < uid)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    pos = lo;
+    if (pos < n_uniq && sus_mount_uniq[pos] == uid)
+        goto out;		/* already recorded (a re-scan, or both mark sites hitting it) */
+    if (n_uniq >= SUS_MOUNT_UNIQ_MAX) {
+        if (atomic_inc_return(&n_uniq_full) == 1)
+            pr_warn("sus_mount: unique-id table full at %d - the newest marked mounts stay visible to listmount/statmount; raise SUS_MOUNT_UNIQ_MAX\n",
+                    SUS_MOUNT_UNIQ_MAX);
+        goto out;
+    }
+    memmove(&sus_mount_uniq[pos + 1], &sus_mount_uniq[pos],
+            (n_uniq - pos) * sizeof(sus_mount_uniq[0]));
+    sus_mount_uniq[pos] = uid;
+    n_uniq++;
+out:
+    spin_unlock_irqrestore(&uniq_lock, flags);
+}
+
+/* kretprobe-safe: a spinlock and a binary search, no allocation and no sleeping, so it may run
+ * from the do_listmount/do_statmount return handlers (preemption disabled there). */
+static bool sus_mount_uniq_has(u64 uid)
+{
+    unsigned long flags;
+    int lo, hi;
+    bool found = false;
+
+    if (!uid)
+        return false;
+    spin_lock_irqsave(&uniq_lock, flags);
+    lo = 0; hi = n_uniq;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+
+        if (sus_mount_uniq[mid] < uid)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (lo < n_uniq && sus_mount_uniq[lo] == uid)
+        found = true;
+    spin_unlock_irqrestore(&uniq_lock, flags);
+    return found;
+}
+
 /* Craft a plausible mnt_id_unique for a mount we just marked.  Upstream (7d91da2) does the same in
  * its mount allocators: read the live counter and add our own monotonically, so the marked mount's
  * unique id sits in the live range with no gap a detector can threshold on.  Reading (not
@@ -278,10 +356,12 @@ static atomic64_t sus_mount_sus_id_ctr = ATOMIC64_INIT(0);
  * target.  Only the 64-bit unique id is touched; the 32-bit mnt_id stays the real KSU-range id. */
 static void sus_mount_craft_unique(struct mount *r)
 {
-    if (!sus_mount_mnt_id_ctr)
-        return;
-    r->mnt_id_unique = atomic64_read(sus_mount_mnt_id_ctr) +
-                       atomic64_inc_return(&sus_mount_sus_id_ctr);
+    if (sus_mount_mnt_id_ctr)
+        r->mnt_id_unique = atomic64_read(sus_mount_mnt_id_ctr) +
+                           atomic64_inc_return(&sus_mount_sus_id_ctr);
+    /* Record whatever id this mount now carries - the crafted one, or the kernel's own when
+     * mnt_id_ctr is unresolved - so listmount/statmount hide the same mount the scan marked. */
+    sus_mount_uniq_add(r->mnt_id_unique);
 }
 #endif
 
@@ -1190,6 +1270,14 @@ static int sus_mount_newmnt_ret(struct kretprobe_instance *ri, struct pt_regs *r
 
     sus_mount_ident_add(r);
     sus_mount_note_id(r);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+    /* This path cannot give the mount a KSU-range id (ida_alloc sleeps, a kretprobe must not), so
+     * it keeps the kernel's own unique id - record that one, so listmount/statmount hide it just
+     * as the identity record hides it from /proc/mounts.  Upstream's listmount filter keys on the
+     * KSU-range mnt_id and so misses these later mounts; recording by identity here is the same
+     * deliberate widening the show_* hooks already do (see sus_mount_is_ours()). */
+    sus_mount_uniq_add(r->mnt_id_unique);
+#endif
     atomic_inc(&n_newmnt_recorded);
     SUSFS_LOGI("sus_mount: learned mount at %s (mnt_id %d, devname %s)\n",
             why, r->mnt_id, r->mnt_devname ? r->mnt_devname : "none");
@@ -1204,6 +1292,158 @@ static struct kretprobe kr_newmnt = {
     .maxactive = 16,
 };
 static bool kr_newmnt_ok;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+/* ---- listmount(2) / statmount(2) ----
+ *
+ * These two syscalls (6.8+, so only the 6.12 and 6.18 KMIs here) are the modern replacement for
+ * reading /proc/mounts: listmount returns the 64-bit mnt_id_unique of every reachable mount, and
+ * statmount details one of them by that id.  The show_* hooks do not touch either, so without this
+ * a non-su app that is refused /proc/mounts can still enumerate the hidden mounts here.
+ *
+ * do_listmount(kls, reverse) fills kls->kmnt_ids with the ids it returns and the SYSCALL copies
+ * that kernel array to userspace AFTERWARDS (copy_to_user with the returned count), so a return
+ * probe that drops our ids from the array and lowers the returned count hides them without ever
+ * touching user memory - the one way to do this from a handler that must not sleep.  This mirrors
+ * upstream's own hunk, a `continue` placed right after the loop's is_path_reachable() check
+ * (DEFAULT_KSU_MNT_ID && susfs_is_current_proc_umounted()); the id test is sus_mount_uniq_has()
+ * instead, which also covers mounts recorded by identity (upstream's id test does not).
+ *
+ * do_statmount(s, mnt_id, ...) resolves that id with lookup_mnt_in_ns() and returns -ENOENT when
+ * it names no mount; forcing that same -ENOENT for an id of ours is indistinguishable from a
+ * non-existent id.  Upstream does not hide statmount - this is a deliberate, documented widening,
+ * because hiding listmount while leaving statmount open is a one-call oracle for any id a detector
+ * already holds (e.g. a statx STATX_MNT_ID_UNIQUE taken before the mount was hidden).
+ *
+ * The struct klistmount below mirrors fs/namespace.c's file-local definition, verified
+ * byte-identical on android16-6.12 and android17-6.18 (the only KMIs with these syscalls); it is
+ * read, never written past kmnt_ids, and only the count in x0 is changed. */
+struct sus_mount_klistmount {
+    u64 last_mnt_id;
+    u64 mnt_parent_id;
+    u64 *kmnt_ids;
+    u32 nr_mnt_ids;
+    struct mnt_namespace *ns;
+    struct path root;
+};
+
+static atomic_t n_listmount_ret = ATOMIC_INIT(0);
+static atomic_t n_listmount_hits = ATOMIC_INIT(0);
+static atomic_t n_listmount_dropped = ATOMIC_INIT(0);
+static atomic_t n_listmount_full = ATOMIC_INIT(0);
+static atomic_t n_statmount_ret = ATOMIC_INIT(0);
+static atomic_t n_statmount_hidden = ATOMIC_INIT(0);
+
+/* The reader this feature hides from, exactly as upstream's listmount hunk decides it: a process
+ * KernelSU would umount modules for.  su, the manager and su-granted apps answer false (their
+ * profile->allow_su is set), so they keep seeing their mounts.  Safe from a kretprobe handler: the
+ * predicate reads current's uid and, when KernelSU is present, calls ksu_uid_should_umount(), which
+ * takes only rcu_read_lock() (confirmed across every supported fork) and never sleeps. */
+static bool sus_mount_hidden_reader(void)
+{
+    return READ_ONCE(susfs_ksu_umount_gate_off)
+           ? susfs_is_current_proc_umounted_app()
+           : susfs_is_current_proc_umounted();
+}
+
+static int sus_mount_listmount_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct sus_mount_kretprobe_state *st = (struct sus_mount_kretprobe_state *)ri->data;
+
+    /* kls is a stack object in the live syscall frame we return into, so it stays valid for the
+     * return handler; an implausible value means the probe is not on the function we think. */
+    st->lm = susfs_ptr_plausible((void *)regs->regs[0]) ? regs->regs[0] : 0;
+    return 0;
+}
+
+static int sus_mount_listmount_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct sus_mount_kretprobe_state *st = (struct sus_mount_kretprobe_state *)ri->data;
+    struct sus_mount_klistmount *kls = (struct sus_mount_klistmount *)st->lm;
+    long ret = (long)regs_return_value(regs);
+    long i, w = 0;
+    u64 *ids;
+
+    atomic_inc(&n_listmount_ret);
+    if (!kls || ret <= 0)
+        return 0;
+    ids = kls->kmnt_ids;
+    if (!ids)
+        return 0;
+    /* One gate test for the whole array: a reader we never hide costs nothing more than this. */
+    if (!sus_mount_hidden_reader())
+        return 0;
+    /* Only a result that did NOT fill the caller's buffer is a complete enumeration.  Upstream skips
+     * our mounts inline and so keeps filling the buffer with real ones; dropping them here after the
+     * fact cannot, so on a full buffer the next real mounts were never written and lowering the count
+     * would make the caller stop paging early and lose them.  kls->nr_mnt_ids is the buffer size
+     * (do_listmount counts down a local copy), so a full page is left as the kernel built it. */
+    if (ret >= (long)kls->nr_mnt_ids) {
+        atomic_inc(&n_listmount_full);
+        return 0;
+    }
+    atomic_inc(&n_listmount_hits);
+    for (i = 0; i < ret; i++) {
+        if (sus_mount_uniq_has(ids[i])) {
+            atomic_inc(&n_listmount_dropped);
+            continue;		/* one of ours: drop it from what the caller is about to copy out */
+        }
+        if (w != i)
+            ids[w] = ids[i];
+        w++;
+    }
+    if (w != ret)
+        regs->regs[0] = (unsigned long)w;	/* the syscall copies and returns this many */
+    return 0;
+}
+
+static struct kretprobe kr_listmount = {
+    .kp.symbol_name = "do_listmount",
+    .entry_handler = sus_mount_listmount_entry,
+    .handler = sus_mount_listmount_ret,
+    .data_size = sizeof(struct sus_mount_kretprobe_state),
+    .maxactive = 16,
+};
+static bool kr_listmount_ok;
+
+static int sus_mount_statmount_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct sus_mount_kretprobe_state *st = (struct sus_mount_kretprobe_state *)ri->data;
+
+    /* do_statmount(struct kstatmount *s, u64 mnt_id, ...) - the requested unique id is the second
+     * argument, an ordinary register, so no struct layout is assumed here. */
+    st->lm = (unsigned long)regs->regs[1];
+    return 0;
+}
+
+static int sus_mount_statmount_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct sus_mount_kretprobe_state *st = (struct sus_mount_kretprobe_state *)ri->data;
+    u64 id = (u64)st->lm;
+
+    atomic_inc(&n_statmount_ret);
+    /* Only rewrite a call that found the mount (ret == 0); a call that already failed is left as
+     * it is, and -ENOENT for one of ours matches do_statmount's own answer for an unknown id. */
+    if ((long)regs_return_value(regs) != 0)
+        return 0;
+    if (!sus_mount_uniq_has(id))
+        return 0;
+    if (!sus_mount_hidden_reader())
+        return 0;
+    regs->regs[0] = (unsigned long)(-ENOENT);
+    atomic_inc(&n_statmount_hidden);
+    return 0;
+}
+
+static struct kretprobe kr_statmount = {
+    .kp.symbol_name = "do_statmount",
+    .entry_handler = sus_mount_statmount_entry,
+    .handler = sus_mount_statmount_ret,
+    .data_size = sizeof(struct sus_mount_kretprobe_state),
+    .maxactive = 16,
+};
+static bool kr_statmount_ok;
+#endif /* >= 6.12 */
 
 /* ---- /proc/<pid>/fdinfo/N ----
  *
@@ -1228,6 +1468,9 @@ struct sus_mount_kretprobe_state {
     struct seq_file *m;		/* fdinfo: the seq_file being filled */
     unsigned long ubuf;		/* statx: the caller's struct statx __user * */
     char where;			/* statx: 's' = __arm64_sys_statx, 'd' = do_statx */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+    unsigned long lm;		/* do_listmount: struct klistmount *; do_statmount: requested id */
+#endif
 };
 
 static atomic_t n_fdinfo_entry = ATOMIC_INIT(0);
@@ -1554,6 +1797,11 @@ static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
                      "fdinfo: probes=%d entry=%d hits=%d rewrites=%d nolabel=%d\n"
                      "statx: entry=%d ret=%d hits=%d rewrites=%d nobuf=%d err=%d copyfail=%d nomap=%d "
                      "(sys=%d do=%d)\n"
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+                     "uniq: recorded=%d/%d full=%d\n"
+                     "listmount: ret=%d hits=%d dropped=%d full=%d (probe=%d)\n"
+                     "statmount: ret=%d hidden=%d (probe=%d)\n"
+#endif
                      "statfs: redirects=%d\n",
                      sus_mount_idmap_live(), n_idmap,
                      sus_mount_ident_live(), READ_ONCE(n_ident), mount_registered,
@@ -1583,6 +1831,14 @@ static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
                      atomic_read(&n_statx_nobuf), atomic_read(&n_statx_err),
                      atomic_read(&n_statx_copyfail), atomic_read(&n_statx_nomap),
                      (int)kr_statx_ok, (int)kr_statx_do_ok,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+                     READ_ONCE(n_uniq), SUS_MOUNT_UNIQ_MAX, atomic_read(&n_uniq_full),
+                     atomic_read(&n_listmount_ret), atomic_read(&n_listmount_hits),
+                     atomic_read(&n_listmount_dropped), atomic_read(&n_listmount_full),
+                     (int)kr_listmount_ok,
+                     atomic_read(&n_statmount_ret), atomic_read(&n_statmount_hidden),
+                     (int)kr_statmount_ok,
+#endif
                      atomic_read(&n_statfs_redirects));
 }
 static const struct kernel_param_ops sus_mount_stat_ops = {
@@ -2687,6 +2943,18 @@ static void sus_mount_unregister(void)
         susfs_krp_forget_addr(&kr_newmnt);
         kr_newmnt_ok = false;
     }
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+    if (kr_listmount_ok) {
+        unregister_kretprobe(&kr_listmount);
+        susfs_krp_forget_addr(&kr_listmount);
+        kr_listmount_ok = false;
+    }
+    if (kr_statmount_ok) {
+        unregister_kretprobe(&kr_statmount);
+        susfs_krp_forget_addr(&kr_statmount);
+        kr_statmount_ok = false;
+    }
+#endif
     mount_registered = false;
     mutex_unlock(&sus_mount_ctl_lock);
 }
@@ -2821,6 +3089,24 @@ static int sus_mount_register(void)
     } else {
         kr_newmnt_ok = true;
     }
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+    /* Optional, and only present on the two KMIs with these syscalls: without them our mounts stay
+     * hidden from /proc/mounts but are listable via listmount(2)/statmount(2). */
+    rc = register_kretprobe(&kr_listmount);
+    if (rc) {
+        susfs_krp_forget_addr(&kr_listmount);
+        pr_warn("sus_mount: register_kretprobe(do_listmount) failed %d - listmount(2) keeps returning our mounts\n", rc);
+    } else {
+        kr_listmount_ok = true;
+    }
+    rc = register_kretprobe(&kr_statmount);
+    if (rc) {
+        susfs_krp_forget_addr(&kr_statmount);
+        pr_warn("sus_mount: register_kretprobe(do_statmount) failed %d - statmount(2) still details our mounts by id\n", rc);
+    } else {
+        kr_statmount_ok = true;
+    }
+#endif
     mount_registered = true;
     mutex_unlock(&sus_mount_ctl_lock);
     return 0;
