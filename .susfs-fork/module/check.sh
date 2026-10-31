@@ -120,3 +120,8 @@ read -r log_state _ <"$PROC/susfs_enable_log" 2>/dev/null
 if [ "$log_state" = 1 ]; then
   out log_switch info "Kernel logging is on" "The module writes to the kernel log. Turn it off for daily use, it costs a little and adds lines anyone with dmesg access can read."
 fi
+
+ctx_types=$(head -n 1 "$PROC/susfs_selinux_ctx" 2>/dev/null | sed -n 's/.*types=\([0-9]*\).*/\1/p')
+if [ -n "$ctx_types" ] && [ "$ctx_types" -gt 0 ] 2>/dev/null; then
+  out selinux_ctx info "Hiding $ctx_types SELinux context type(s)" "See /proc/susfs_selinux_ctx for the list and hit counters."
+fi

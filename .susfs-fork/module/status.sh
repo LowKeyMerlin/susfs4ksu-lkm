@@ -52,3 +52,7 @@ fi
 mounts=$(head -n 1 "$PROC/susfs_hide_mounts" 2>/dev/null)
 echo "mount_prefixes=$(printf '%s' "$mounts" | sed -n 's/^mount prefixes: \([0-9]*\/[0-9]*\),.*/\1/p')"
 echo "mounts_hidden=$(printf '%s' "$mounts" | sed -n 's/.*hidden_by_identity=\([0-9]*\).*/\1/p')"
+# "armed=1 types=1" - empty when the layer did not load at all (an older kernel build).
+ctx=$(head -n 1 "$PROC/susfs_selinux_ctx" 2>/dev/null)
+echo "selinux_ctx_armed=$(printf '%s' "$ctx" | sed -n 's/^armed=\([01]\).*/\1/p')"
+echo "selinux_ctx_types=$(printf '%s' "$ctx" | sed -n 's/.*types=\([0-9]*\).*/\1/p')"
