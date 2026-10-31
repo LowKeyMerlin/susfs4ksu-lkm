@@ -242,6 +242,24 @@ class FstatfsRawFd(unittest.TestCase):
                                   "use fdget_raw() or fdget(): check each")
 
 
+class BuildHygiene(unittest.TestCase):
+    def test_log_macro_users_include_susfs_log_h(self):
+        """de14a15 used SUSFS_LOGI in susfs_selinux_hide.c without the header: every DDK build failed
+        with -Wimplicit-function-declaration (CI run 41182120881).  A unit that uses a SUSFS_LOG*
+        macro includes susfs_log.h itself, as every other unit does, instead of relying on the
+        include order of another header."""
+        missing = []
+        kdir = os.path.join(SRC, "kernel")
+        for name in sorted(os.listdir(kdir)):
+            if not name.endswith(".c"):
+                continue
+            text = read(f"kernel/{name}")
+            if re.search(r"\bSUSFS_LOG[A-Z]\(", strip_comments(text)) and \
+                    not re.search(r'#\s*include\s+"susfs_log\.h"', text):
+                missing.append(name)
+        self.assertEqual(missing, [])
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", default=SRC)

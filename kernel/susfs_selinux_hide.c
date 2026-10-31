@@ -25,6 +25,7 @@
 #include <linux/seq_file.h>
 #include <linux/cred.h>	/* current_uid(): the control-node gate */
 #include "symbol_resolver.h"
+#include "susfs_log.h"	/* SUSFS_LOGI */
 #include "susfs.h"	/* susfs_expose_proc, susfs_control_node_allowed() */
 #include "ksu_allow_gate.h"	/* susfs_control_visible(): the control-node gate */
 
