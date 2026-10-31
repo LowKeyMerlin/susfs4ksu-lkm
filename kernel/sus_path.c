@@ -237,22 +237,27 @@ static inline bool sus_path_filter_maybe(const struct inode *inode)
            test_bit(sus_path_filter_ino_bit((u64)inode->i_ino), sus_path_bits);
 }
 
+/* Scratch for the rebuild: 2 KiB is too much for the stack of a function that is inlined into
+ * the release path (frame limit 2048), and sus_path_lock already serialises its only user. */
+static unsigned long sus_path_bits_next[BITS_TO_LONGS(SUS_PATH_FILTER_BITS)];
+
 /* sus_path_lock held, after an entry left the table. */
 static void sus_path_filter_trim(void)
 {
-    unsigned long fresh[BITS_TO_LONGS(SUS_PATH_FILTER_BITS)] = { 0 };
+    unsigned long *fresh = sus_path_bits_next;
     struct sus_path_entry *e;
     unsigned int i;
 
     if (++sus_path_filter_stale < 32 || sus_path_filter_stale < sus_path_count)
         return;
+    memset(fresh, 0, sizeof(sus_path_bits_next));
     list_for_each_entry(e, &sus_path_list, list) {
         if (!e->inode)
             continue;
         __set_bit(sus_path_filter_ino_bit(e->ino), fresh);
         __set_bit(sus_path_filter_ptr_bit(e->inode), fresh);
     }
-    for (i = 0; i < ARRAY_SIZE(fresh); i++)
+    for (i = 0; i < ARRAY_SIZE(sus_path_bits_next); i++)
         WRITE_ONCE(sus_path_bits[i], fresh[i]);
     sus_path_filter_stale = 0;
 }
