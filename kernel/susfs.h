@@ -153,8 +153,8 @@ int susfs_selinux_hide_init(void);
 void susfs_selinux_hide_exit(void);
 
 /* /proc/susfs_selinux_ctx: hides an admin-chosen list of SELinux context types (empty, hooks
- * unarmed, by default - see susfs_selinux_ctx.c) from apps probing /sys/fs/selinux/{context,access}
- * and /proc/self/attr/*. */
+ * unarmed, by default - see susfs_selinux_ctx.c) from apps probing /sys/fs/selinux/context,
+ * /sys/fs/selinux/access, and /proc/self/attr/current and its siblings. */
 int susfs_selinux_ctx_init(void);
 void susfs_selinux_ctx_exit(void);
 
