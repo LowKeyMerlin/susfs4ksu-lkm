@@ -220,6 +220,15 @@ class Checks(Scratch):
                  "get_user_pages_remote covers the same call\n")
         self.assertEqual(self.checks()["kernel_log"][0], "ok")
 
+    def test_mount_debug_lines_are_not_warnings_but_a_real_not_still_is(self):
+        # mount_dbg=1 names every ordinary mount the identity test did not claim.
+        self.log("[5.4] susfs_guard_lkm: sus_mount: hook: NOT ours id=38 s_dev=2 root=ffffff80 devname=rootfs\n")
+        self.assertEqual(self.checks()["kernel_log"][0], "ok")
+        self.log("[5.4] susfs_guard_lkm: sus_mount: hook: NOT ours id=38 s_dev=2 root=ffffff80 devname=rootfs\n"
+                 "[5.5] susfs_guard_lkm: sus_map: show_map hook NOT installed\n")
+        self.assertEqual(self.checks()["kernel_log"][0], "warn")
+        self.assertIn("1 line(s)", self.checks()["kernel_log"][2])
+
     def test_other_drivers_warnings_are_not_the_modules(self):
         self.log("[8.3] qcom,fastrpc: Warning: fastrpc_notif_find_process failed\n")
         self.assertEqual(self.checks()["kernel_log"][0], "ok")

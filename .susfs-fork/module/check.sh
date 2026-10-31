@@ -25,9 +25,10 @@ out() { printf '%s|%s|%s|%s\n' "$1" "$2" "$(clean "$3")" "$(clean "$4")"; }
 modlog() { "$DMESG" 2>/dev/null | grep "$NAME:"; }
 
 # What the module prints when a hook could not be placed and the feature is partly or wholly off.
-# Lines about an empty rule list are normal at boot.
+# Lines about an empty rule list are normal at boot, and so is "hook: NOT ours": with mount_dbg on,
+# sus_mount names each ordinary system mount its identity test did not claim.
 WARN_RE='failed|NOT |not filtered|keeps (showing|printing|returning)|did not|drifted|not found|not resolved|not installed|not recogni[sz]ed'
-problems() { modlog | grep -v -e 'that feature stays off' -e ': no rules' | grep -E "$WARN_RE"; }
+problems() { modlog | grep -v -e 'that feature stays off' -e ': no rules' -e 'hook: NOT ours' | grep -E "$WARN_RE"; }
 
 if [ -d "$SYS_MODULE" ]; then
   out loaded ok "Module is loaded" "The kernel module is running."
