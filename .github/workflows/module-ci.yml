@@ -3,9 +3,9 @@ name: module-ci
 
 on:
   push:
-    paths: ['module/**', 'tools/pack_module.py', 'tools/test_pack.py', 'tools/test_toggle.py', '.github/workflows/module-ci.yml']
+    paths: ['module/**', 'tools/pack_module.py', 'tools/test_pack.py', 'tools/test_toggle.py', 'tools/test_load.py', 'tools/test_review_findings.py', 'kernel/**', '.github/workflows/module-ci.yml']
   pull_request:
-    paths: ['module/**', 'tools/pack_module.py', 'tools/test_pack.py', 'tools/test_toggle.py', '.github/workflows/module-ci.yml']
+    paths: ['module/**', 'tools/pack_module.py', 'tools/test_pack.py', 'tools/test_toggle.py', 'tools/test_load.py', 'tools/test_review_findings.py', 'kernel/**', '.github/workflows/module-ci.yml']
   workflow_dispatch:
 
 permissions:
@@ -29,8 +29,12 @@ jobs:
       - name: Shell syntax
         run: for s in module/*.sh; do sh -n "$s"; done
       - name: Byte-compile
-        run: python -m py_compile tools/pack_module.py tools/test_pack.py tools/test_toggle.py
+        run: python -m py_compile tools/pack_module.py tools/test_pack.py tools/test_toggle.py tools/test_load.py tools/test_review_findings.py
       - name: Pack test
         run: python tools/test_pack.py
       - name: Toggle test
         run: python tools/test_toggle.py
+      - name: Loader outcome test
+        run: python tools/test_load.py
+      - name: Kernel source contract and listmount compaction test
+        run: python tools/test_review_findings.py

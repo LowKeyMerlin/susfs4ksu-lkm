@@ -79,7 +79,7 @@ case $1 in
     # A hand-edited or damaged line is skipped, the rest still applies.  The `|| [ -n "$k" ]`
     # keeps the last line when a hand-edited file ends without a trailing newline: read returns
     # non-zero at EOF but still fills k/v, so without it that line would be dropped.
-    while IFS== read -r k v || [ -n "$k" ]; do
+    while IFS='=' read -r k v || [ -n "$k" ]; do
       is_key "$k" && is_value "$v" || continue
       write_node "$k" "$v" || echo "toggle: $k=$v not applied" >&2
     done < "$CONF"

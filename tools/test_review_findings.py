@@ -87,7 +87,7 @@ static long tail_leaks, prefix_errors, writes_when_none, scenarios, fault_leaks;
 /* one scenario: ret ids built by the kernel in a buffer of len slots, hidden[] marks ours */
 static void run(int ret, int len, int fault_k)
 {
-	u64 buf[300], orig[300], kept[300];
+	u64 buf[300] = {0}, orig[300], kept[300];
 	int i, nk = 0, nh = 0, mid_full;
 	struct kretprobe_instance ri;
 	struct sus_mount_sc_state *st = (struct sus_mount_sc_state *)ri.data;

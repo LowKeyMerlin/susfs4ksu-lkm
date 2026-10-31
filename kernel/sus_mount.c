@@ -1302,7 +1302,8 @@ static bool kr_newmnt_ok;
  * page we shorten also reads as the last one to a caller that stops on a short page (util-linux
  * libmount does), which then misses the mounts after it; the kernel never returns a short page
  * before the end, so that is also visible.  The ids sit in the caller's array between the kernel's
- * copy and our compaction, a window a second thread polling that array can read.  All are limits of
+ * copy and our compaction, a window a second thread polling that array can read; the slots past the
+ * lowered count are cleared after the shift so no id outlives it there.  All are limits of
  * editing the result after the fact, which is all these builds leave room for.
  *
  * User memory is touched only in return handlers and only where the syscall body just read or wrote
