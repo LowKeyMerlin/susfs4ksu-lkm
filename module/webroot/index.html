@@ -68,6 +68,7 @@
   .finding p { margin: 6px 0 0; color: var(--muted); font-size: 14px; }
   .finding button.head { width: 100%; background: none; border: 0; padding: 0; text-align: left; cursor: pointer; }
   .quiet { padding: 16px 0; color: var(--muted); }
+  .list.busy > * { opacity: .4; }
 
   .line { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin: 18px 0 4px; }
   .btn { min-height: 40px; padding: 0 16px; border: 1px solid var(--text); border-radius: 6px; background: none; font-weight: 600; cursor: pointer; }
@@ -356,7 +357,7 @@ function renderChecks() {
   if (n.warn) parts.push(n.warn + (n.warn === 1 ? " warning" : " warnings"));
   parts.push(n.ok + " passed");
   if (n.info) parts.push(n.info + (n.info === 1 ? " note" : " notes"));
-  $("summary").textContent = sorted.length ? parts.join(", ") : "Not run yet";
+  $("summary").textContent = sorted.length ? parts.join(", ") + (state.ranAt ? " at " + state.ranAt : "") : "Not run yet";
   var count = $("checks-count");
   var bad = n.fail + n.warn;
   count.hidden = !bad;
@@ -365,21 +366,35 @@ function renderChecks() {
   $("copy").disabled = !sorted.length;
 }
 
-function runChecks() {
+// A manual run keeps its busy state for at least this long. The checks take well under a second on
+// most devices, which is too quick to notice that anything happened.
+var MIN_BUSY_MS = 600;
+function runChecks(manual) {
   var btn = $("run");
+  var started = Date.now();
   btn.disabled = true;
-  btn.textContent = "Running";
+  btn.textContent = "Running checks";
+  $("checks").classList.add("busy");
+  $("checks").setAttribute("aria-busy", "true");
+  $("summary").textContent = "Running the checks";
   return run("check.sh").then(function (r) {
+    var wait = manual === true ? Math.max(0, MIN_BUSY_MS - (Date.now() - started)) : 0;
+    return new Promise(function (go) { setTimeout(go, wait); }).then(function () { return r; });
+  }).then(function (r) {
     state.checks = parseChecks(r.out);
+    state.ranAt = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
     renderChecks();
     renderAttention();
     renderMasthead();
+    $("checks").classList.remove("busy");
+    $("checks").removeAttribute("aria-busy");
     btn.disabled = false;
     btn.textContent = "Run checks";
     if (r.code !== 0 && !state.checks.length) toast("The checks did not run: " + (r.err.trim() || "exit " + r.code));
+    else if (manual === true) toast("Checks finished: " + $("summary").textContent);
   });
 }
-$("run").addEventListener("click", runChecks);
+$("run").addEventListener("click", function () { runChecks(true); });
 
 function report() {
   var f = state.facts;
