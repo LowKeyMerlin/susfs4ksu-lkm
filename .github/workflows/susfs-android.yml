@@ -229,6 +229,12 @@ jobs:
           "$ADB" -s "$SERIAL" shell sh /data/local/tmp/guest-test.sh 2>&1 | tr -d '\r' | tee /tmp/guest.out
           grep -q '^ANDROID susfs_loaded=yes' /tmp/guest.out
           grep -q '^ANDROID ksu_loaded=yes' /tmp/guest.out
+          # The saved WebUI choice must reach the nodes at load, then set/get/bad input behave.
+          for fact in toggle_enable_log_after_boot=0 toggle_avc_spoof_after_boot=1 \
+                      toggle_load_log=0 toggle_set_enable_log_rc=0 toggle_set_avc_spoof_rc=0 \
+                      "toggle_get=enable_log=1 avc_spoof=0 " toggle_bad_value_rc=64; do
+            grep -qxF "ANDROID $fact" /tmp/guest.out || { echo "DIFF: wanted 'ANDROID $fact'"; grep '^ANDROID toggle_' /tmp/guest.out; exit 1; }
+          done
       - name: Run the priority filter in the guest
         run: |
           source .susfs-fork/android/lib.sh
