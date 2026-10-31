@@ -120,6 +120,44 @@ def reject(problems, files, rejects):
         print(f"  {p}", file=sys.stderr)
 
 
+NAME = "SUSFS (LKM Edition)"
+AUTHOR = "LowKeyMerlin, inforcqb"
+ABI_HEADER = ROOT / "kernel" / "susfs_abi.h"
+
+
+def susfs_base():
+    """The SUSFS release the kernel code tracks, without the leading v."""
+    for line in ABI_HEADER.read_text(encoding="utf-8").splitlines():
+        parts = line.split()
+        if parts[:2] == ["#define", "SUSFS_VERSION_STR"] and len(parts) > 2:
+            return parts[2].strip('"').lstrip("v")
+    raise Reject([f"{ABI_HEADER.relative_to(ROOT)} has no SUSFS_VERSION_STR"])
+
+
+def kmi_range(kmis):
+    """Lowest and highest kernel version among KMI names like android14-6.1."""
+    versions = sorted((tuple(int(n) for n in k.split("-", 1)[1].split(".")), k.split("-", 1)[1]) for k in kmis)
+    return versions[0][1], versions[-1][1]
+
+
+def brand(prop, kmis):
+    """Our name, author and base version in the module.prop that pack_module.py wrote.
+
+    The version and versionCode stay as pack_module.py set them. The description is what the card
+    shows until the first boot, load.sh replaces it with the state of that boot.
+    """
+    base = susfs_base()
+    low, high = kmi_range(kmis)
+    props = dict(line.split("=", 1) for line in prop.splitlines() if "=" in line)
+    props.update(
+        name=NAME,
+        author=AUTHOR,
+        susfsBase=base,
+        description=f"Waiting for the first boot | {len(kmis)} kernel builds, {low} to {high} | SUSFS {base}",
+    )
+    return "".join(f"{k}={v}\n" for k, v in props.items())
+
+
 def read_tree():
     return {p.name: p.read_bytes() for p in MODULE.iterdir() if p.is_file()}
 
@@ -159,6 +197,8 @@ def overlay(zip_path, sc_path):
                 info.filename = RENAMED[info.filename]
             elif info.filename == "provenance.json":
                 data = (json.dumps(provenance, indent=2) + "\n").encode()
+            elif info.filename == "module.prop":
+                data = brand(data.decode(), provenance["supported_kmis"]).encode()
             out.writestr(info, data)
         entries = {WRAPPER: sources[WRAPPER], INSTALLER: sources[INSTALLER], PROBE: probe} | {
             ADDED[n]: sources[n] for n in ADDED}

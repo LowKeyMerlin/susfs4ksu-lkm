@@ -137,7 +137,7 @@ def packing_job(text):
         text,
         "      actions: read\n    steps:\n      - uses: actions/checkout@v4\n",
         "      actions: write\n    steps:\n"
-        "      # Full history and tags, git describe below needs them.\n"
+        "      # Full history and tags, the pack step reads the tags on HEAD.\n"
         "      - uses: actions/checkout@v4\n        with:\n          fetch-depth: 0\n",
         "packing job: permissions and checkout")
     text = once(
@@ -157,31 +157,23 @@ def packing_job(text):
 
 
 PACK_AND_UPLOAD = '''\
-      # The fork does not keep upstream's tags, so they would not show on its tags page. They are
-      # read from the parent into this runner's clone, only to name the zip below.
-      - name: Fetch the upstream tags
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          parent="$(gh api "repos/$GITHUB_REPOSITORY" --jq '.parent.full_name // empty')"
-          if [ -n "$parent" ]; then
-            git fetch --quiet "https://github.com/$parent.git" 'refs/tags/*:refs/tags/*'
-          fi
-
       - name: Pack the module
         id: pack
         run: |
           set -euo pipefail
-          # Version the module by the nearest upstream release tag, then the commit. Fall back to
-          # the SUSFS version in the ABI header when no tag is reachable.
-          base="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)"
-          if [ -z "$base" ]; then
-            base="$(sed -n 's/^#define SUSFS_VERSION_STR[[:space:]]*"\\(.*\\)".*/\\1/p' kernel/susfs_abi.h)"
-            echo "::warning::no release tag reachable, using $base as the module version"
+          # The module has its own version, in .susfs-fork/VERSION. A commit tagged v<VERSION> is
+          # a release; any other commit gets a -dev suffix and cannot be mistaken for one.
+          version="$(tr -d '[:space:]' < .susfs-fork/VERSION)"
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::.susfs-fork/VERSION is '$version', not MAJOR.MINOR.PATCH"; exit 1 ;;
+          esac
+          tag="v$version-dev.$(git rev-parse --short HEAD)"
+          tags="$(git tag --points-at HEAD --list 'v[0-9]*')"
+          if [ -n "$tags" ]; then
+            [ "$tags" = "v$version" ] || { echo "::error::HEAD is tagged '$tags' but VERSION is $version"; exit 1; }
+            tag="v$version"
           fi
-          [ -n "$base" ] || { echo "::error::no release tag and no SUSFS_VERSION_STR for the module version"; exit 1; }
-          tag="${base}-$(git rev-parse --short HEAD)"
           zip="dist/ksu_susfs_lkm-module-$tag-arm64.zip"
           python tools/pack_module.py --ko-dir ko --insmod bin/susfs_insmod \\
             --tag "$tag" --sha "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" \\

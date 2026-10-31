@@ -3,9 +3,9 @@ name: module-ci
 
 on:
   push:
-    paths: ['module/**', 'tools/pack_module.py', 'tools/test_pack.py', 'tools/test_toggle.py', 'tools/test_load.py', 'tools/test_review_findings.py', 'tools/test_soak_check.py', '.susfs-fork/smoke/**', 'kernel/**', '.github/workflows/module-ci.yml']
+    paths: ['module/**', 'tools/pack_module.py', 'tools/test_pack.py', 'tools/test_toggle.py', 'tools/test_load.py', 'tools/test_review_findings.py', 'tools/test_soak_check.py', 'tools/test_pack_extra.py', '.susfs-fork/pack_extra.py', '.susfs-fork/VERSION', '.susfs-fork/smoke/**', 'kernel/**', '.github/workflows/module-ci.yml']
   pull_request:
-    paths: ['module/**', 'tools/pack_module.py', 'tools/test_pack.py', 'tools/test_toggle.py', 'tools/test_load.py', 'tools/test_review_findings.py', 'tools/test_soak_check.py', '.susfs-fork/smoke/**', 'kernel/**', '.github/workflows/module-ci.yml']
+    paths: ['module/**', 'tools/pack_module.py', 'tools/test_pack.py', 'tools/test_toggle.py', 'tools/test_load.py', 'tools/test_review_findings.py', 'tools/test_soak_check.py', 'tools/test_pack_extra.py', '.susfs-fork/pack_extra.py', '.susfs-fork/VERSION', '.susfs-fork/smoke/**', 'kernel/**', '.github/workflows/module-ci.yml']
   workflow_dispatch:
 
 permissions:
@@ -40,3 +40,5 @@ jobs:
         run: python tools/test_review_findings.py
       - name: Soak judge test
         run: python tools/test_soak_check.py
+      - name: Module identity test
+        run: python tools/test_pack_extra.py
