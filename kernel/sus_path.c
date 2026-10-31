@@ -210,7 +210,7 @@ static DECLARE_DELAYED_WORK(sus_path_pending_wq, sus_path_pending_work);
  */
 #define SUS_PATH_FILTER_SHIFT 14
 #define SUS_PATH_FILTER_BITS (1U << SUS_PATH_FILTER_SHIFT)
-static unsigned long sus_path_filter[BITS_TO_LONGS(SUS_PATH_FILTER_BITS)];
+static unsigned long sus_path_bits[BITS_TO_LONGS(SUS_PATH_FILTER_BITS)];
 static unsigned int sus_path_filter_stale;      /* guarded by sus_path_lock */
 
 static inline unsigned int sus_path_filter_ino_bit(u64 ino)
@@ -226,14 +226,14 @@ static inline unsigned int sus_path_filter_ptr_bit(const struct inode *inode)
 /* sus_path_lock held; for an entry that has just gained its inode. */
 static void sus_path_filter_add(const struct sus_path_entry *e)
 {
-    set_bit(sus_path_filter_ino_bit(e->ino), sus_path_filter);
-    set_bit(sus_path_filter_ptr_bit(e->inode), sus_path_filter);
+    set_bit(sus_path_filter_ino_bit(e->ino), sus_path_bits);
+    set_bit(sus_path_filter_ptr_bit(e->inode), sus_path_bits);
 }
 
 static inline bool sus_path_filter_maybe(const struct inode *inode)
 {
-    return test_bit(sus_path_filter_ptr_bit(inode), sus_path_filter) ||
-           test_bit(sus_path_filter_ino_bit((u64)inode->i_ino), sus_path_filter);
+    return test_bit(sus_path_filter_ptr_bit(inode), sus_path_bits) ||
+           test_bit(sus_path_filter_ino_bit((u64)inode->i_ino), sus_path_bits);
 }
 
 /* sus_path_lock held, after an entry left the table. */
@@ -252,7 +252,7 @@ static void sus_path_filter_trim(void)
         __set_bit(sus_path_filter_ptr_bit(e->inode), fresh);
     }
     for (i = 0; i < ARRAY_SIZE(fresh); i++)
-        WRITE_ONCE(sus_path_filter[i], fresh[i]);
+        WRITE_ONCE(sus_path_bits[i], fresh[i]);
     sus_path_filter_stale = 0;
 }
 
