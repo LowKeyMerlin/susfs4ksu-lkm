@@ -9,12 +9,16 @@
   :root {
     --bg: #f6f5f1; --text: #1b1b19; --muted: #6a6963; --line: #dad8d0; --soft: #ebe9e2;
     --ok: #2a7a4b; --note: #3b5b8f; --warn: #9c5a00; --fail: #b3261e;
+    /* The header band is dark in both themes, so it has its own text and state colours. */
+    --head-bg: #1f2824; --head-text: #efede6; --head-muted: #a2aca6; --head-line: #3a4640;
+    --on-ok: #6cc38e; --on-note: #8fadde; --on-warn: #e2a64d; --on-fail: #f08b7e;
     --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #121211; --text: #ecebe6; --muted: #918f87; --line: #2b2b28; --soft: #1c1c1a;
       --ok: #6cc38e; --note: #8fadde; --warn: #e2a64d; --fail: #f08b7e;
+      --head-bg: #1a231f; --head-line: #34403a;
     }
   }
   * { box-sizing: border-box; }
@@ -29,11 +33,18 @@
   button, input { font: inherit; color: inherit; }
   button:focus-visible, input:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
 
-  /* The state, one word, with a rail that takes the colour of the worst finding. */
-  .masthead { padding: 28px 0 22px; border-left: 4px solid var(--rail, var(--line)); padding-left: 16px; margin-left: -20px; padding-right: 20px; }
-  .eyebrow { font: 600 11px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
-  h1 { margin: 10px 0 6px; font-size: 34px; line-height: 1.05; font-weight: 600; letter-spacing: -.025em; }
-  .ident { font: 12.5px/1.5 var(--mono); color: var(--muted); word-break: break-word; }
+  /* The state, one word, on a band of its own. The dot and the strip under it take the colour of the
+   * worst finding. The band runs past the column to both screen edges. */
+  body { overflow-x: clip; }
+  .masthead { position: relative; isolation: isolate; padding: 26px 0 20px; color: var(--head-text); }
+  .masthead::before { content: ""; position: absolute; z-index: -1; inset: 0 -100vmax; background: var(--head-bg); border-bottom: 3px solid var(--rail, var(--head-line)); }
+  .brand { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; font: 600 11px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase; }
+  .brand .edition { padding: 4px 7px; border-radius: 4px; background: var(--head-line); letter-spacing: .08em; }
+  .brand .by { margin-left: auto; color: var(--head-muted); font-weight: 500; letter-spacing: .04em; text-transform: none; }
+  h1 { display: flex; align-items: center; gap: 12px; margin: 12px 0 12px; font-size: 34px; line-height: 1.05; font-weight: 600; letter-spacing: -.025em; }
+  .dot { flex: none; width: 12px; height: 12px; border-radius: 50%; background: var(--rail, var(--head-line)); }
+  .ident { display: flex; flex-wrap: wrap; gap: 6px; font: 12px/1 var(--mono); color: var(--head-muted); }
+  .ident span { padding: 5px 8px; border: 1px solid var(--head-line); border-radius: 4px; }
 
   .tabs { display: flex; gap: 22px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); z-index: 1; }
   .tabs button { background: none; border: 0; padding: 14px 0 12px; color: var(--muted); font-weight: 600; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; }
@@ -109,9 +120,13 @@
 <body>
 <main>
   <header class="masthead" id="masthead">
-    <div class="eyebrow">SUSFS / LKM Edition</div>
-    <h1 id="state">Reading</h1>
-    <div class="ident" id="ident">Reading module state</div>
+    <div class="brand">
+      <span class="name">SUSFS</span>
+      <span class="edition">LKM Edition</span>
+      <span class="by" id="by" hidden></span>
+    </div>
+    <h1><span class="dot"></span><span id="state">Reading</span></h1>
+    <div class="ident" id="ident"><span>Reading module state</span></div>
   </header>
 
   <div class="tabs" role="tablist" aria-label="Sections">
@@ -222,7 +237,7 @@ var LEVELS = {
 var STATES = {
   "Active": "ok", "Standing by": "info", "Degraded": "warn", "Not loaded": "fail", "Disabled": "fail"
 };
-var RAIL = { ok: "var(--ok)", info: "var(--note)", warn: "var(--warn)", fail: "var(--fail)" };
+var RAIL = { ok: "var(--on-ok)", info: "var(--on-note)", warn: "var(--on-warn)", fail: "var(--on-fail)" };
 
 var state = { facts: {}, checks: [], toggles: {}, paths: [] };
 var toastTimer = 0;
@@ -274,7 +289,11 @@ function renderMasthead() {
   var kmi = (f.card || "").split(" | ").filter(function (p) { return /^android\d+-/.test(p); })[0];
   if (kmi) bits.push(kmi);
   if (f.susfs_base) bits.push("SUSFS " + f.susfs_base);
-  $("ident").textContent = bits.join(" / ");
+  $("by").textContent = f.author ? "by " + f.author : "";
+  $("by").hidden = !f.author;
+  var ident = $("ident");
+  ident.textContent = "";
+  bits.forEach(function (b) { ident.appendChild(el("span", "", b)); });
   $("masthead").style.setProperty("--rail", RAIL[worst()]);
 }
 

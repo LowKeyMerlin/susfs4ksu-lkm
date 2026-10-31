@@ -11,6 +11,7 @@ flag() { [ -e "$1" ] && echo 1 || echo 0; }
 
 echo "name=$(prop name)"
 echo "version=$(prop version)"
+echo "author=$(prop author)"
 echo "susfs_base=$(prop susfsBase)"
 echo "card=$(prop description)"
 echo "kernel=$(cat "$PROC/sys/kernel/osrelease" 2>/dev/null)"

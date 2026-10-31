@@ -39,7 +39,7 @@ class Scratch(unittest.TestCase):
         data = (ROOT / "module" / "early-dispatch.sh").read_bytes().replace(b"\r\n", b"\n")
         (self.mod / "early-dispatch.sh").write_bytes(data)
         put(self.mod / "module.prop",
-            "id=susfs_guard_lkm\nname=SUSFS (LKM Edition)\nversion=v1.0.0\nsusfsBase=2.3.0\n"
+            "id=susfs_guard_lkm\nname=SUSFS (LKM Edition)\nversion=v1.0.0\nauthor=A Person, Another\nsusfsBase=2.3.0\n"
             "description=Active | boot load | android16-6.12 | SUSFS 2.3.0\n")
         self.proc = self.base / "proc"
         (self.proc / "sys/kernel").mkdir(parents=True)
@@ -104,6 +104,7 @@ class Status(Scratch):
         out = dict(l.split("=", 1) for l in self.run_script("status.sh").splitlines())
         self.assertEqual(out["name"], "SUSFS (LKM Edition)")
         self.assertEqual(out["version"], "v1.0.0")
+        self.assertEqual(out["author"], "A Person, Another")
         self.assertEqual(out["susfs_base"], "2.3.0")
         self.assertEqual(out["kernel"], "6.12.23-android16-5-gabc-4k")
         self.assertEqual((out["loaded"], out["early_load"], out["guard_tripped"], out["guard_fails"]),
