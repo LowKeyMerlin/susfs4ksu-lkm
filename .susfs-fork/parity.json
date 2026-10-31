@@ -60,20 +60,19 @@
   ],
   "audits": [
     {
-      "target": "linux 6.18 internals used by sus_mount.c (mnt_id_xa, __xa_alloc, __xa_erase)",
-      "source": "our own 6.18 branches read for consistency; the DDK and GKI builds of every KMI, 6.18 included, are what validate them against the real kernel",
+      "target": "linux 6.18 internals used by sus_mount.c (mnt_id_xa, __xa_alloc, __xa_erase, mnt_id_ctr)",
+      "source": "android.googlesource.com/kernel/common branch android17-6.18 (kernel 6.18.33), fetched file-by-file with tools/fetch_kernel_files.py: fs/namespace.c, lib/xarray.c, include/linux/xarray.h, include/linux/types.h, cross-checked against android16-6.12 (kernel 6.12.96) for the same files",
       "checked": [
         "every id taken with __xa_alloc is released exactly once: by the kernel's own erase when a marked mount is freed, or by sus_mount_ida_release() for an unused or orphaned id",
         "alloc and release use the same xarray and the same lock call, and both run in process context",
         "a missing mnt_id_xa, __xa_alloc or __xa_erase leaves marking off and logs the name, so the feature does nothing instead of guessing",
         "kallsyms and the loader's own extern are cross-checked and a mismatch is logged",
-        "the 6.12+ mnt_id_ctr and namespace_sem lookups are compiled for 6.18 too"
-      ],
-      "build-gated": [
-        "which lock flavour mnt_id_xa uses: xa_lock() is right only if the array is not declared XA_FLAGS_LOCK_IRQ or LOCK_BH, and the 6.18 System.map and a PROVE_LOCKING boot are what settle it",
-        "that __xa_alloc() with a NULL entry keeps the slot allocated (it is meant to store a reserved entry), which the first marked mount in the 6.18 smoke run shows",
-        "that mnt_id_xa is not static in 6.18 fs/namespace.c, which the System.map gate already checks at build time",
-        "whether 6.18 changed mnt_id_ctr or the mnt_id_unique rules the craft in sus_mount_craft_unique() relies on"
+        "the 6.12+ mnt_id_ctr and namespace_sem lookups are compiled for 6.18 too",
+        "xa_lock() flavour: mnt_id_xa is declared DEFINE_XARRAY_FLAGS(mnt_id_xa, XA_FLAGS_ALLOC) (fs/namespace.c:80), no XA_FLAGS_LOCK_IRQ/LOCK_BH; xa_lock()/xa_unlock() are unconditionally spin_lock()/spin_unlock() (include/linux/xarray.h:536-537), and the kernel's own mnt_alloc_id()/mnt_free_id() call the same plain xa_lock() on this xarray - our matching plain xa_lock() in sus_mount_ida_alloc()/release() is therefore correct, not a guess",
+        "__xa_alloc() with a NULL entry: __xa_alloc() substitutes XA_ZERO_ENTRY for a NULL entry (lib/xarray.c:1995-1996) and clears XA_FREE_MARK on the slot it stores into (line 2006), so a NULL-entry alloc is unambiguously taken; xa_erase() stores NULL back and xas_store() re-marks a NULL store free (lib/xarray.c:816-817), so sus_mount_ida_release() genuinely frees it. Also confirmed mnt_id_xa has no other reader in fs/namespace.c (no xa_load/xa_for_each on it), so a reserved slot holding XA_ZERO_ENTRY instead of a real struct mount * is never dereferenced by anything else",
+        "mnt_id_xa is static in 6.18 fs/namespace.c (line 80) and resolves via kallsyms the same as every other static data symbol this module reads (CONFIG_KALLSYMS_ALL)",
+        "mnt_id_ctr changed from 6.12's atomic64_t (atomic64_inc_return under no external lock, fs/namespace.c:84,255) to 6.18's plain u64 incremented as ++mnt_id_ctr under mnt_id_xa's xa_lock (fs/namespace.c:85,227); our sus_mount_craft_unique() still reads it with atomic64_read() on both, which is exactly right on either type because CONFIG_64BIT's atomic64_t is `struct { s64 counter; }` (include/linux/types.h:187-190) - bit-identical layout to a bare u64 at the same address, and atomic64_read() is a plain relaxed load, needing no lock to read race-free, matching the function's already-documented approximate/lock-free design",
+        "mnt_id_unique allocation range check: mnt_alloc_id() allocates with xa_limit_31b = XA_LIMIT(0, INT_MAX) (include/linux/xarray.h:239-251); our sus_mount_ida_alloc() allocates within [DEFAULT_KSU_MNT_ID, INT_MAX-1], a strict subset, so a marked mount's id is always one the kernel's own allocator could have produced"
       ]
     }
   ],

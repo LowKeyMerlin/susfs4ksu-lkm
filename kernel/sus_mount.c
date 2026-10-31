@@ -252,11 +252,21 @@ static void (*pfn_ida_free)(struct ida *ida, unsigned int id);
 #endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-/* The kernel's 6.12+ unique mount-id counter (static atomic64_t mnt_id_ctr in fs/namespace.c),
- * read but never incremented so a marked mount can be given a plausible mnt_id_unique.  Resolved
- * from kallsyms (GKI enables CONFIG_KALLSYMS_ALL) and optional: without it the unique id is left as
- * the kernel assigned it.  sus_mount_sus_id_ctr is our own monotonic offset, the analogue of
- * upstream's sus_mnt_id_ctr (commit 7d91da2). */
+/* The kernel's 6.12+ unique mount-id counter, read but never incremented so a marked mount
+ * can be given a plausible mnt_id_unique.  Resolved from kallsyms (GKI enables
+ * CONFIG_KALLSYMS_ALL) and optional: without it the unique id is left as the kernel assigned it.
+ * sus_mount_sus_id_ctr is our own monotonic offset, the analogue of upstream's sus_mnt_id_ctr
+ * (commit 7d91da2).
+ *
+ * The symbol's own C type differs by version and the cast below does not track it - verified
+ * harmless, not assumed: on 6.12 it is `static atomic64_t mnt_id_ctr`, incremented lock-free
+ * with atomic64_inc_return(); on 6.18 the allocator moved to mnt_id_xa and mnt_id_ctr became a
+ * plain `static u64`, incremented as `++mnt_id_ctr` under mnt_id_xa's xa_lock (fs/namespace.c).
+ * Casting its address to atomic64_t* and reading with atomic64_read() is still exactly right on
+ * both: CONFIG_64BIT's atomic64_t is `struct { s64 counter; }` (include/linux/types.h), so the
+ * read touches the same 8 bytes at the same offset as a direct u64 load either way, and
+ * atomic64_read() is a plain relaxed load (no cmpxchg loop), so no lock is needed to read it
+ * race-free - matching the already-approximate, lock-free design this function documents below. */
 static atomic64_t *sus_mount_mnt_id_ctr;
 static atomic64_t sus_mount_sus_id_ctr = ATOMIC64_INIT(0);
 

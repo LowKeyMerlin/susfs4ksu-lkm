@@ -137,6 +137,35 @@ rcu_barrier because the callback runs kernel code, not module code.
   listmount/statmount return-probe lacks the per-mount struct context needed to drop a marked mount
   from the enumeration, and the 16K fold needs 16K-page handling that cannot be validated blind.
 
+## 6.18 mnt_id_xa audit (previously build-gated, now source-confirmed)
+
+The four points `parity.json`'s "audits" entry listed as build-gated were settled by fetching
+`fs/namespace.c`, `lib/xarray.c`, `include/linux/xarray.h` and `include/linux/types.h` from the
+real `android17-6.18` branch (kernel 6.18.33) with `tools/fetch_kernel_files.py`, cross-checked
+against `android16-6.12` (6.12.96) for the same files:
+
+- `xa_lock()` on `mnt_id_xa` is correct: the xarray carries no `XA_FLAGS_LOCK_IRQ`/`LOCK_BH`, so
+  `xa_lock()` is unconditionally `spin_lock()`, matching the kernel's own `mnt_alloc_id()`/
+  `mnt_free_id()` on the same object.
+- A NULL entry in `__xa_alloc()` becomes `XA_ZERO_ENTRY` and the slot's free mark is cleared, so
+  it is genuinely taken; `xa_erase()`/`__xa_erase()` genuinely frees it back. `mnt_id_xa` has no
+  other reader in `fs/namespace.c`, so a reserved slot holding `XA_ZERO_ENTRY` instead of a real
+  `struct mount *` is never dereferenced.
+- `mnt_id_xa` is `static`, resolved via kallsyms like every other static data symbol this module
+  reads.
+- `mnt_id_ctr` changed type from 6.12's `atomic64_t` to 6.18's plain `u64` (now incremented under
+  `mnt_id_xa`'s own `xa_lock` instead of atomically). `sus_mount_craft_unique()`'s
+  `atomic64_read()` on the cast pointer is still correct on both: `CONFIG_64BIT`'s `atomic64_t` is
+  `struct { s64 counter; }`, bit-identical in layout to a bare `u64` at the same address, and
+  `atomic64_read()` is a plain relaxed load that needs no lock to read race-free.
+- The allocation range `sus_mount_ida_alloc()` uses (`[DEFAULT_KSU_MNT_ID, INT_MAX-1]`) is a
+  strict subset of the kernel's own `xa_limit_31b = [0, INT_MAX]`, so a marked mount's id is
+  always one the kernel's own allocator could have produced.
+
+No bug found. One comment in `sus_mount.c` was wrong (it described `mnt_id_ctr` as always
+`atomic64_t`, which is only true through 6.12) and has been corrected to state the verified,
+version-dependent type and why the cast is still safe.
+
 ## Closing outcomes (p0, p1-618, p3, p4, p5)
 
 - p0: abi_drift.py was already the upstream comparison tool, so no new script. Running it showed the
