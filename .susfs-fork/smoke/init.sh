@@ -8,6 +8,10 @@ mount -t proc proc /proc
 mount -t sysfs sys /sys
 # The loader reads real addresses from /proc/kallsyms.
 echo 0 >/proc/sys/kernel/kptr_restrict
+# The kprobe list is read before the module loads and again after it is unloaded.
+mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+kprobe_count() { n=$(grep -c . /sys/kernel/debug/kprobes/list 2>/dev/null); echo "${n:-0}"; }
+kprobes_base=$(kprobe_count)
 
 . /smoke.env
 M=/module
@@ -696,6 +700,111 @@ say "installer_noksu_done=$(has '[5/5]' "$out")"
 say "installer_noksu_results=$(results "$out")"
 say "installer_noksu_log_result=$(logresult)"
 say "installer_log_rotated=$(yesno grep -q 'arm64 only' "$instlog.old")"
+
+# ---- soak, unload and reload ----------------------------------------------------------------
+# Not run with KernelSU loaded: those boots check the gates, and an unload there says nothing more.
+# Everything the module hooks is used at once by several readers while the marked mount is torn
+# down and made again and the rules change.  The kernel is not a debug build, so a use-after-free or
+# a deadlock shows only as a crash, a stall, or a VM that never reaches its last line; check.py
+# treats each of those as a failure.  Leaks show as slab growth between two identical rounds.
+if [ -z "$KSU" ]; then
+  SOAK_SECS=${SOAK_SECS:-12}
+  SD=/data/local/tmp/soak
+  say "soak_secs=$SOAK_SECS"
+  sus_map_add /bin/busybox >/dev/null
+  lm_id=${lm_id:-0}
+  # One worker: run the command over and over until the stop file exists, then store the count.
+  soak_worker() {
+    n=0
+    while [ ! -f $SD/stop ]; do "$2" >/dev/null 2>&1; n=$((n + 1)); done
+    echo $n >$SD/n.$1
+  }
+  w_statfs() {
+    out=$(ksb app statfs /data/adb/ms)
+    case "$out" in "$kparent" | "$ktmp" | "") ;; *) echo "statfs $out" >>$SD/bad ;; esac
+  }
+  w_fstatfs() {
+    out=$(ksb app fstatfs /data/adb/ms)
+    case "$out" in "$kparent" | "$ktmp" | "") ;; *) echo "fstatfs $out" >>$SD/bad ;; esac
+  }
+  w_list() { lids app 4096 >/dev/null; }
+  w_statmount() { kcall app $KSTAT statmount "$lm_id" >/dev/null; }
+  w_mountinfo() { as_app 'cat /proc/self/mountinfo /proc/self/mounts /proc/self/mountstats'; }
+  w_maps() { as_app 'grep -c busybox /proc/self/maps; ls /data/adb >/dev/null'; }
+  w_churn() {
+    umount -l /data/adb/ms 2>/dev/null
+    mount -t tmpfs -o size=2m tmpfs /data/adb/ms
+    echo reset >/proc/susfs_hide_mounts
+  }
+  w_rules() { wr root 'add /bin/sc'; wr root 'del /bin/sc'; }
+  SOAK_WORKERS="statfs fstatfs list statmount mountinfo maps churn rules"
+  soak_round() {
+    rm -rf $SD
+    mkdir -p $SD
+    umount -l /data/adb/ms 2>/dev/null
+    mount -t tmpfs -o size=2m tmpfs /data/adb/ms
+    echo reset >/proc/susfs_hide_mounts
+    pids=
+    for w in $SOAK_WORKERS; do
+      soak_worker "$w" "w_$w" &
+      pids="$pids $!"
+    done
+    sleep "$SOAK_SECS"
+    : >$SD/stop
+    wait $pids
+  }
+  # Memory the kernel cannot reclaim, in kB, after the caches are dropped and freed objects settle.
+  slab_kb() {
+    sync
+    echo 3 >/proc/sys/vm/drop_caches 2>/dev/null
+    sleep 2
+    sed -n 's/^SUnreclaim: *\([0-9]*\) kB.*/\1/p' /proc/meminfo
+  }
+  # The first round warms the caches, so the growth is measured over the second.
+  soak_round
+  slab_warm=$(slab_kb)
+  soak_round
+  slab_end=$(slab_kb)
+  idle=
+  for w in $SOAK_WORKERS; do
+    [ "$(cat $SD/n.$w 2>/dev/null || echo 0)" -gt 0 ] || idle="$idle $w"
+  done
+  say "soak_idle_workers=${idle:- none}"
+  say "soak_iterations=$(for w in $SOAK_WORKERS; do printf '%s=%s ' "$w" "$(cat $SD/n.$w 2>/dev/null)"; done)"
+  say "soak_bad_answers=$([ -f $SD/bad ] && wc -l <$SD/bad || echo 0)"
+  say "soak_slab_kb=$slab_warm/$slab_end"
+  say "soak_slab_growth_kb=$((slab_end - slab_warm))"
+  umount -l /data/adb/ms 2>/dev/null
+  say "soak_alive=$(yesno [ -d /sys/module/susfs_guard_lkm ])"
+
+  # Unload, then load again, three times.  An unload that leaves a hook behind crashes on the
+  # next call into freed text, so each cycle ends with the module in use again.
+  say "unload_kprobes_base=$kprobes_base"
+  say "unload_kprobes_loaded=$(kprobe_count)"
+  slab_c0=$(slab_kb)
+  for c in 1 2 3; do
+    rmmod susfs_guard_lkm >/tmp/rmmod.out 2>&1
+    say "unload${c}_rc=$?"
+    sed "s/^/RMMOD $c: /" /tmp/rmmod.out
+    sleep 1
+    say "unload${c}_sysfs=$(if [ -d /sys/module/susfs_guard_lkm ]; then echo present; else echo gone; fi)"
+    say "unload${c}_probe=$(probe)"
+    say "unload${c}_kprobes_left=$(kprobe_count)"
+    say "unload${c}_proc_nodes=$(ls /proc | grep -c '^susfs_')"
+    # Still a working kernel: the same calls the module hooked, with the hooks gone.
+    say "unload${c}_app_statfs=$(yesno [ -n "$(ksb app statfs /)" ])"
+    say "unload${c}_app_maps=$(yesno [ "$(as_app grep -c busybox /proc/self/maps)" -gt 0 ])"
+    ( cd "$M" && /system/bin/sh ./post-fs-data.sh )
+    say "reload${c}_rc=$?"
+    say "reload${c}_probe=$(probe)"
+    say "reload${c}_sysfs=$(if [ -d /sys/module/susfs_guard_lkm ]; then echo present; else echo gone; fi)"
+    say "reload${c}_map_rule=$(sus_map_add /bin/busybox)"
+    say "reload${c}_app_maps=$(yesno [ "$(as_app grep -c busybox /proc/self/maps)" -gt 0 ])"
+  done
+  slab_c3=$(slab_kb)
+  say "unload_slab_kb=$slab_c0/$slab_c3"
+  say "unload_slab_growth_kb=$((slab_c3 - slab_c0))"
+fi
 
 for f in load.log guard.log; do
   [ -f "$f" ] && sed "s/^/LOG $f: /" "$f"

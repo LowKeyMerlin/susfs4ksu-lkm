@@ -34,7 +34,13 @@ FACT = re.compile(r"^SMOKE (\w+)=(.*)$")
 SCRIPT_LINE = re.compile(r"^(SMOKE |LOG |INSTALL[\w-]*: )")
 LAYER_FAILED = re.compile(r"\b\w+ init failed -?\d+ - that feature stays off")
 KERNEL_TAIL = re.compile(r"\[\s*\d+\.\d{6}\]")
-CRASH = re.compile(r"Kernel panic|Oops[:\s]|BUG:|Call trace:|Unable to handle kernel|Internal error:")
+# A healthy boot prints none of these.  The stalls and lock reports are what a deadlock or a
+# lockup under the soak looks like on a kernel that is not a debug build.
+CRASH = re.compile(
+    r"Kernel panic|Oops[:\s]|BUG:|Call trace:|Unable to handle kernel|Internal error:"
+    r"|soft lockup|hard LOCKUP|detected stalls? on CPUs|self-detected stall"
+    r"|blocked for more than \d+ seconds|possible (?:circular|recursive) locking"
+    r"|inconsistent lock state|refcount_t: (?:underflow|saturated|addition on 0)")
 
 # What a healthy run reports: key, expected value, what it shows.
 EXPECTED = [
@@ -268,6 +274,59 @@ KSU_DEBUG_EXPECTED = [
 ]
 
 
+# The soak, unload and reload stage (not run with KernelSU loaded).  Every unload cycle is checked
+# alike: the module is gone, the kprobe list is what it was before the load, the calls it hooked
+# still work, and a reload brings the hooks back.
+SOAK_EXPECTED = [
+    ("soak_idle_workers", "none", "every reader and writer of the soak made progress, so none was stuck"),
+    ("soak_bad_answers", "0", "no reader of a mount that is torn down and made again got an answer no mount gives"),
+    ("soak_alive", "yes", "the module is still loaded after the soak"),
+]
+UNLOAD_EXPECTED = [
+    ("unload{c}_rc", "0", "rmmod of the module succeeds"),
+    ("unload{c}_sysfs", "gone", "/sys/module/susfs_guard_lkm is gone after the unload"),
+    ("unload{c}_probe", "1", "SUSFS no longer answers after the unload"),
+    ("unload{c}_proc_nodes", "0", "no /proc/susfs_* node is left after the unload"),
+    ("unload{c}_app_statfs", "yes", "an app's statfs still works after the unload"),
+    ("unload{c}_app_maps", "yes", "with the module gone an app sees the mapping the rule hid"),
+    ("reload{c}_rc", "0", "post-fs-data.sh loads the module again"),
+    ("reload{c}_probe", "0", "SUSFS answers again after the reload"),
+    ("reload{c}_sysfs", "present", "/sys/module/susfs_guard_lkm exists again after the reload"),
+    ("reload{c}_map_rule", "0", "a sus_map rule is accepted after the reload"),
+    ("reload{c}_app_maps", "no", "the reloaded module hides the mapping again"),
+]
+# Growth of memory the kernel cannot reclaim, in kB.  Measured over a second identical round, so
+# warm-up is not counted; a leak per call grows with the thousands of calls a round makes.
+SLAB_LIMITS = [
+    ("soak_slab_growth_kb", 4096, "unreclaimable slab grew over a second identical soak round"),
+    ("unload_slab_growth_kb", 2048, "unreclaimable slab grew over three unload and reload cycles"),
+]
+
+
+def soak_problems(facts):
+    problems = []
+    for key, want, shows in SOAK_EXPECTED:
+        got = facts.get(key)
+        if got != want:
+            problems.append(f"{shows}: expected {key}={want}, got {got if got is not None else 'nothing'}")
+    base = facts.get("unload_kprobes_base")
+    for c in (1, 2, 3):
+        for key, want, shows in UNLOAD_EXPECTED:
+            key = key.format(c=c)
+            got = facts.get(key)
+            if got != want:
+                problems.append(f"{shows}: expected {key}={want}, got {got if got is not None else 'nothing'}")
+        key = f"unload{c}_kprobes_left"
+        if facts.get(key) != base or base is None:
+            problems.append("no kprobe of the module is left after the unload: expected "
+                            f"{key}={base} (the count before the load), got {facts.get(key)}")
+    for key, limit, shows in SLAB_LIMITS:
+        got = facts.get(key)
+        if not (got is not None and got.lstrip("-").isdigit() and int(got) <= limit):
+            problems.append(f"{shows}: expected {key}<={limit}, got {got if got is not None else 'nothing'}")
+    return problems
+
+
 def split_tail(line):
     """Return (line without a kernel message that ran into it, that message)."""
     m = KERNEL_TAIL.search(line)
@@ -355,6 +414,8 @@ def judge(lines, qemu_rc, ksu_cfg=None):
         if not (got is not None and got.lstrip("-").isdigit() and int(got) > 0):
             problems.append(f"{shows}: expected {key}>0, got {got if got is not None else 'nothing'}")
     problems += listmount_problems(facts)
+    if not ksu_cfg:
+        problems += soak_problems(facts)
     seen = crashed = False
     for line in lines:
         seen = seen or line.startswith("SMOKE kernel=")
