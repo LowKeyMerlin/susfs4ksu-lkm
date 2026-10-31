@@ -2,113 +2,405 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>susfs_guard_lkm</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>SUSFS (LKM Edition)</title>
 <style>
-  body { font: 16px sans-serif; margin: 16px; color: #222; background: #fafafa; }
-  @media (prefers-color-scheme: dark) { body { color: #ddd; background: #121212; } }
-  label { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid #8884; }
-  small { display: block; opacity: .7; }
-  small.warn { opacity: 1; color: #a33; font-weight: 600; }
-  @media (prefers-color-scheme: dark) { small.warn { color: #e88; } }
-  #msg { margin-top: 16px; min-height: 1.4em; }
+  :root {
+    --bg: #f4f5f7; --surface: #ffffff; --line: #dfe2e7; --text: #16181d; --muted: #5d6573;
+    --accent: #0b6e69; --accent-text: #ffffff;
+    --ok: #1c7a3d; --note: #3b5fa8; --warn: #9a6500; --fail: #b3261e;
+    --ok-bg: #e4f3e9; --note-bg: #e6edf9; --warn-bg: #fbf0d9; --fail-bg: #fae6e4;
+    --radius: 12px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1114; --surface: #181b20; --line: #2a2f37; --text: #e6e8ec; --muted: #9aa3b0;
+      --accent: #4fc3bb; --accent-text: #08201e;
+      --ok: #6fd08b; --note: #8fb0ee; --warn: #e6b450; --fail: #f2928a;
+      --ok-bg: #16281d; --note-bg: #19233a; --warn-bg: #2b2412; --fail-bg: #2f1a18;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  main { max-width: 640px; margin: 0 auto; padding: 16px 16px 40px; }
+  header { padding: 8px 0 16px; }
+  h1 { margin: 0; font-size: 22px; font-weight: 650; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); margin-top: 2px; font-size: 13px; }
+  .tabs { display: flex; gap: 4px; padding: 4px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); margin-bottom: 16px; }
+  .tabs button {
+    flex: 1; min-height: 40px; border: 0; border-radius: 9px; background: none; color: var(--muted);
+    font: inherit; font-weight: 600; cursor: pointer;
+  }
+  .tabs button[aria-selected="true"] { background: var(--accent); color: var(--accent-text); }
+  button:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  [hidden] { display: none !important; }
+
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; margin-bottom: 12px; }
+  .verdict { display: flex; align-items: center; gap: 12px; }
+  .badge { flex: none; width: 40px; height: 40px; border-radius: 50%; display: grid; place-items: center; font-weight: 700; font-size: 18px; }
+  .verdict h2 { margin: 0; font-size: 17px; font-weight: 650; }
+  .verdict p { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+  .lv-ok { color: var(--ok); background: var(--ok-bg); }
+  .lv-info { color: var(--note); background: var(--note-bg); }
+  .lv-warn { color: var(--warn); background: var(--warn-bg); }
+  .lv-fail { color: var(--fail); background: var(--fail-bg); }
+
+  dl { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 10px 16px; }
+  dt { color: var(--muted); }
+  dd { margin: 0; word-break: break-word; text-align: right; font-variant-numeric: tabular-nums; }
+
+  .actions { display: flex; gap: 8px; margin-bottom: 12px; }
+  .btn {
+    min-height: 40px; padding: 0 16px; border-radius: 9px; border: 1px solid var(--line); background: var(--surface);
+    color: var(--text); font: inherit; font-weight: 600; cursor: pointer;
+  }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  .btn:disabled { opacity: .55; cursor: default; }
+
+  .checks { list-style: none; margin: 0; padding: 0; }
+  .checks li { border-top: 1px solid var(--line); }
+  .checks li:first-child { border-top: 0; }
+  details > summary { list-style: none; display: flex; align-items: center; gap: 10px; min-height: 48px; cursor: pointer; padding: 6px 0; }
+  details > summary::-webkit-details-marker { display: none; }
+  .pill { flex: none; min-width: 64px; text-align: center; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 650; }
+  .check-title { flex: 1; font-weight: 550; }
+  .chev { flex: none; width: 8px; height: 8px; border-right: 2px solid var(--muted); border-bottom: 2px solid var(--muted); transform: rotate(45deg); }
+  details[open] .chev { transform: rotate(225deg); }
+  .detail { margin: 0 0 12px; color: var(--muted); font-size: 14px; }
+
+  .row { display: flex; align-items: center; gap: 16px; min-height: 64px; padding: 10px 0; border-top: 1px solid var(--line); }
+  .row:first-child { border-top: 0; }
+  .row .text { flex: 1; }
+  .row .title { font-weight: 550; }
+  .row .note { color: var(--muted); font-size: 13px; margin-top: 1px; }
+  .switch { position: relative; flex: none; width: 48px; height: 28px; }
+  .switch input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+  .switch .track { position: absolute; inset: 0; border-radius: 999px; background: var(--line); transition: background-color .12s; pointer-events: none; }
+  .switch .track::after { content: ""; position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%; background: #fff; transition: transform .12s; }
+  .switch input:checked + .track { background: var(--accent); }
+  .switch input:checked + .track::after { transform: translateX(20px); }
+  .switch input:disabled { cursor: default; }
+  .switch input:disabled + .track { opacity: .45; }
+  .row .fixed { flex: none; color: var(--muted); font-size: 13px; }
+
+  .section-title { margin: 20px 4px 8px; color: var(--muted); font-size: 12px; font-weight: 650; letter-spacing: .06em; text-transform: uppercase; }
+  #toast { position: fixed; left: 16px; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom)); max-width: 608px; margin: 0 auto;
+    padding: 12px 16px; border-radius: 10px; background: var(--text); color: var(--bg); font-size: 14px; }
+  .empty { color: var(--muted); padding: 8px 0; }
+  @media (prefers-reduced-motion: reduce) { .switch .track, .switch .track::after { transition: none; } }
 </style>
 </head>
 <body>
-<h1>susfs_guard_lkm</h1>
-<div id="rows"></div>
-<div id="msg"></div>
+<main>
+  <header>
+    <h1 id="title">SUSFS (LKM Edition)</h1>
+    <div class="sub" id="subtitle">Reading module state</div>
+  </header>
+
+  <div class="tabs" role="tablist" aria-label="Sections">
+    <button role="tab" id="tab-overview" aria-controls="panel-overview" aria-selected="true">Overview</button>
+    <button role="tab" id="tab-health" aria-controls="panel-health" aria-selected="false">Health</button>
+    <button role="tab" id="tab-options" aria-controls="panel-options" aria-selected="false">Options</button>
+  </div>
+
+  <section id="panel-overview" role="tabpanel" aria-labelledby="tab-overview">
+    <div class="card verdict">
+      <div class="badge lv-info" id="verdict-badge" aria-hidden="true">?</div>
+      <div>
+        <h2 id="verdict-title">Checking</h2>
+        <p id="verdict-text">Running the health checks.</p>
+      </div>
+    </div>
+    <div class="card"><dl id="facts"></dl></div>
+  </section>
+
+  <section id="panel-health" role="tabpanel" aria-labelledby="tab-health" hidden>
+    <div class="actions">
+      <button class="btn primary" id="run">Run checks</button>
+      <button class="btn" id="copy" disabled>Copy report</button>
+    </div>
+    <div class="card"><ul class="checks" id="checks"></ul></div>
+  </section>
+
+  <section id="panel-options" role="tabpanel" aria-labelledby="tab-options" hidden>
+    <div class="section-title">Logging and traces</div>
+    <div class="card" id="toggles"></div>
+    <div class="section-title">Handled elsewhere</div>
+    <div class="card" id="fixed"></div>
+  </section>
+</main>
+<div id="toast" role="status" aria-live="polite" hidden></div>
+
 <script>
-// One entry per node toggle.sh accepts; the command line is built from these constants only.
-var TOGGLES = [
-  { key: "enable_log", title: "Kernel log", note: "/proc/susfs_enable_log" },
-  { key: "avc_spoof", title: "AVC log spoof", note: "/proc/susfs_avc_spoof" }
-];
-var SCRIPT = "/data/adb/modules/susfs_guard_lkm/toggle.sh";
+"use strict";
+var DIR = "/data/adb/modules/susfs_guard_lkm/";
 var seq = 0;
 
 // ksu.exec reports through a named global callback: (errno, stdout, stderr).
-function run(args) {
+function run(script, args) {
   return new Promise(function (resolve) {
-    var name = "susfs_cb_" + (seq++);
-    window[name] = function (errno, out, err) {
-      delete window[name];
-      resolve({ code: errno, out: String(out || ""), err: String(err || "") });
+    var cb = "susfs_cb_" + (seq++);
+    window[cb] = function (code, out, err) {
+      delete window[cb];
+      resolve({ code: code, out: String(out || ""), err: String(err || "") });
     };
-    window.ksu.exec("/system/bin/sh " + SCRIPT + " " + args, "{}", name);
+    window.ksu.exec("/system/bin/sh " + DIR + script + (args ? " " + args : ""), "{}", cb);
   });
 }
 
-function say(text) { document.getElementById("msg").textContent = text; }
+function el(tag, cls, text) {
+  var e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
 
-function parse(out) {
-  var state = {};
+function pairs(out) {
+  var o = {};
   out.split("\n").forEach(function (line) {
     var i = line.indexOf("=");
-    if (i > 0) state[line.slice(0, i)] = line.slice(i + 1);
+    if (i > 0) o[line.slice(0, i)] = line.slice(i + 1);
   });
-  return state;
+  return o;
 }
 
-// selinux_hide has no switch: see susfs_selinux_hide.c for why this module does not offer one.
-// "native" means the installed root manager's own kernel patch already answers this, so a
-// second one here would fight it. "none" and "unavailable" are both warnings: this module has
-// no override of its own, so there is nothing backing the feature either way.
-var SELINUX_HIDE_TEXT = {
-  native: { text: "handled by your root manager (kernel patch has selinux_hide built in)", warn: false },
-  none: { text: "Requires KernelSU or a supported fork (SukiSU-Ultra, BakaSU, KernelSU-Next, backslashxx) for this feature. This module does not implement it on its own.", warn: true },
-  unavailable: { text: "/proc/susfs_selinux_hide missing (module not loaded)", warn: true }
+var LEVELS = {
+  fail: { label: "Problem", rank: 3, mark: "!" },
+  warn: { label: "Warning", rank: 2, mark: "!" },
+  info: { label: "Note", rank: 1, mark: "i" },
+  ok: { label: "OK", rank: 0, mark: "\u2713" }
 };
 
-function renderSelinuxHide(value) {
-  var info = SELINUX_HIDE_TEXT[value] || SELINUX_HIDE_TEXT.unavailable;
-  var label = document.createElement("label");
-  var text = document.createElement("span");
-  text.textContent = "SELinux hide";
-  var note = document.createElement("small");
-  if (info.warn) note.className = "warn";
-  note.textContent = info.text;
-  text.appendChild(note);
-  label.appendChild(text);
-  return label;
+var state = { facts: {}, checks: [], toggles: {} };
+var toastTimer = 0;
+
+function toast(text) {
+  var t = document.getElementById("toast");
+  t.textContent = text;
+  t.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(function () { t.hidden = true; }, 2600);
 }
 
-function render(state) {
-  var rows = document.getElementById("rows");
-  rows.textContent = "";
-  TOGGLES.forEach(function (t) {
-    var value = state[t.key];
-    var label = document.createElement("label");
-    var text = document.createElement("span");
-    text.textContent = t.title;
-    var note = document.createElement("small");
-    note.textContent = value === "unavailable" ? t.note + " (module not loaded)" : t.note;
-    text.appendChild(note);
-    var box = document.createElement("input");
-    box.type = "checkbox";
-    box.checked = value === "1";
-    box.disabled = value !== "0" && value !== "1";
-    box.addEventListener("change", function () {
-      var want = box.checked ? "1" : "0";
-      run("set " + t.key + " " + want).then(function (r) {
-        if (r.code !== 0) say(t.title + " not changed: " + (r.err.trim() || "exit " + r.code));
-        else say(t.title + (want === "1" ? " on" : " off") + ", kept across reboots");
-        refresh();
-      });
-    });
-    label.appendChild(text);
-    label.appendChild(box);
-    rows.appendChild(label);
+// Tabs
+var TABS = ["overview", "health", "options"];
+function select(name) {
+  TABS.forEach(function (n) {
+    var on = n === name;
+    document.getElementById("tab-" + n).setAttribute("aria-selected", String(on));
+    document.getElementById("panel-" + n).hidden = !on;
   });
-  rows.appendChild(renderSelinuxHide(state.selinux_hide));
+}
+TABS.forEach(function (n) {
+  document.getElementById("tab-" + n).addEventListener("click", function () { select(n); });
+});
+
+// Overview
+function fact(label, value) {
+  var dl = document.getElementById("facts");
+  dl.appendChild(el("dt", "", label));
+  dl.appendChild(el("dd", "", value));
 }
 
-function refresh() {
-  run("get").then(function (r) { render(parse(r.out)); });
+function renderFacts() {
+  var f = state.facts;
+  var dl = document.getElementById("facts");
+  dl.textContent = "";
+  document.getElementById("title").textContent = f.name || "SUSFS (LKM Edition)";
+  document.getElementById("subtitle").textContent = (f.version || "unknown version") + (f.susfs_base ? "  /  SUSFS " + f.susfs_base : "");
+  fact("Module", f.loaded === "1" ? "Loaded" : "Not loaded");
+  fact("Kernel", f.kernel || "unknown");
+  fact("Load stage", f.early_load === "1" ? "Early (post-fs-data hook)" : "Manager boot stage");
+  fact("Bootloop guard", f.guard_tripped === "1" ? "Tripped" : (Number(f.guard_fails) > 0 ? f.guard_fails + " early boot(s) recorded" : "Quiet"));
+  fact("Module state", f.disabled === "1" ? "Disabled" : "Enabled");
+  if (f.card) fact("Last boot", f.card);
 }
 
-if (window.ksu && window.ksu.exec) refresh();
-else say("Open this page from the KernelSU manager.");
+function worst() {
+  var top = "ok";
+  state.checks.forEach(function (c) { if (LEVELS[c.level].rank > LEVELS[top].rank) top = c.level; });
+  return top;
+}
+
+function renderVerdict() {
+  var badge = document.getElementById("verdict-badge");
+  var title = document.getElementById("verdict-title");
+  var text = document.getElementById("verdict-text");
+  if (!state.checks.length) return;
+  var counts = { fail: 0, warn: 0, info: 0, ok: 0 };
+  state.checks.forEach(function (c) { counts[c.level]++; });
+  var top = worst();
+  badge.className = "badge lv-" + top;
+  badge.textContent = LEVELS[top].mark;
+  if (top === "fail") {
+    title.textContent = counts.fail + (counts.fail === 1 ? " problem needs attention" : " problems need attention");
+  } else if (top === "warn") {
+    title.textContent = counts.warn + (counts.warn === 1 ? " warning" : " warnings");
+  } else {
+    title.textContent = "All checks passed";
+  }
+  text.textContent = state.checks.length + " checks run. Open Health for the details.";
+}
+
+// Health
+function renderChecks() {
+  var ul = document.getElementById("checks");
+  ul.textContent = "";
+  var sorted = state.checks.slice().sort(function (a, b) { return LEVELS[b.level].rank - LEVELS[a.level].rank; });
+  sorted.forEach(function (c) {
+    var li = el("li");
+    var d = el("details");
+    var s = el("summary");
+    s.appendChild(el("span", "pill lv-" + c.level, LEVELS[c.level].label));
+    s.appendChild(el("span", "check-title", c.title));
+    s.appendChild(el("span", "chev"));
+    d.appendChild(s);
+    d.appendChild(el("p", "detail", c.detail));
+    if (c.level === "fail" || c.level === "warn") d.open = true;
+    li.appendChild(d);
+    ul.appendChild(li);
+  });
+  if (!sorted.length) ul.appendChild(el("li", "empty", "No result. Run the checks again."));
+  document.getElementById("copy").disabled = !sorted.length;
+}
+
+function parseChecks(out) {
+  var list = [];
+  out.split("\n").forEach(function (line) {
+    var p = line.split("|");
+    if (p.length >= 4 && LEVELS[p[1]]) list.push({ id: p[0], level: p[1], title: p[2], detail: p.slice(3).join("|") });
+  });
+  return list;
+}
+
+function runChecks() {
+  var btn = document.getElementById("run");
+  btn.disabled = true;
+  btn.textContent = "Running";
+  return run("check.sh").then(function (r) {
+    state.checks = parseChecks(r.out);
+    renderChecks();
+    renderVerdict();
+    btn.disabled = false;
+    btn.textContent = "Run checks";
+    if (r.code !== 0 && !state.checks.length) toast("The checks did not run: " + (r.err.trim() || "exit " + r.code));
+  });
+}
+document.getElementById("run").addEventListener("click", runChecks);
+
+function report() {
+  var f = state.facts;
+  var lines = [
+    (f.name || "SUSFS") + " " + (f.version || "") + " (SUSFS " + (f.susfs_base || "?") + ")",
+    "Kernel: " + (f.kernel || "?"),
+    "State: " + (f.card || "?"),
+    ""
+  ];
+  state.checks.forEach(function (c) { lines.push("[" + LEVELS[c.level].label + "] " + c.title + ": " + c.detail); });
+  return lines.join("\n");
+}
+
+// The manager's WebView may not expose the async clipboard API, so fall back to a selection.
+function copyText(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(text);
+  return new Promise(function (resolve, reject) {
+    var ta = el("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    var ok = false;
+    try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+    document.body.removeChild(ta);
+    ok ? resolve() : reject(new Error("copy refused"));
+  });
+}
+document.getElementById("copy").addEventListener("click", function () {
+  copyText(report()).then(function () { toast("Report copied"); }, function () { toast("Copy is not available here"); });
+});
+
+// Options
+var TOGGLES = [
+  { key: "enable_log", title: "Kernel log", note: "Let the module write to the kernel log. Leave off for daily use." },
+  { key: "avc_spoof", title: "AVC log spoof", note: "Hide SELinux denials caused by root from the audit log." }
+];
+var SELINUX_HIDE = {
+  native: "Handled by your root manager's own kernel patch.",
+  none: "Needs KernelSU or a supported fork. This module does not provide it alone.",
+  unavailable: "Not available until the module is loaded."
+};
+
+function renderOptions() {
+  var box = document.getElementById("toggles");
+  box.textContent = "";
+  TOGGLES.forEach(function (t) {
+    var v = state.toggles[t.key];
+    var row = el("label", "row");
+    var text = el("span", "text");
+    text.appendChild(el("div", "title", t.title));
+    text.appendChild(el("div", "note", v === "unavailable" || v === undefined ? "Available once the module is loaded." : t.note));
+    var sw = el("span", "switch");
+    var input = el("input");
+    input.type = "checkbox";
+    input.setAttribute("role", "switch");
+    input.checked = v === "1";
+    input.disabled = v !== "0" && v !== "1";
+    input.addEventListener("change", function () { setToggle(t, input); });
+    sw.appendChild(input);
+    sw.appendChild(el("span", "track"));
+    row.appendChild(text);
+    row.appendChild(sw);
+    box.appendChild(row);
+  });
+  var fixed = document.getElementById("fixed");
+  fixed.textContent = "";
+  var row = el("div", "row");
+  var text = el("span", "text");
+  text.appendChild(el("div", "title", "SELinux hide"));
+  text.appendChild(el("div", "note", SELINUX_HIDE[state.toggles.selinux_hide] || SELINUX_HIDE.unavailable));
+  row.appendChild(text);
+  fixed.appendChild(row);
+}
+
+function setToggle(t, input) {
+  var want = input.checked ? "1" : "0";
+  input.disabled = true;
+  run("toggle.sh", "set " + t.key + " " + want).then(function (r) {
+    input.disabled = false;
+    if (r.code !== 0) {
+      input.checked = !input.checked;
+      toast(t.title + " was not changed: " + (r.err.trim() || "exit " + r.code));
+      return;
+    }
+    state.toggles[t.key] = want;
+    toast(t.title + (want === "1" ? " on" : " off") + ". Kept across reboots.");
+  });
+}
+
+function boot() {
+  if (!(window.ksu && window.ksu.exec)) {
+    document.getElementById("subtitle").textContent = "Open this page from the root manager";
+    document.getElementById("verdict-title").textContent = "Not connected";
+    document.getElementById("verdict-text").textContent = "This page talks to the module through the manager.";
+    return;
+  }
+  Promise.all([run("status.sh"), run("toggle.sh", "get")]).then(function (r) {
+    state.facts = pairs(r[0].out);
+    state.toggles = pairs(r[1].out);
+    renderFacts();
+    renderOptions();
+    return runChecks();
+  });
+}
+boot();
 </script>
 </body>
 </html>
