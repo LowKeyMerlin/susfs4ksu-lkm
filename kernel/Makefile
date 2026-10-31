@@ -11,7 +11,7 @@ obj-m += susfs_guard_lkm.o
 susfs_guard_lkm-objs := susfs_main.o patch_memory.o symbol_resolver.o lsm_hook.o \
               susfs_uname.o susfs_kstat.o sus_map.o sus_path.o sus_mount.o \
               spoof_cmdline.o susfs_open_redirect.o susfs_enable_log.o \
-              susfs_avc_spoof.o susfs_selinux_hide.o susfs_supercall.o susfs_hide_syms.o imports_guard.o \
+              susfs_avc_spoof.o susfs_selinux_hide.o susfs_selinux_ctx.o susfs_supercall.o susfs_hide_syms.o imports_guard.o \
               ksu_umount_gate.o ksu_allow_gate.o susfs_fp_hook.o susfs_opath.o susfs_or_entry.o \
               susfs_create_gate.o susfs_priority_filter.o \
               fsnotify_lifetime.o btf_layout.o sus_dirent.o

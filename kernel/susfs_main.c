@@ -51,6 +51,7 @@ static const char *const susfs_self_hide_paths[] = {
     "/proc/susfs_enable_log",
     "/proc/susfs_avc_spoof",
     "/proc/susfs_selinux_hide",
+    "/proc/susfs_selinux_ctx",
     SUSFS_HIDE_MODULES_NODE,
     SUSFS_HIDE_MOUNTS_NODE,
     /* sus_path's own interface (the rule listing): it goes through the same table it
@@ -324,6 +325,10 @@ static struct susfs_layer {
     { "priority_filter",	susfs_priority_filter_init,	susfs_priority_filter_exit, false, SUSFS_FEAT_PRIORITY_FILTER },
     /* Read-only detection, nothing to arm: NOT fatal either way. */
     { "selinux_hide",	susfs_selinux_hide_init,	susfs_selinux_hide_exit, false, -1 },
+    /* Opt-in, config-driven, nothing armed at load: the probes go up only once the admin's list
+     * (/proc/susfs_selinux_ctx) stops being empty.  NOT fatal: without it those three functions
+     * keep answering the kernel's own way. */
+    { "selinux_ctx",	susfs_selinux_ctx_init,		susfs_selinux_ctx_exit, false, -1 },
 };
 
 /* Diagnostic: make one layer's init fail, by 1-based index, to exercise the rollback path
@@ -336,7 +341,7 @@ static struct susfs_layer {
  *   1 fp_hook   2 ksu_umount_gate  3 ksu_allow_gate  4 lsm_hook   5 sus_path
  *   6 create_gate  7 opath  8 dirent  9 uname  10 kstat  11 sus_map  12 sus_mount
  *   13 cmdline  14 open_redirect  15 enable_log  16 avc_spoof  17 supercall  18 hide_syms  19 priority_filter
- *   20 selinux_hide
+ *   20 selinux_hide  21 selinux_ctx
  */
 static int fail_layer;
 module_param_named(fail_layer, fail_layer, int, 0644);

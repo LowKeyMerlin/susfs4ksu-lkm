@@ -152,6 +152,12 @@ void susfs_avc_spoof_exit(void);
 int susfs_selinux_hide_init(void);
 void susfs_selinux_hide_exit(void);
 
+/* /proc/susfs_selinux_ctx: hides an admin-chosen list of SELinux context types (empty, hooks
+ * unarmed, by default - see susfs_selinux_ctx.c) from apps probing /sys/fs/selinux/{context,access}
+ * and /proc/self/attr/*. */
+int susfs_selinux_ctx_init(void);
+void susfs_selinux_ctx_exit(void);
+
 int susfs_supercall_init(void);
 void susfs_supercall_exit(void);
 /* True when the sys_call_table hook could not arm and the supercall is delivered
