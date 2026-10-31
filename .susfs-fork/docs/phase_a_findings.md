@@ -80,6 +80,7 @@ Needs verification or a port (narrow):
 6. p4-selinux: selinux_hide as a new file with fork detection.
 7. p5-webui: module WebUI toggles.
 8. WildKernels: 16K fixup fold (folds into p1-612), dentry null guards (fold into Phase 3).
+   Resolved below: neither applies. See "WildKernels and pershoot audit".
 
 The memory-safety and statfs/cmdline fix batches need no code: they are already handled or are moot
 because the LKM uses snapshots, real ids, atomic buffer swaps and kfree_rcu rather than the in-tree
@@ -165,6 +166,57 @@ against `android16-6.12` (6.12.96) for the same files:
 No bug found. One comment in `sus_mount.c` was wrong (it described `mnt_id_ctr` as always
 `atomic64_t`, which is only true through 6.12) and has been corrected to state the verified,
 version-dependent type and why the cast is still safe.
+
+## WildKernels and pershoot audit: nothing to port
+
+Checked simonpunk/susfs4ksu (`abi_drift.py` against a freshly fetched clone: zero new commits
+to `kernel_patches/` on any stable branch beyond what `triaged` already covers), then
+WildKernels/GKI_KernelSU_SUSFS and gitlab.com/pershoot/susfs4ksu for anything that affects this
+module and is not yet reflected here. Nothing does, for one structural reason that applies to
+every candidate found: WildKernels and pershoot both build SUSFS the way upstream ships it, text
+patched into the kernel tree and compiled in with the KSU driver. This module never patches
+kernel source or KSU source. It loads standalone and reaches both through kallsyms, kprobes and
+a syscall-table entry. Most of what those two repos fix is therefore patch-context drift between
+an evolving kernel tree and a text patch, something an LKM cannot have because it has no text
+patch to go stale.
+
+Specific candidates checked, each a mechanical reason, not a guess:
+
+- WildKernels' `fs/notify/fdinfo.c` "fake patch" fix (`mark->ignored_mask` -> 
+  `inotify_mark_user_mask(mark)`, commit 9cead8e): fixes a text-patch hunk that no longer matches
+  the kernel's own `inotify_fdinfo()` source after an AOSP refactor. `susfs_kstat.c`'s inotify
+  hook never reads that field; `kstat_fdinfo_inotify()` parses the RENDERED fdinfo line as text
+  (`kstat_fdinfo_hex()` et al.), so whichever internal helper the kernel used to print the number
+  is invisible to us. Not applicable.
+- WildKernels' `__fold_filemap_fixup_entry` stub (commit b435a9d) and pershoot's "Toolkit
+  coexistence" / "no features" resyncs of `kernel_patches/fs/susfs.c` (commits 161c058,
+  6387756): all three patch code that runs INSIDE the kernel's `show_map_vma()`/`fs/susfs.c`,
+  i.e. code the built-in patch inserts into the function itself. Our `susfs_kstat.c` and
+  `susfs_open_redirect.c` hook `show_map_vma` with a kretprobe that fires AFTER the real,
+  unpatched function has already run (see the note above `struct kretprobe krp_kstat_map_vma`),
+  so the kernel's own 16K fixup-fold call already ran, unconditionally, before we ever see the
+  line - there is no early-return branch on our side for it to skip. `fs/susfs.c` does not exist
+  in this module at all; 6387756's underlying upstream commit (44a893a6, NULL deref in
+  get_enabled_features) was already independently confirmed handled in `susfs_supercall.c`.
+  Not applicable, on both counts.
+- pershoot's SELinux time side-channel fix (commit 35b2a01, 256 lines of
+  `security/selinux/hooks.c` and `selinuxfs.c`): migrates KernelSU-Next's OWN `selinux_hide`
+  implementation from a `fake_state` swap to the `backup_sepolicy`-based `_with_policy` calls, to
+  close a timing gap between a hidden and a real context lookup. This is a fix to the exact
+  mechanism `susfs_selinux_hide.c`'s header explains we do not reimplement: `backup_sepolicy` is
+  created and freed by KernelSU's own policy-apply path, and a correct second copy would mean
+  rebuilding this very mechanism, timing fix included. Since we only detect whether the running
+  KernelSU has `selinux_hide` at all, a timing fix inside that feature's native implementation is
+  not ours to carry. Not applicable.
+- "Dentry null guards": no commit matching this was found in WildKernels' current history
+  (checked commit messages and `.github/actions/susfs*` content for `dentry`/`d_inode`/
+  `IS_ROOT`). Every direct `->d_inode` dereference in this module's kprobe context is already
+  guarded (`sus_mount_ident_add()`: `if (!root || !root->d_inode) return;`); every `d_inode()`
+  call elsewhere runs on a dentry a successful path lookup already produced. Closing this item:
+  either it was resolved upstream before this audit, or it did not name a real gap.
+
+Net result: both repos' current fixes target the built-in compile-time architecture this module
+does not share. No patch, workaround or code change is needed from either source right now.
 
 ## Closing outcomes (p0, p1-618, p3, p4, p5)
 
