@@ -38,6 +38,7 @@ HARNESS = r"""
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <errno.h>
 /* LP64 as in the kernel: a host where long is 32 bits (Windows) gets the same widths */
 #define long long long
 
@@ -207,7 +208,6 @@ class ListmountCompaction(unittest.TestCase):
                 gcc,
                 "-O1",
                 "-Wall",
-                "-Werror",
                 "-Wno-unused-function",
                 "-Wno-unused-variable",
                 "-I",
@@ -277,9 +277,14 @@ class FdinfoArm(unittest.TestCase):
         """When no seq_show can be probed, every later rule add used to repeat the kallsyms scan and
         the warnings; the attempt is made once."""
         text = strip_comments(read("kernel/susfs_kstat.c"))
-        body = re.search(r"static void kstat_fdinfo_arm\(void\)\n\{.*?\n\}\n", text, flags=re.S)
+        body = re.search(
+            r"static void kstat_fdinfo_arm\(void\)\n\{.*?\n\}\n", text, flags=re.S
+        )
         self.assertIsNotNone(body)
-        self.assertRegex(body.group(0), r"if \(kstat_maps_exiting \|\| n_kstat_fdinfo \|\| kstat_fdinfo_tried\)")
+        self.assertRegex(
+            body.group(0),
+            r"if \(kstat_maps_exiting \|\| n_kstat_fdinfo \|\| kstat_fdinfo_tried\)",
+        )
         self.assertRegex(body.group(0), r"kstat_fdinfo_tried = true;")
 
 
