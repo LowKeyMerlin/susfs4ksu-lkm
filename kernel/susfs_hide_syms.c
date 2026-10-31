@@ -565,7 +565,9 @@ static const struct seq_operations *modules_op_target;
  * validated (see hide_syms_resolve_show()) - this gate is the only identity test there is. */
 static bool hide_syms_iter_plausible(const struct kallsym_iter_local *it)
 {
-	if (!it->type || !strchr("aAbBdDgGijNnRrSsTtUuVvWw", it->type))
+	/* Any printable type character: the Rust modules on android16-6.12 (ashmem_rust and the kernel
+	 * crate) carry '3', and refusing those lines logged a drift that was not one. */
+	if (it->type < 0x21 || it->type > 0x7e)
 		return false;
 	if (strnlen(it->name, sizeof(it->name)) >= sizeof(it->name))
 		return false;
