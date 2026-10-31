@@ -25,3 +25,21 @@ fi
 echo "disabled=$(flag "$MODDIR/disable")"
 echo "guard_tripped=$(flag "$MODDIR/guard.tripped")"
 echo "guard_fails=$(cat "$MODDIR/guard.fails" 2>/dev/null || echo 0)"
+# Anything but self and none reads as all, as guard.sh does.
+case $(cat "$MODDIR/guard.scope" 2>/dev/null) in
+  self) echo "guard_scope=self" ;;
+  none) echo "guard_scope=none" ;;
+  *) echo "guard_scope=all" ;;
+esac
+
+# What the kernel side reports. The tool is the one the manager ships, so it may be missing.
+SUSFS_BIN=${SUSFS_BIN:-/data/adb/ksu/bin/ksu_susfs}
+if [ -x "$SUSFS_BIN" ]; then
+  echo "susfs_version=$("$SUSFS_BIN" show version 2>/dev/null | head -n 1)"
+  echo "susfs_variant=$("$SUSFS_BIN" show variant 2>/dev/null | head -n 1)"
+  echo "features=$("$SUSFS_BIN" show enabled_features 2>/dev/null | sed -n 's/^CONFIG_KSU_SUSFS_//p' | tr '\n' ',' | sed 's/,$//')"
+fi
+# "mount prefixes: 3/64, rescans=0, recorded=0, hidden_by_identity=1886, learned_ids=76"
+mounts=$(head -n 1 "$PROC/susfs_hide_mounts" 2>/dev/null)
+echo "mount_prefixes=$(printf '%s' "$mounts" | sed -n 's/^mount prefixes: \([0-9]*\/[0-9]*\),.*/\1/p')"
+echo "mounts_hidden=$(printf '%s' "$mounts" | sed -n 's/.*hidden_by_identity=\([0-9]*\).*/\1/p')"

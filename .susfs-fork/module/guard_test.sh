@@ -524,6 +524,33 @@ failboot boot-B1
 failboot boot-B
 check "an unreadable scope means all modules" '[ -f "$T/modules/other_a/disable" ]'
 
+# Scope none turns the boot watch off: nothing is armed, and cut-off boots trip nothing.
+fresh
+echo none >"$M/guard.scope"
+load
+check "scope none still loads the module" loaded
+check "scope none arms no marker" '! armed'
+failboot boot-N1
+failboot boot-N2
+failboot boot-N3
+check "scope none trips on no number of cut-off boots" '! tripped'
+check "scope none leaves this module enabled" '! disabled'
+check "scope none leaves other modules enabled" '[ ! -f "$T/modules/other_a/disable" ]'
+check "scope none loads on the next boot" loaded
+# What an earlier scope left behind is dropped, not held against the next boot.
+fresh
+load
+echo none >"$M/guard.scope"
+echo 1 >"$M/guard.fails"
+failboot boot-N4
+check "switching to none drops the old marker" '! armed'
+check "switching to none drops the failure count" '[ ! -f "$M/guard.fails" ]'
+# Switching back starts a clean count.
+echo all >"$M/guard.scope"
+failboot boot-N5
+check "switching back arms the guard again" armed
+check "switching back does not trip at once" '! tripped'
+
 # Every kind of trip applies the scope.
 fresh
 echo 1 >"$T/probe_rc"

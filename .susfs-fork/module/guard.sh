@@ -23,7 +23,8 @@ GUARD_UP="$MODDIR/guard.up"
 GUARD_CLEAN="$MODDIR/guard.clean"
 # Boots in a row that ended too early without a request for it.
 GUARD_FAILS_FILE="$MODDIR/guard.fails"
-# What a trip disables: "all" modules (default) or only "self". Chosen at install, see customize.sh.
+# What a trip disables: "all" modules (default) or only "self". "none" turns the boot watch off.
+# Chosen at install (see customize.sh) and changed later by scope.sh.
 GUARD_SCOPE_FILE="$MODDIR/guard.scope"
 GUARD_DISABLED="$MODDIR/guard.disabled"
 
@@ -134,11 +135,11 @@ guard_boot_id() {
 }
 
 guard_scope() {
-  if [ "$(cat "$GUARD_SCOPE_FILE" 2>/dev/null)" = self ]; then
-    echo self
-  else
-    echo all
-  fi
+  case $(cat "$GUARD_SCOPE_FILE" 2>/dev/null) in
+    self) echo self ;;
+    none) echo none ;;
+    *) echo all ;;
+  esac
 }
 
 # Disable every other module and list the ones this changed in guard.disabled. A disabled module
@@ -227,6 +228,12 @@ guard_check() {
     guard_log "enabled again after a trip, starting over"
     rm -f "$GUARD_TRIPPED" "$GUARD_ARMED" "$GUARD_UP" "$GUARD_CLEAN" "$GUARD_FAILS_FILE"
   fi
+  # Scope none turns the boot watch off. Nothing is armed, so nothing can trip, and what an
+  # earlier scope left behind must not count against the next boot.
+  if [ "$(guard_scope)" = none ]; then
+    rm -f "$GUARD_ARMED" "$GUARD_UP" "$GUARD_CLEAN" "$GUARD_FAILS_FILE"
+    return 0
+  fi
   cur=$(guard_boot_id)
   if [ -z "$cur" ]; then
     guard_log "cannot identify the boot"
@@ -262,6 +269,7 @@ guard_check() {
 }
 
 guard_arm() {
+  [ "$(guard_scope)" != none ] || return 0
   guard_boot_id >"$GUARD_ARMED.tmp" && mv "$GUARD_ARMED.tmp" "$GUARD_ARMED" || return 1
   sync
 }

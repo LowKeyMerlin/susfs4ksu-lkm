@@ -31,9 +31,11 @@ class Scratch(unittest.TestCase):
         self.modules = self.base / "modules"
         self.mod = self.modules / "susfs_guard_lkm"
         self.mod.mkdir(parents=True)
-        for name in ("status.sh", "check.sh"):
+        for name in ("status.sh", "check.sh", "scope.sh", "early.sh", "hide_mounts.sh"):
             data = (OVERLAY / name).read_bytes().replace(b"\r\n", b"\n")
             (self.mod / name).write_bytes(data)
+        data = (ROOT / "module" / "early-dispatch.sh").read_bytes().replace(b"\r\n", b"\n")
+        (self.mod / "early-dispatch.sh").write_bytes(data)
         put(self.mod / "module.prop",
             "id=susfs_guard_lkm\nname=SUSFS (LKM Edition)\nversion=v1.0.0\nsusfsBase=2.3.0\n"
             "description=Active | boot load | android16-6.12 | SUSFS 2.3.0\n")
@@ -52,6 +54,9 @@ class Scratch(unittest.TestCase):
         self.enforce.write_text("#!/bin/sh\necho Enforcing\n")
         self.enforce.chmod(0o755)
         self.brene_conf = self.base / "brene.conf"
+        self.node = self.base / "hide_node"
+        self.hide_list = self.base / "state" / "hide_mounts.txt"
+        self.legacy = self.base / "legacy.txt"
 
     def env(self):
         return {
@@ -64,11 +69,18 @@ class Scratch(unittest.TestCase):
             "SUSFS_DMESG": self.dmesg.as_posix(),
             "SUSFS_GETENFORCE": self.enforce.as_posix(),
             "SUSFS_BRENE_CONF": self.brene_conf.as_posix(),
+            "SUSFS_BIN": (self.base / "no-such-tool").as_posix(),
+            "HIDE_NODE": self.node.as_posix(),
+            "HIDE_LIST": self.hide_list.as_posix(),
+            "HIDE_LEGACY": self.legacy.as_posix(),
         }
 
-    def run_script(self, name):
-        r = subprocess.run([self.sh, (self.mod / name).as_posix()], capture_output=True, text=True,
-                           env=self.env(), timeout=60)
+    def run_args(self, name, *args):
+        return subprocess.run([self.sh, (self.mod / name).as_posix(), *args], capture_output=True, text=True,
+                              env=self.env(), timeout=60)
+
+    def run_script(self, name, *args):
+        r = self.run_args(name, *args)
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout
 
@@ -222,6 +234,155 @@ class Checks(Scratch):
         put(self.mod / "module.prop", "description=a|b\nline two\n")
         self.sysmod.rmdir()
         self.checks()
+
+
+class Scope(Scratch):
+    def get(self):
+        return self.run_script("scope.sh", "get").strip()
+
+    def test_default_is_all(self):
+        self.assertEqual(self.get(), "scope=all")
+
+    def test_each_scope_round_trips(self):
+        for scope in ("self", "none", "all"):
+            self.run_script("scope.sh", "set", scope)
+            self.assertEqual(self.get(), f"scope={scope}")
+            self.assertEqual((self.mod / "guard.scope").read_text().strip(), scope)
+
+    def test_anything_else_in_the_file_reads_as_all(self):
+        (self.mod / "guard.scope").write_text("garbage\n")
+        self.assertEqual(self.get(), "scope=all")
+
+    def test_an_unknown_scope_is_refused_and_changes_nothing(self):
+        self.run_script("scope.sh", "set", "self")
+        r = self.run_args("scope.sh", "set", "everything")
+        self.assertEqual(r.returncode, 64)
+        self.assertEqual(self.get(), "scope=self")
+        self.assertFalse((self.mod / "guard.scope.tmp").exists())
+
+    def test_status_reports_it(self):
+        self.run_script("scope.sh", "set", "none")
+        out = dict(l.split("=", 1) for l in self.run_script("status.sh").splitlines())
+        self.assertEqual(out["guard_scope"], "none")
+        (self.mod / "guard.scope").write_text("garbage\n")
+        out = dict(l.split("=", 1) for l in self.run_script("status.sh").splitlines())
+        self.assertEqual(out["guard_scope"], "all")
+
+
+class Facts(Scratch):
+    def test_kernel_side_facts(self):
+        tool = self.base / "ksu_susfs"
+        tool.write_text("#!/bin/sh\ncase \"$*\" in\n"
+                        "  \"show version\") echo v2.3.0 ;;\n"
+                        "  \"show variant\") echo GKI-LKM ;;\n"
+                        "  \"show enabled_features\") printf 'SUSFS_LKM_MODULES\\nCONFIG_KSU_SUSFS_SUS_PATH\\n"
+                        "CONFIG_KSU_SUSFS_SUS_MOUNT\\n' ;;\nesac\n")
+        tool.chmod(0o755)
+        put(self.proc / "susfs_hide_mounts",
+            "mount prefixes: 3/64, rescans=0, recorded=0, hidden_by_identity=1886, learned_ids=76\n"
+            "prefixes: /data/adb/ /system/etc/hosts\n")
+        env = self.env()
+        env["SUSFS_BIN"] = tool.as_posix()
+        r = subprocess.run([self.sh, (self.mod / "status.sh").as_posix()], capture_output=True, text=True,
+                           env=env, timeout=60)
+        out = dict(l.split("=", 1) for l in r.stdout.splitlines())
+        self.assertEqual((out["susfs_version"], out["susfs_variant"]), ("v2.3.0", "GKI-LKM"))
+        self.assertEqual(out["features"], "SUS_PATH,SUS_MOUNT")
+        self.assertEqual((out["mount_prefixes"], out["mounts_hidden"]), ("3/64", "1886"))
+
+    def test_missing_tool_and_node_leave_the_facts_empty(self):
+        out = dict(l.split("=", 1) for l in self.run_script("status.sh").splitlines())
+        self.assertNotIn("features", out)
+        self.assertEqual((out["mount_prefixes"], out["mounts_hidden"]), ("", ""))
+
+
+class EarlyLoad(Scratch):
+    def test_on_installs_the_hook_and_sets_the_marker(self):
+        self.run_script("early.sh", "on")
+        self.assertEqual(self.hook.read_bytes(), (self.mod / "early-dispatch.sh").read_bytes())
+        self.assertTrue((self.mod / "early_load").exists())
+        self.assertEqual(self.run_script("early.sh", "status").strip(), "early_load=1")
+        self.run_script("early.sh", "on")
+
+    def test_on_refuses_a_hook_that_is_not_ours(self):
+        self.hook.write_text("#!/bin/sh\necho someone else\n")
+        r = self.run_args("early.sh", "on")
+        self.assertEqual(r.returncode, 1)
+        self.assertFalse((self.mod / "early_load").exists())
+        self.assertIn("someone else", self.hook.read_text())
+
+    def test_off_removes_the_marker_and_keeps_the_hook(self):
+        self.run_script("early.sh", "on")
+        self.run_script("early.sh", "off")
+        self.assertFalse((self.mod / "early_load").exists())
+        self.assertTrue(self.hook.exists())
+        self.assertEqual(self.run_script("early.sh", "status").strip(), "early_load=0")
+
+
+class HideMounts(Scratch):
+    def setUp(self):
+        super().setUp()
+        self.node.write_text("mount prefixes: 2/64, rescans=0, recorded=0, hidden_by_identity=5, learned_ids=2\n"
+                             "prefixes: /data/adb/ /system/etc/hosts\n")
+
+    def write_list(self, text):
+        self.hide_list.parent.mkdir(exist_ok=True)
+        self.hide_list.write_bytes(text.encode())
+
+    def paths(self):
+        return self.run_script("hide_mounts.sh", "list").split()
+
+    def test_first_use_seeds_common_module_mounts(self):
+        self.assertEqual(self.paths(), ["/system/etc/hosts", "/apex/com.android.art/bin/dex2oat64"])
+
+    def test_first_use_takes_over_the_old_list(self):
+        self.legacy.write_text("# mine\n/odm/etc/x\n")
+        self.assertEqual(self.paths(), ["/odm/etc/x"])
+
+    def test_apply_sends_only_what_the_kernel_lacks(self):
+        self.write_list("# note\n/system/etc/hosts\r\n/apex/x/dex2oat64\n\n")
+        self.assertEqual(self.run_script("hide_mounts.sh", "apply").strip(), "added=1 kept=1 invalid=0 failed=0")
+        self.assertEqual(self.node.read_text(), "add /apex/x/dex2oat64\n")
+
+    def test_unusable_paths_are_counted_and_never_sent(self):
+        self.write_list("relative/p\n/with space\n/a/../b\n/ok\n")
+        self.assertEqual(self.run_script("hide_mounts.sh", "apply").strip(), "added=1 kept=0 invalid=3 failed=0")
+        self.assertEqual(self.node.read_text(), "add /ok\n")
+
+    def test_apply_without_the_module_says_so(self):
+        self.node.unlink()
+        r = self.run_args("hide_mounts.sh", "apply")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("not loaded", r.stderr)
+
+    def test_add_reaches_the_kernel_and_the_list_once(self):
+        self.run_script("hide_mounts.sh", "add", "/new/mount")
+        self.assertEqual(self.node.read_text(), "add /new/mount\n")
+        self.run_script("hide_mounts.sh", "add", "/new/mount")
+        self.assertEqual(self.paths().count("/new/mount"), 1)
+
+    def test_add_keeps_lines_apart_when_the_file_has_no_final_newline(self):
+        self.write_list("/a")
+        self.run_script("hide_mounts.sh", "add", "/b")
+        self.assertEqual(self.paths(), ["/a", "/b"])
+
+    def test_add_without_the_module_is_kept_for_the_next_load(self):
+        self.node.unlink()
+        self.run_script("hide_mounts.sh", "add", "/later")
+        self.assertIn("/later", self.paths())
+
+    def test_remove_drops_it_from_both(self):
+        self.write_list("/a\n/b\n")
+        self.run_script("hide_mounts.sh", "remove", "/a")
+        self.assertEqual(self.paths(), ["/b"])
+        self.assertEqual(self.node.read_text(), "del /a\n")
+
+    def test_a_bad_path_is_refused_before_anything_changes(self):
+        self.write_list("/a\n")
+        for cmd in ("add", "remove"):
+            self.assertEqual(self.run_args("hide_mounts.sh", cmd, "bad path").returncode, 64)
+        self.assertEqual(self.paths(), ["/a"])
+        self.assertIn("prefixes:", self.node.read_text())
 
 
 class Page(unittest.TestCase):

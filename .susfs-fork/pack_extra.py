@@ -36,7 +36,9 @@ OVERLAY = pathlib.Path(__file__).resolve().parent / "module"
 # Files taken from .susfs-fork/module/, and where they go in the zip.
 WRAPPER = "load.sh"
 INSTALLER = "customize.sh"
-ADDED = {"guard.sh": "guard.sh", "service.sh": "service.sh", "status.sh": "status.sh", "check.sh": "check.sh"}
+ADDED = {name: name for name in (
+    "guard.sh", "service.sh", "status.sh", "check.sh", "early.sh", "hide_mounts.sh", "boot-completed.sh",
+    "scope.sh")}
 LOADER = "load.upstream.sh"
 INSTALLER_UPSTREAM = "customize.upstream.sh"
 # What upstream's script of that name becomes in the zip.
