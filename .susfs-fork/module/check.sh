@@ -9,7 +9,6 @@
 MODDIR=${0%/*}
 PROC=${SUSFS_PROC:-/proc}
 SYS_MODULE=${SUSFS_SYS_MODULE:-/sys/module/susfs_guard_lkm}
-MODULES_DIR=${SUSFS_MODULES_DIR:-${MODDIR%/*}}
 EARLY_HOOK=${SUSFS_EARLY_HOOK:-/data/adb/post-fs-data.d/00-susfs-guard-lkm.sh}
 TIMEOUT_LOG=${SUSFS_TIMEOUT_LOG:-/data/adb/susfsload_timeout.log}
 DMESG=${SUSFS_DMESG:-dmesg}
