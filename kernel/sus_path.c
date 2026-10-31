@@ -31,6 +31,7 @@
 #include <trace/events/syscalls.h>
 #include <asm/syscall.h>
 #include <linux/sched/task_stack.h>	/* task_pt_regs(), for the fstat check */
+#include <linux/fdtable.h>	/* the zygote re-open check reads the caller's descriptor table */
 #include <linux/uaccess.h>
 #include <linux/syscalls.h>
 #include <linux/slab.h>
@@ -1319,7 +1320,7 @@ bool sus_path_rules_present(void)
  * FileDescriptorInfo::CreateFromFd aborts the process on a failed fstat).  A rule on one of those
  * files turned that into "Unable to stat <fd>" and the zygote died, taking down every isolated
  * service of the app with it.  Hiding stays for stat/fstatat/statx on a path, and open() of a
- * hidden file is still refused by inode_permission, so no new descriptor can be obtained.
+ * hidden file is still refused by inode_permission (bar the zygote's own re-open, below).
  * Numbers: arm64 fstat is 80; AArch32 has fstat 108 and fstat64 197 (arch/arm/tools/syscall.tbl). */
 #define SUS_PATH_NR_FSTAT		80
 #define SUS_PATH_NR_FSTAT_COMPAT	108
@@ -1337,13 +1338,53 @@ static bool sus_path_in_fstat(void)
     return nr == SUS_PATH_NR_FSTAT;
 }
 
+/* The second half of the same problem.  After it forks, an app zygote re-opens every inherited
+ * file by its path (FileDescriptorInfo::ReopenOrDetach) and aborts the child on a failed open(),
+ * so a rule on /system/framework/<overlay>.apk still killed every isolated helper of the app.
+ * That caller is recognised by its thread name (Android names app and WebView zygotes
+ * "<package tail>_zygote", the last 15 characters of the process name) AND by already holding
+ * the very inode it opens, in its own descriptor table: nothing is revealed that its open
+ * descriptor does not already give it, and every other path to the file stays hidden.  The name
+ * is settable by any app, so the held-inode condition is what bounds the exemption: a process
+ * that fakes it can open, by path, only a file it already holds. */
+static bool sus_path_zygote_reopen(const struct inode *inode)
+{
+    static const char suffix[] = "_zygote";
+    struct files_struct *files = current->files;
+    struct fdtable *fdt;
+    size_t len;
+    unsigned int i;
+    bool held = false;
+
+    if (!files || (current->flags & PF_KTHREAD))
+        return false;
+    len = strnlen(current->comm, sizeof(current->comm));
+    if (len < sizeof(suffix) - 1 ||
+        memcmp(current->comm + len - (sizeof(suffix) - 1), suffix, sizeof(suffix) - 1))
+        return false;
+
+    rcu_read_lock();
+    fdt = files_fdtable(files);
+    for (i = 0; i < fdt->max_fds; i++) {
+        struct file *f = rcu_dereference_raw(fdt->fd[i]);
+
+        if (f && file_inode(f) == inode) {
+            held = true;
+            break;
+        }
+    }
+    rcu_read_unlock();
+    return held;
+}
+
 static int sus_path_inode_getattr(const struct path *path)
 {
     struct inode *inode;
 
     if (path && path->dentry) {
         inode = d_inode(path->dentry);
-        if (sus_path_inode_hidden(inode) && !sus_path_in_fstat()) {
+        if (sus_path_inode_hidden(inode) && !sus_path_in_fstat() &&
+            !sus_path_zygote_reopen(inode)) {
             atomic_inc(&n_enoent_getattr);
             return -ENOENT;
         }
@@ -1358,7 +1399,7 @@ static int sus_path_inode_getattr(const struct path *path)
 
 static int sus_path_inode_permission(struct inode *inode, int mask)
 {
-    if (sus_path_inode_hidden(inode)) {
+    if (sus_path_inode_hidden(inode) && !sus_path_zygote_reopen(inode)) {
         atomic_inc(&n_enoent_perm);
         return -ENOENT;
     }
