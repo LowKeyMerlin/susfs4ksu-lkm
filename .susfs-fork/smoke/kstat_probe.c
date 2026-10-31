@@ -66,6 +66,8 @@
 
 /* O_RDONLY | O_DIRECTORY, which arm and arm64 number 040000 and not as asm-generic does. */
 #define O_DIRECTORY_RDONLY	040000
+/* O_PATH is 010000000 on arm and arm64 alike (asm-generic). */
+#define O_PATH_FLAG		010000000
 
 static long sys5(long nr, long a, long b, long c, long d, long e)
 {
@@ -265,6 +267,34 @@ static int listmount_pages(unsigned long long parent, long nr)
 	return 0;
 }
 
+/* One listmount call over a buffer of NR slots filled with a sentinel, then every slot the call did
+ * NOT report (index >= the returned count) that holds ID: a hidden id left behind by compaction.
+ * listmount_pages() only prints the reported slots, so it cannot see this. */
+#define LM_SENTINEL 0xdeadbeefdeadbeefULL
+static int listmount_tail(long nr, unsigned long long id)
+{
+	static unsigned long long ids[LM_MAX_IDS];
+	struct mnt_id_req req = { .size = MNT_ID_REQ_SIZE_VER0, .mnt_id = LSMT_ROOT, .param = 0 };
+	long got, i, hits = 0;
+
+	if (nr < 1 || nr > LM_MAX_IDS)
+		nr = 1;
+	for (i = 0; i < nr; i++)
+		ids[i] = LM_SENTINEL;
+	got = sys5(NR_LISTMOUNT, (long)&req, (long)ids, nr, 0, 0);
+	report("rc", got);
+	if (got < 0)
+		return 1;
+	for (i = 0; i < got; i++)
+		if (ids[i] == id)
+			report("reported_hidden", i);
+	for (i = got; i < nr; i++)
+		if (ids[i] == id)
+			hits++;
+	report("tail_hidden", hits);
+	return 0;
+}
+
 /* statmount of one unique id. Prints rc and, on success, the mnt_id the kernel wrote back, so the
  * test can tell a real answer from a hidden one (which comes out as an error or a zeroed buffer). */
 static int statmount_one(unsigned long long id)
@@ -330,6 +360,8 @@ long probe_main(long argc, char **argv)
 
 		return listmount_pages(parent, (long)parse_u64(argv[2]));
 	}
+	if (same(argv[1], "listmount_tail"))	/* listmount_tail N ID */
+		return argc > 3 ? listmount_tail((long)parse_u64(argv[2]), parse_u64(argv[3])) : 2;
 	if (same(argv[1], "statmount"))
 		return statmount_one(parse_u64(argv[2]));
 	if (same(argv[1], "errors")) {
@@ -338,6 +370,15 @@ long probe_main(long argc, char **argv)
 	}
 	if (same(argv[1], "statfs")) {
 		rc = sys(NR_STATFS, (long)argv[2], SIZE_ARG ? SIZE_ARG : (long)buf, SIZE_ARG ? (long)buf : 0);
+	} else if (same(argv[1], "fstatfs_opath")) {
+		/* fs/statfs.c fd_statfs() takes fdget_raw(), so an O_PATH descriptor is a legal argument */
+		fd = open_path(argv[2], O_PATH_FLAG | O_DIRECTORY_RDONLY);
+		if (fd < 0) {
+			report("rc", fd);
+			return 1;
+		}
+		rc = sys(NR_FSTATFS, fd, SIZE_ARG ? SIZE_ARG : (long)buf, SIZE_ARG ? (long)buf : 0);
+		sys(NR_CLOSE, fd, 0, 0);
 	} else if (same(argv[1], "fstatfs")) {
 		fd = open_dir(argv[2]);
 		if (fd < 0) {

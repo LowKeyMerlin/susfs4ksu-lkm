@@ -2169,7 +2169,9 @@ static __nocfi long susfs_kstatfs_answer(enum kstatfs_layout layout, bool by_fd,
 		ubuf = (unsigned long)compat_ptr((u32)ubuf);
 
 	if (by_fd) {
-		struct file *f = fget((unsigned int)uarg);
+		/* fget_raw(), as fs/statfs.c's fd_statfs() uses fdget_raw(): fget() is
+		 * __fget(fd, FMODE_PATH) and answers NULL for an O_PATH descriptor, which statfs accepts. */
+		struct file *f = fget_raw((unsigned int)uarg);
 
 		if (!f)
 			return -EBADF;

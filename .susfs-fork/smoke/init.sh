@@ -428,6 +428,11 @@ say "kstat_fstatfs_app=$(kwho "$(ksb app fstatfs $KS)" "$kreal" "$ksmall")"
 say "kstat_statfs_app_compat=$(kwho "$(ksb app statfs $KS "$KSTAT32")" "$kreal" "$ksmall")"
 say "kstat_fstatfs_app_compat=$(kwho "$(ksb app fstatfs $KS "$KSTAT32")" "$kreal" "$ksmall")"
 say "kstat_statfs_root=$(kwho "$(ksb root statfs $KS)" "$kreal" "$ksmall")"
+# fstatfs takes an O_PATH descriptor (fs/statfs.c fd_statfs() uses fdget_raw), so the module's own
+# fd lookup must not reject one: an app and root get the same answers as for a plain descriptor.
+say "kstat_fstatfs_opath_app=$(kwho "$(ksb app fstatfs_opath $KS)" "$kreal" "$ksmall")"
+say "kstat_fstatfs_opath_app_compat=$(kwho "$(ksb app fstatfs_opath $KS "$KSTAT32")" "$kreal" "$ksmall")"
+say "kstat_fstatfs_opath_root=$(kwho "$(ksb root fstatfs_opath $KS)" "$kreal" "$ksmall")"
 say "kstat_other_path_app=$(yesno [ "$(ksb app statfs /proc)" = "$(ksb root statfs /proc)" ])"
 # A caller the rules apply to is answered by the module and not by the kernel, so what the kernel
 # fails with, and the bytes it fills in on the paths no rule names, have to come out the same.
@@ -539,6 +544,11 @@ if grep -q '^mntroot: ' "$MS" 2>/dev/null; then
   # count, so the list was not truncated to nothing).
   say "lm_app_sees_big=$(yesno lhas app 4096 "$lm_id")"
   say "lm_app_count_big=$(lids app 4096 | grep -c .)"
+  # The page is shortened by moving the kept ids down; the slots past the new count must not keep the
+  # old values.  lids only prints the reported slots, so listmount_tail reads the whole buffer.
+  # /data/adb/ms is the newest mount here, so it is in the last slot of the unfiltered answer.
+  say "lm_app_tail_hidden=$(as_app "$KSTAT listmount_tail 4096 $lm_id" | sed -n 's/^tail_hidden=//p')"
+  say "lm_root_tail_shows=$($KSTAT listmount_tail 4096 "$lm_id" | sed -n 's/^reported_hidden=.*/yes/p')"
   # A buffer of one is the documented residual: a page that is entirely our id cannot be shortened to
   # zero without ending the walk, so it goes out and the module counts it as full_leak.  The test
   # records both, rather than pretending the leak is closed.

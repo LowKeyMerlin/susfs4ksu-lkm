@@ -1354,6 +1354,7 @@ static atomic_t n_root_layout = ATOMIC_INIT(0);
 static atomic_t n_listmount_ret = ATOMIC_INIT(0);
 static atomic_t n_listmount_dropped = ATOMIC_INIT(0);
 static atomic_t n_listmount_full = ATOMIC_INIT(0);
+static atomic_t n_listmount_tailfail = ATOMIC_INIT(0);
 static atomic_t n_listmount_parent = ATOMIC_INIT(0);
 static atomic_t n_statmount_ret = ATOMIC_INIT(0);
 static atomic_t n_statmount_hidden = ATOMIC_INIT(0);
@@ -1517,6 +1518,12 @@ static int sus_mount_listmount_ret(struct kretprobe_instance *ri, struct pt_regs
      * last of them and the rest is listed again.  With nothing kept, the original answer stands. */
     if (w == 0 && r < ret)
         return 0;
+    /* The shift leaves the old values of ids[w..ret) in the caller's array, past the count it is
+     * about to get.  Ours sit in the last slots whenever the hidden mount is the newest one (ids
+     * are listed in ascending order), so they must not be left there.  A fault here is the
+     * caller's own unmapped buffer, which it will hit on its own read. */
+    if (clear_user(ids + w, (size_t)(ret - w) * sizeof(u64)))
+        atomic_inc(&n_listmount_tailfail);
     atomic_add(dropped, &n_listmount_dropped);
     regs->regs[0] = (unsigned long)w;
     return 0;
@@ -1911,7 +1918,7 @@ static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
                      "uniq: recorded=%d/%d full=%d\n"
                      "mntroot: statmount=%d parent=%d layout=%d missed=%d (probe=%d)\n"
-                     "listmount: ret=%d dropped=%d full_leak=%d parent=%d missed=%d (probe=%d)\n"
+                     "listmount: ret=%d dropped=%d full_leak=%d tailfail=%d parent=%d missed=%d (probe=%d)\n"
                      "statmount_fallback: ret=%d hidden=%d (probe=%d)\n"
 #endif
                      "statfs: redirects=%d\n",
@@ -1948,7 +1955,8 @@ static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
                      atomic_read(&n_root_statmount), atomic_read(&n_root_parent),
                      atomic_read(&n_root_layout), (int)kr_mntroot.nmissed, (int)kr_mntroot_ok,
                      atomic_read(&n_listmount_ret), atomic_read(&n_listmount_dropped),
-                     atomic_read(&n_listmount_full), atomic_read(&n_listmount_parent),
+                     atomic_read(&n_listmount_full), atomic_read(&n_listmount_tailfail),
+                     atomic_read(&n_listmount_parent),
                      (int)kr_listmount.nmissed, (int)kr_listmount_ok,
                      atomic_read(&n_statmount_ret), atomic_read(&n_statmount_hidden),
                      (int)kr_statmount_ok,
