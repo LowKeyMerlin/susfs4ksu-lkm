@@ -478,13 +478,18 @@ say "kin_cleared_app=$(kwho "$(kin app $KS)" "$kin_before" "$kin_after")"
 # the first mount above it that is not, as upstream does in vfs_statfs; root keeps the real ones.
 # The VM has no KernelSU, so "umounted" is the app half of the gate, as for the rest of the module.
 kmsn() { sed -n 's/.*statfs: redirects=\([0-9]*\).*/\1/p' /sys/module/susfs_guard_lkm/parameters/mount_stat; }
-# The module has listmount/statmount probes from 6.12, the first KMI with the syscalls.  Each can
-# fail to arm if LTO inlined its function; "absent" means a kernel without them.
-kprobe_of() { sed -n "s/^$1: .*(probe=\([01]\)).*/\1/p" /sys/module/susfs_guard_lkm/parameters/mount_stat; }
-if grep -q '^listmount: ' /sys/module/susfs_guard_lkm/parameters/mount_stat 2>/dev/null; then
-  say "lm_probes=$(kprobe_of listmount),$(kprobe_of listmount_inline),$(kprobe_of statmount)"
+# From 6.12 (the first KMI with listmount/statmount) the module reports three probe lines on
+# mount_stat.  grab_requested_root is the primary hook (it closes the statmount target and the
+# listmount parent); the listmount wrapper compacts the id array; the statmount wrapper is a
+# fallback armed only when grab_requested_root could not be.  "absent" means a kernel without them.
+MS=/sys/module/susfs_guard_lkm/parameters/mount_stat
+probe_of() { sed -n "s/^$1: .*(probe=\([01]\)).*/\1/p" "$MS"; }
+if grep -q '^mntroot: ' "$MS" 2>/dev/null; then
+  say "lm_mntroot_probe=$(probe_of mntroot)"
+  say "lm_listmount_probe=$(probe_of listmount)"
+  say "lm_statmount_fallback_probe=$(probe_of statmount_fallback)"
 else
-  say "lm_probes=absent"
+  say "lm_mntroot_probe=absent"
 fi
 mkdir -p /data/adb/ms /ms_bind
 kparent=$(ksb root statfs /data/adb)
@@ -510,6 +515,50 @@ mount --bind /data/adb/ms /ms_bind
 say "kms_ident_root=$(kwho "$(ksb root statfs /ms_bind)" "$kroot_fs" "$ktmp")"
 say "kms_ident_app=$(kwho "$(ksb app statfs /ms_bind)" "$kroot_fs" "$ktmp")"
 umount /ms_bind
+
+# listmount(2)/statmount(2) hiding, 6.12+ only.  The marked mount /data/adb/ms has a 64-bit unique
+# id; a detector enumerates it with listmount or confirms a held id with statmount.  Root is the
+# control: it must still see everything.  lm_id is read as root (the real unique id the module
+# recorded); the app half is the hidden reader on this KernelSU-less VM.
+# lmc KEY reads a listmount counter off mount_stat.
+lmc() { sed -n "s/^listmount: .*$1=\([0-9-]*\).*/\1/p" "$MS"; }
+# lids WHO NR [PARENT] lists the ids listmount gives WHO, NR per call, one per line.
+lids() {
+  if [ "$1" = root ]; then $KSTAT listmount "$2" $3; else as_user "$1" "$KSTAT listmount $2 $3"; fi |
+    sed -n 's/^id=//p'
+}
+# lhas WHO NR ID: yes if listmount gives WHO the id ID (whole pipeline, so yesno reads grep's status).
+lhas() { lids "$1" "$2" | grep -qx "$3"; }
+if grep -q '^mntroot: ' "$MS" 2>/dev/null; then
+  lm_id=$(kcall root $KSTAT mntid /data/adb/ms | sed -n 's/^mntid=//p')
+  say "lm_id_read=$(yesno [ -n "$lm_id" ])"
+  # Root sees the id when it lists the whole tree; both buffer sizes.
+  say "lm_root_sees_big=$(yesno lhas root 4096 "$lm_id")"
+  say "lm_root_sees_one=$(yesno lhas root 1 "$lm_id")"
+  # A hidden reader with a roomy buffer never sees it, and still reaches the real mounts (a non-zero
+  # count, so the list was not truncated to nothing).
+  say "lm_app_sees_big=$(yesno lhas app 4096 "$lm_id")"
+  say "lm_app_count_big=$(lids app 4096 | grep -c .)"
+  # A buffer of one is the documented residual: a page that is entirely our id cannot be shortened to
+  # zero without ending the walk, so it goes out and the module counts it as full_leak.  The test
+  # records both, rather than pretending the leak is closed.
+  before_full=$(lmc full_leak)
+  say "lm_app_one_leaks=$(yesno lhas app 1 "$lm_id")"
+  say "lm_app_one_full_counted=$(yesno [ "$(lmc full_leak)" -gt "${before_full:-0}" ])"
+  # statmount of the marked id, held by a detector, is fully closed for the app and open for root.
+  say "lm_statmount_app=$(kcall app $KSTAT statmount "$lm_id" | sed -n 's/^rc=//p')"
+  say "lm_statmount_root_matches=$(yesno [ -n "$lm_id" ] &&
+    [ "$(kcall root $KSTAT statmount "$lm_id" | sed -n 's/^sm_mnt_id=//p')" = "$lm_id" ])"
+  say "lm_statmount_app_compat=$(kcall app $KSTAT32 statmount "$lm_id" | sed -n 's/^rc=//p')"
+  # A mount the module does not hide is still answered, so statmount is not blanket-denied: root's
+  # own id for / proves a normal lookup works.
+  root_id=$(kcall root $KSTAT mntid / | sed -n 's/^mntid=//p')
+  say "lm_statmount_app_other=$(kcall app $KSTAT statmount "$root_id" | sed -n 's/^rc=//p')"
+  # listmount under the hidden mount as the parent is closed too (the mnt_parent_id oracle).
+  say "lm_app_parent_rc=$(as_app "$KSTAT listmount 4 $lm_id" | sed -n 's/^rc=//p')"
+  # Same request from root has no children to list but succeeds, so the app's error is ours.
+  say "lm_root_parent_count=$($KSTAT listmount 4 "$lm_id" | sed -n 's/^count=//p')"
+fi
 # Readers while the mount is lazily unmounted and mounted again: each answer is one a mount can
 # give, an empty one while the path is gone, and nothing crashes.
 kms_bad=/data/local/tmp/kms_bad

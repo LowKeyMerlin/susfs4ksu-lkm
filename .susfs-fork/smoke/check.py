@@ -280,6 +280,48 @@ def facts_of(lines):
     return found
 
 
+# listmount(2)/statmount(2) exist from 6.12 on the KMIs here. A marked mount is hidden from an app;
+# root is the control. lm_app_one_leaks=yes is the documented residual (a page of one that is
+# entirely ours cannot be shortened to zero), so it is expected, and counted as full_leak.
+LISTMOUNT_EXPECTED = [
+    ("lm_listmount_probe", "1", "the __arm64_sys_listmount probe armed"),
+    ("lm_id_read", "yes", "the test read the unique id of the marked mount"),
+    ("lm_root_sees_big", "yes", "root listing the tree sees the marked mount"),
+    ("lm_root_sees_one", "yes", "root listing one id per call sees the marked mount"),
+    ("lm_app_sees_big", "no", "an app listing the tree with a roomy buffer does not see the marked mount"),
+    ("lm_app_one_leaks", "yes", "a page of one that is only the marked mount goes out (documented residual)"),
+    ("lm_app_one_full_counted", "yes", "that residual is counted as full_leak"),
+    ("lm_statmount_app", "-2", "an app's statmount of the marked id fails with ENOENT"),
+    ("lm_statmount_app_compat", "-2", "the same through the 32-bit table"),
+    ("lm_statmount_root_matches", "yes", "root's statmount of the marked id answers that mount"),
+    ("lm_statmount_app_other", "0", "an app's statmount of an unmarked mount still works"),
+    ("lm_app_parent_rc", "-2", "an app's listmount under the marked mount fails with ENOENT"),
+    ("lm_root_parent_count", "0", "root's listmount under the marked mount succeeds (no children)"),
+]
+
+
+def listmount_problems(facts):
+    m = re.match(r"(\d+)\.(\d+)", facts["kernel"])
+    if not (m and (int(m[1]), int(m[2])) >= (6, 12)):
+        got = facts.get("lm_mntroot_probe")
+        return [] if got == "absent" else [
+            f"a kernel without listmount reports no listmount probes: expected lm_mntroot_probe=absent, got {got}"]
+    problems = []
+    # grab_requested_root is the primary hook; the statmount wrapper stands in only when it is missing.
+    modes = (facts.get("lm_mntroot_probe"), facts.get("lm_statmount_fallback_probe"))
+    if modes not in (("1", "0"), ("0", "1")):
+        problems.append("exactly one of grab_requested_root and the statmount fallback armed: expected "
+                        f"lm_mntroot_probe/lm_statmount_fallback_probe=1/0 or 0/1, got {modes[0]}/{modes[1]}")
+    for key, want, shows in LISTMOUNT_EXPECTED:
+        got = facts.get(key)
+        if got != want:
+            problems.append(f"{shows}: expected {key}={want}, got {got if got is not None else 'nothing'}")
+    got = facts.get("lm_app_count_big")
+    if not (got and got.isdigit() and int(got) > 0):
+        problems.append(f"an app listing the tree still gets the real mounts: expected lm_app_count_big>0, got {got}")
+    return problems
+
+
 def judge(lines, qemu_rc, ksu_cfg=None):
     """Return (verdict, problems, facts)."""
     facts = facts_of(lines)
@@ -307,13 +349,7 @@ def judge(lines, qemu_rc, ksu_cfg=None):
         got = facts.get(key)
         if not (got is not None and got.lstrip("-").isdigit() and int(got) > 0):
             problems.append(f"{shows}: expected {key}>0, got {got if got is not None else 'nothing'}")
-    # The module builds the listmount(2)/statmount(2) probes from 6.12, the first KMI with the syscalls.
-    m = re.match(r"(\d+)\.(\d+)", facts["kernel"])
-    want = "1,1,1" if m and (int(m[1]), int(m[2])) >= (6, 12) else "absent"
-    got = facts.get("lm_probes")
-    if got != want:
-        problems.append("the do_listmount, is_path_reachable and do_statmount probes armed where the kernel "
-                        f"has them: expected lm_probes={want}, got {got if got is not None else 'nothing'}")
+    problems += listmount_problems(facts)
     seen = crashed = False
     for line in lines:
         seen = seen or line.startswith("SMOKE kernel=")

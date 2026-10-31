@@ -79,31 +79,35 @@ For each feature's supercall and `/proc` write:
 - `statx(STATX_MNT_ID)` on a marked mount maps to the original id; `statx(STATX_MNT_ID_UNIQUE)`
   returns the kernel's own unique id (not crafted, so no rb-tree key is ever rewritten). The su-domain
   caller sees the real mnt_id (the gate short-circuits).
-- Probes armed: on both 6.12 and 6.18 images `mount_stat` shows `(probe=1)` on the `listmount`,
-  `listmount_inline` and `statmount` lines (the QEMU smoke asserts this as `lm_probes=1,1,1`). A 0
-  means LTO inlined that function on this build; record which, it decides the next two bullets.
-- With the inline filter armed (`listmount_inline ... probe=1`): `listmount(2)` from a hidden reader
-  returns no marked mount's unique id at any buffer size, including 1. Page through to the end and
-  confirm none appears and every real mount does. Expect `filtered` to rise and `listmount
-  dropped` to stay 0; `dropped > 0` here means do_listmount's call to is_path_reachable() was
-  inlined while the out-of-line copy still exists, so the probe armed but did not see the loop.
-- Fallback only (`listmount_inline ... probe=0`): pages that were partly marked mounts come back
-  short, and a full page that is entirely marked mounts is returned unfiltered (`listmount full`
-  rises). That page is the known leak in this mode, and buffer size 1 reaches it on every marked
-  mount. Confirm real mounts after it are still returned (no early end-of-list).
-- Not scoped too wide: while a hidden reader lists, `openat2(RESOLVE_BENEATH)` and
-  `RESOLVE_IN_ROOT` under a marked mount from another task (and from the same task between
-  listmount calls) behave as before, and `pivot_root` is unaffected. `filtered` only rises during
-  listmount calls.
-- A su-granted app and root see every mount through listmount, and `filtered` does not rise.
-- `statmount(2)` on a marked mount's unique id returns `-ENOENT` for a hidden reader, the same as an
-  unknown id; a su-granted app gets the real details.
-- Concurrency: 32 hidden readers listing at once with buffer size 1 overflow the 16 `lm` slots
-  (`lm_full` rises) and the overflowed calls fall back to compaction; nothing crashes. Disable the
-  mount layer mid-listing and enable it again: the slots are cleared, and openat2 under a marked
-  mount from those tasks still works afterwards.
-- `do_listmount`/`do_statmount`/`is_path_reachable` inlined (simulate by denying the symbol): that
-  probe does not arm, the rest keep working, and nothing crashes.
+- Hook points, from the official android16-6.12 Images (6.12.23 and 6.12.69): `do_statmount` is
+  inlined on both, `do_listmount` on 6.12.69, and `is_path_reachable` is called only from
+  `get_dominating_id`, so none of them can carry the hiding. `grab_requested_root`,
+  `__arm64_sys_listmount` and `__arm64_sys_statmount` are out of line on both. Repeat the kallsyms and
+  call-site check on a 6.18 Image before trusting it there.
+- Probes armed: `mount_stat` shows `mntroot ... (probe=1)`, `listmount ... (probe=1)` and
+  `statmount_fallback ... (probe=0)`. The smoke asserts this; `mntroot probe=0` with
+  `statmount_fallback probe=1` is the fallback mode (statmount still hidden, by zeroing the buffer;
+  listmount parent handled in the wrapper), anything else fails.
+- statmount: a hidden reader's `statmount(2)` of a marked mount's unique id returns `-ENOENT`, the same
+  as an unknown id, through both ABIs, and the buffer stays untouched. Root and a su-granted app get
+  the real details. An unmarked mount still answers the hidden reader. `mntroot statmount=` rises.
+- listmount parent: a hidden reader's `listmount(2)` with a marked mount as `mnt_parent_id` returns
+  `-ENOENT`; root gets 0 children. `mntroot parent=` rises.
+- listmount enumeration, roomy buffer: no marked id appears and every real mount does. `listmount
+  dropped=` rises.
+- listmount, buffer of 1: the page that is only a marked mount goes out (`full_leak=` rises) and the
+  walk continues to the end. This is the documented residual, the smoke asserts that it leaks rather
+  than pretending it is closed.
+- listmount, small buffer, paged by a caller that stops on a short page (libmount style): a page we
+  shortened ends the walk early, and the mounts after it are missing. A caller that stops on `<= 0`
+  gets them all. Record both; this is the second documented residual.
+- Struct mirrors: `mntroot layout=` stays 0 on every image. A non-zero value means the
+  `kstatmount`/`klistmount` mirror does not match that build, and those calls are left alone.
+- Concurrency: 64 hidden readers calling listmount and statmount at once. `missed=` may rise (32
+  instances per probe); a missed call is answered as the kernel built it, nothing crashes, and the
+  counters stay consistent.
+- Unload while 16 readers loop on listmount/statmount, then reload: no leaked mount references
+  (`umount` of the marked mount succeeds afterwards), no KASAN or RCU report.
 
 ## 5. Unload safety (all features)
 

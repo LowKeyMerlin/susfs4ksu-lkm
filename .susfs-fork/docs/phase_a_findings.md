@@ -244,60 +244,81 @@ How it works:
   `atomic64_inc_return(&mnt_id_ctr)` on 6.12, `++mnt_id_ctr` on 6.18), so a recorded id can never
   later name a different mount and the table needs no teardown on umount. It persists across disable/re-enable on purpose: the re-scan skips
   already-marked mounts, so clearing it would lose them.
-- Inline filter, the same point as upstream's hunk (a `continue` right after the loop's
-  `is_path_reachable()` check). The `do_listmount` entry probe records the task and `&kls->root` in
-  a 16-slot table (`sus_mount_lm[]`, `lm_lock`) when the reader is hidden. While the task is listed,
-  an `is_path_reachable()` return probe forces 0 for a mount of ours, so the loop skips it and the
-  page fills with real mounts. The first call (orig against `&kls->root`, which decides `-EPERM` for
-  the whole listing) is told apart by its root argument and left alone. The `do_listmount` return
-  probe removes the slot.
-- Fallback compaction: the same return probe drops any of our ids still in `kls->kmnt_ids` and
-  lowers the count before the syscall copies the array out. With the inline filter working it finds
-  nothing.
+- Where upstream's hunk sits cannot be reached from a module on shipping GKI. Read from the official
+  android16-6.12 Images (6.12.23 and 6.12.69, kallsyms plus every BL/B call site): `do_statmount` is
+  inlined on both, `do_listmount` on 6.12.69, and `is_path_reachable` survives as a symbol but is
+  called only from `get_dominating_id`, so a probe on it arms and never fires for a listing. An
+  earlier version of this code hooked exactly those three; it was dead on these builds and was
+  replaced. What both builds keep out of line is `grab_requested_root`, called only from the two
+  syscalls, and the syscall wrappers `__arm64_sys_listmount`/`__arm64_sys_statmount`.
+- `grab_requested_root(ns, root)` runs in both syscalls before anything is copied out: in statmount
+  right after the requested mount was looked up, in listmount before the parent is. Its entry
+  handler tells the two apart by `current_pt_regs()->syscallno` (457/458 on both ABIs), recovers the
+  enclosing `kstatmount`/`klistmount` with `container_of(root, ...)` and reads the id there: the
+  statmount target (`real_mount(s->mnt)->mnt_id_unique`) or listmount's `mnt_parent_id`. For a hidden
+  reader and one of our ids, the return handler turns its 0 into `-ENOENT`, an errno it returns
+  itself, so the syscall fails with nothing copied: the answer an unknown id gets. The id comes from
+  kernel memory, so a thread rewriting the user request cannot race it.
+- The statmount target and the listmount parent are both widenings: upstream hides neither. Leaving
+  either open is a one-call oracle for an id a detector already holds (for example a statx
+  `STATX_MNT_ID_UNIQUE` taken before the mount was hidden).
+- Enumeration: nothing per-mount in listmount's loop is out of line, so the `__arm64_sys_listmount`
+  return probe edits the result. It re-reads the ids already copied to the caller (32 per copy, a
+  read-only first pass so nothing is written when none are ours), moves the kept ones down and
+  lowers the count.
+- Fallback when `grab_requested_root` cannot be probed: an `__arm64_sys_statmount` return probe reads
+  the id back from the user request, zeroes the buffer and returns `-ENOENT` (a racing thread can
+  beat that), and the listmount wrapper clears the array and returns `-ENOENT` for a parent of ours.
+  Only one of the two statmount paths is armed at a time.
 - The id test is by identity (`sus_mount_uniq_has`), a superset of upstream's KSU-range `mnt_id`
   test, so it also hides mounts the `attach_recursive_mnt` path marked.
-- A kretprobe on `do_statmount` forces `-ENOENT` (its own answer for an unknown id) when the
-  requested id is ours and the reader is hidden. Upstream does not hide statmount; this is a
-  deliberate, documented widening, because hiding listmount alone leaves statmount as a one-call
-  oracle for any id a detector already holds.
+
+Residuals, all from editing the listmount result after the fact (upstream has none of them):
+
+- A FULL page that is entirely ours cannot be lowered to 0 without ending the walk, so it goes out
+  as built. A buffer of 1 reaches that on every marked mount; it is counted as `full_leak`, and the
+  smoke asserts the leak rather than hiding it.
+- A full page we shorten reads as the last page to a caller that stops on a short page (util-linux
+  libmount: `n < stepsiz` is done), which then misses the mounts after it. A caller that stops on a
+  return `<= 0` (the kernel's `samples/vfs`) gets everything. The kernel never returns a short page
+  before the end, so a short page followed by more is a presence signal.
+- The ids sit in the caller's array between the kernel's copy and the compaction, a window a second
+  thread polling that array can read.
 
 Why it is regress-safe:
 
-- The `struct klistmount` mirror is byte-identical on android16-6.12 and android17-6.18 (verified
-  against both sources); only `kmnt_ids`/`nr_mnt_ids` are read and only the count in x0 is written.
+- `struct klistmount` and `struct kstatmount` are file-local; the mirrors match android16-6.12 and
+  android17-6.18 (6.18 adds `kstatmount.idmap`, mirrored under a version check). They were checked
+  against the 6.12 machine code too: the instruction before each `bl grab_requested_root` is
+  `add x1, <struct>, #32` for statmount and `#40` for listmount, the `root` offsets the mirrors
+  give. Before anything is read through a mirror, the fields `prepare_kstatmount` and
+  `prepare_klistmount` stored are compared with the syscall's own saved arguments (`buf`/`bufsize`,
+  `nr_mnt_ids`); a mismatch counts `layout=` and leaves the call alone.
+- `grab_requested_root` takes a reference on the root it returns. Both callers drop it on every path
+  (`path_put(&ks->root)` after `do_statmount`, `__free_klistmount_free` for listmount), so the forced
+  `-ENOENT` leaks nothing, and `retry_statmount` only loops on `-EOVERFLOW`.
 - Overriding the return value in a kretprobe handler is sound on arm64: `kretprobe_brk_handler()`
   runs the handler on the exception `pt_regs` (where x0 holds the function's just-returned value) and
   the exception return restores that same `pt_regs`, so writing `regs->regs[0]` changes the effective
   return (confirmed in `arch/arm64/kernel/probes/kprobes.c` on both trees).
-- `is_path_reachable()` is shared: `path_is_under()` (exported, used by openat2
-  `RESOLVE_BENEATH`/`RESOLVE_IN_ROOT`), `do_pivot_root()` and `do_statmount()` call it too. An
-  unscoped override would make those scoped lookups fail with `-EXDEV` under our mounts. The probe
-  only acts for a task listed in `sus_mount_lm[]`, which only `do_listmount` adds to, so those
-  callers are never changed. The table is cleared when the probes are unregistered: a call in flight
-  at that moment never runs its return handler, and its stale slot would otherwise filter that task's
-  later `is_path_reachable()` calls after a re-enable.
-- Compaction alone is not enough, which is why the inline filter exists. The caller pages from the
-  last id it received (`mnt_find_id_at(ns, last_mnt_id + 1)`) and stops on a 0 return. A partly-ours
-  page can safely come back short, but a FULL page that is entirely ours cannot be lowered to 0
-  without ending the enumeration, so it goes out as built (`listmount full=`). With a buffer of 1,
-  every one of our mounts is such a page. So when the inline filter is not live (probe did not arm,
-  `lm_full`, missed instances, or LTO inlined do_listmount's own call), a small buffer sees every
-  marked mount. `mount_stat` shows which mode is live: `listmount_inline ... (probe=1)` with
-  `filtered=` rising and `listmount dropped=0` is the inline mode.
-- Cost: a hidden reader's listmount pays one table scan per mount in the loop; every other
-  `is_path_reachable()` caller pays a 16-entry pointer scan and returns.
+- User memory is touched only in the wrapper return handlers, only where the syscall body just read
+  or wrote it, the same pattern as the existing `__arm64_sys_statx` hook. From the preempt-disabled
+  handler a fault fails the copy rather than sleeping, and any failure leaves the call as the kernel
+  answered it. `uniq_lock` is never held across a user copy.
 - The gate (`sus_mount_hidden_reader`) is the umount predicate, so su, the manager and su-granted
   apps are never touched. It is safe from the preempt-disabled handler: across all five supported
   forks `ksu_uid_should_umount()` takes only `rcu_read_lock()` and a `kref_put`/`kfree_rcu`, never a
-  mutex (read the fork sources to confirm, since the LKM substitute calls KernelSU here where
-  built-in susfs would read a cheap `TIF_PROC_UMOUNTED` flag).
-- Fail-open arming: `do_listmount`/`do_statmount` are static and `is_path_reachable()` has few
-  callers, so LTO may inline any of them. A probe that does not register leaves its path unfiltered,
-  logged, never a crash. The QEMU smoke asserts all three arm on 6.12 and 6.18 (`lm_probes=1,1,1`),
-  and `tools/verify-gki.sh` checks the same on a device.
+  mutex.
+- Cost: every other caller of the three functions returns from the entry handler after a syscall
+  number and uid check, and the instance is discarded so no return trap is taken. A hidden reader's
+  listmount pays one table lookup per returned id.
+- Fail-open arming: a probe that does not register leaves its path unfiltered, logged, never a
+  crash. The QEMU smoke asserts the probe set (`lm_*_probe`) and the behaviour (`lm_*` facts) on
+  6.12 and 6.18, and `tools/verify-gki.sh` checks the probes on a device.
 
-Unvalidated: nothing here has been built or booted. New counters are on `mount_stat`
-(`uniq:`, `listmount:`, `listmount_inline:`, `statmount:`).
+Unvalidated: nothing here has been built or booted, and no 6.18 Image was available to repeat the
+call-site check. Counters are on `mount_stat` (`uniq:`, `mntroot:`, `listmount:`,
+`statmount_fallback:`).
 
 ## fdinfo inotify SUS_MOUNT branch (b): blocked, not a regression
 

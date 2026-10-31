@@ -363,11 +363,18 @@ echo 'set /data/adb/ /data/local/tmp/' > /proc/susfs_hide_mounts 2>/dev/null
 sleep 1
 head -2 "$P/mount_stat" 2>/dev/null | sed 's/^/  /'
 grep -q 'show_probes=3/3' "$P/mount_stat" 2>/dev/null && ok "show_probes=3/3" || bad "the mount probes did not all arm"
-# Only 6.12+ builds print these.  A 0 here means LTO inlined the function and that path is not hidden.
-for f in listmount listmount_inline statmount; do
-    l=$(grep "^$f: " "$P/mount_stat" 2>/dev/null) || continue
-    case "$l" in *"(probe=1)"*) ok "$f probe armed" ;; *) bad "$f probe did not arm: $l" ;; esac
-done
+# Only 6.12+ builds print these.  grab_requested_root (mntroot) is the primary hook and the
+# statmount wrapper its stand-in, so exactly one of the two must be armed; listmount always.
+if l=$(grep '^mntroot: ' "$P/mount_stat" 2>/dev/null); then
+    lm=$(grep '^listmount: ' "$P/mount_stat")
+    sf=$(grep '^statmount_fallback: ' "$P/mount_stat")
+    case "$lm" in *"(probe=1)"*) ok "listmount probe armed" ;; *) bad "listmount probe did not arm: $lm" ;; esac
+    case "$l/$sf" in
+        *"(probe=1)"*/*"(probe=0)"*) ok "grab_requested_root armed (statmount and listmount parent closed)" ;;
+        *"(probe=0)"*/*"(probe=1)"*) note "grab_requested_root missing, statmount fallback armed: $l" ;;
+        *) bad "neither or both of grab_requested_root and the statmount fallback armed: $l / $sf" ;;
+    esac
+fi
 
 sec "10. leave the device usable"
 if [ "$RESTORE" = "1" ]; then
