@@ -409,6 +409,29 @@ static int susfs_load_layer(int id, bool fatal)
     return 0;
 }
 
+/* A susfs-enabled KernelSU (in vmlinux or kernelsu.ko) owns the same SUSFS_MAGIC command and
+ * /proc/susfs_* nodes as this module, so the two must not coexist. The markers are upstream's
+ * fs/susfs.c entry points, which this module never defines. ksu_kallsyms_lookup_name() (not the
+ * vmlinux-only resolver) also sees kernelsu.ko, so a hit means another susfs. */
+static bool susfs_builtin_present(void)
+{
+    static const char *const markers[] = {
+        "susfs_update_sus_kstat",
+        "susfs_add_sus_path",
+        "susfs_spoof_uname",
+    };
+    int i;
+
+    for (i = 0; i < (int)ARRAY_SIZE(markers); i++) {
+        if (ksu_kallsyms_lookup_name(markers[i])) {
+            pr_warn("susfs_guard_lkm: built-in susfs detected (%s in kallsyms), refusing to load so the two do not both own SUSFS_MAGIC or /proc/susfs_*\n",
+                    markers[i]);
+            return true;
+        }
+    }
+    return false;
+}
+
 static int __init susfs_init(void)
 {
     int i;
@@ -426,6 +449,10 @@ static int __init susfs_init(void)
     /* Now that kallsyms lookups work, check the addresses themselves: see imports_guard.c. */
     if (susfs_imports_crosscheck())
         return -EINVAL;
+
+    /* Checked before any layer arms, so a refusal leaves nothing behind.  See susfs_builtin_present(). */
+    if (susfs_builtin_present())
+        return -EEXIST;
 
     /* Text/data patching needs a cache-flush helper whose name differs between kernels; resolve it
      * here, before any layer can patch.  Not fatal by itself, but below 6.12 sus_path is a fatal
