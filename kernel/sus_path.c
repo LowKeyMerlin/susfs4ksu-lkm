@@ -120,6 +120,12 @@ struct sus_path_entry {
     const struct inode_operations *orig_iop;
     u64 dev;
     u64 ino;
+    /* The inode's generation at registration.  (ino, generation) is the pair NFS filehandles
+     * use to survive inode-number reuse: a file deleted and its number handed to a new file in
+     * the same superblock keeps the same ino but gets a new generation.  The identity-fallback
+     * match confirms it so a reused number stops matching the rule.  0 when the filesystem does
+     * not track one, and then the match stays ino-only, as before. */
+    u64 generation;
     char name[NAME_MAX + 1];
     /* The path as registered, stored without a trailing slash
      * (path_len == strlen(path)). */
@@ -748,6 +754,7 @@ static int sus_path_resolve_pending(void)
             slot->sb = inode->i_sb;
             slot->dev = (u64)inode->i_sb->s_dev;
             slot->ino = (u64)inode->i_ino;
+            slot->generation = (u64)inode->i_generation;
             strscpy(slot->name, name, sizeof(slot->name));
             slot->inode = inode;
             sus_path_filter_add(slot);
@@ -1220,9 +1227,12 @@ static void sus_path_entry_set_path(struct sus_path_entry *e, const char *path)
  * Why the object alone is not enough (both measured on hardware): after a quick rmmod + insmod a rule
  * can hold an inode no reader ever sees again while a NEW object carries the same (dev, i_ino) - seen
  * as ptr_equal=0 in sus_path_probe with this module's control nodes readable by uid 2000 again; and
- * ihold() keeps an inode alive but NOT hashed, so it can be unhashed while its number is handed out
- * again.  (dev, i_ino) is sound because a rule holds its inode from registration until del / clear /
- * unload: while that inode is the hashed one, its number cannot be reused.
+ * ihold() keeps an inode alive but not hashed, so the original can be unhashed and its number handed
+ * to a new file while the rule still holds the old object.  (dev, i_ino) alone would then match that
+ * new file by its number, so the fallback also confirms i_generation, the second half of the
+ * (ino, generation) pair that survives number reuse, which the new file does not share, so a reused
+ * number no longer matches the rule.  (A filesystem that leaves i_generation 0 keeps the ino-only
+ * match. The generation guard only ever removes a match, never adds one.)
  * One tier more, for this module's own control nodes only: another INSTANCE of the same filesystem
  * keeps the inode number but has its own s_dev (measured, a container's /proc: the same 4026535268
  * with dev 1048754 against the main /proc's 20), so their identity is (filesystem type, i_ino) -
@@ -1266,6 +1276,13 @@ static bool sus_path_inode_hidden(struct inode *inode)
         if (!e->ino || e->ino != (u64)inode->i_ino)
             continue;
         if (e->dev == dev) {
+            /* Same (dev,ino) but a different generation is a reused inode number, not the
+             * file the rule named, so skip it the way an unrelated inode would be.  Guarded
+             * on both being non-zero so a filesystem that leaves i_generation 0 keeps the
+             * old ino-only match instead of matching nothing. */
+            if (e->generation && inode->i_generation &&
+                e->generation != (u64)inode->i_generation)
+                continue;
             by_identity = true;
             if (sus_path_entry_gate_inode(e, inode)) {
                 hidden = true;
@@ -2646,6 +2663,7 @@ static int sus_path_publish_entry(struct sus_path_entry *e, bool merge_pending)
             cur->sb = e->sb;
             cur->dev = e->dev;
             cur->ino = e->ino;
+            cur->generation = e->generation;
             strscpy(cur->name, e->name, sizeof(cur->name));
             /* e was armed before publish: its inode points at our i_op copy and e->orig_iop
              * holds the original.  The copy now belongs to cur, so the original must move with
@@ -2702,6 +2720,7 @@ static int sus_path_add_hidden_ex(const char *path, bool self_protect)
     e->sb = inode->i_sb;
     e->dev = (u64)inode->i_sb->s_dev;
     e->ino = (u64)inode->i_ino;
+    e->generation = (u64)inode->i_generation;
     e->inode = inode;
     e->self_protect = self_protect;
     ihold(inode);
@@ -3019,6 +3038,7 @@ void sus_path_supercall(unsigned int cmd, void __user **arg)
         e->sb = inode->i_sb;
         e->dev = (u64)inode->i_sb->s_dev;
         e->ino = (u64)inode->i_ino;
+        e->generation = (u64)inode->i_generation;
         e->inode = inode;
         ihold(inode);
         if (sus_path_iop_arm(e))
