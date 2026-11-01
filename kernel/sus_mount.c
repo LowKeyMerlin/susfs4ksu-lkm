@@ -115,6 +115,9 @@
 #include <linux/stat.h>     /* struct statx (stx_mnt_id) */
 #include <linux/uaccess.h>
 #include <linux/sched.h>
+#include <linux/sched/task_stack.h> /* task_pt_regs() behind current_pt_regs() */
+#include <linux/ptrace.h>  /* current_pt_regs(): the syscall number and saved args */
+#include <asm/unistd.h>    /* __NR_statmount/__NR_listmount, checked against ours */
 #include <linux/cred.h>
 #include <linux/nsproxy.h>
 #include <linux/percpu.h>
@@ -249,6 +252,90 @@ static struct ida *sus_mount_mnt_id_ida;
 static int (*pfn_ida_alloc_range)(struct ida *ida, unsigned int min,
                                   unsigned int max, gfp_t gfp);
 static void (*pfn_ida_free)(struct ida *ida, unsigned int id);
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+/* ---- unique ids of the mounts we have marked ----
+ *
+ * listmount(2)/statmount(2) (6.8+, so only these two KMIs) name a mount by its 64-bit
+ * mnt_id_unique, not by the 32-bit mnt_id the show_* hooks and the idmap filter on.  To hide a
+ * mount from those two calls we have to recognise its unique id, so every id we mark is recorded
+ * here when the mark happens and tested when the two syscalls return.
+ *
+ * Sorted for a binary search.  Only ids the kernel itself assigned are recorded, never crafted
+ * ones: the kernel's unique id is a monotonic 64-bit counter that is never reused (fs/namespace.c),
+ * so a recorded id can never later name a different mount. Unlike the idmap, this table needs no
+ * teardown when a filesystem is unmounted.  This is also why the id is never rewritten in place:
+ * ns->mounts is an rb-tree keyed on mnt_id_unique (mnt_add_to_ns()), so changing the key of a
+ * mount already in it would break every later lookup and insert in that namespace.  Bounded
+ * at the same ceiling as the idmap. A full table only means the newest marked mount stays visible
+ * to listmount/statmount (logged once), never a crash or a wrong-mount match. */
+#define SUS_MOUNT_UNIQ_MAX 1024
+static u64 sus_mount_uniq[SUS_MOUNT_UNIQ_MAX];
+static int n_uniq;
+static DEFINE_SPINLOCK(uniq_lock);
+static atomic_t n_uniq_full = ATOMIC_INIT(0);
+
+static void sus_mount_uniq_add(u64 uid)
+{
+    unsigned long flags;
+    int lo, hi, pos;
+
+    if (!uid)
+        return;
+    spin_lock_irqsave(&uniq_lock, flags);
+    lo = 0; hi = n_uniq;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+
+        if (sus_mount_uniq[mid] < uid)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    pos = lo;
+    if (pos < n_uniq && sus_mount_uniq[pos] == uid)
+        goto out;		/* already recorded (a re-scan, or both mark sites hitting it) */
+    if (n_uniq >= SUS_MOUNT_UNIQ_MAX) {
+        if (atomic_inc_return(&n_uniq_full) == 1)
+            pr_warn("sus_mount: unique-id table full at %d. The newest marked mounts stay visible to listmount/statmount. Raise SUS_MOUNT_UNIQ_MAX\n",
+                    SUS_MOUNT_UNIQ_MAX);
+        goto out;
+    }
+    memmove(&sus_mount_uniq[pos + 1], &sus_mount_uniq[pos],
+            (n_uniq - pos) * sizeof(sus_mount_uniq[0]));
+    sus_mount_uniq[pos] = uid;
+    n_uniq++;
+out:
+    spin_unlock_irqrestore(&uniq_lock, flags);
+}
+
+/* kretprobe-safe: a spinlock and a binary search, no allocation and no sleeping, so it may run
+ * from the listmount/statmount probe handlers (preemption disabled there).  Never called with
+ * user memory being copied, so the lock is not held across a fault. */
+static bool sus_mount_uniq_has(u64 uid)
+{
+    unsigned long flags;
+    int lo, hi;
+    bool found = false;
+
+    if (!uid)
+        return false;
+    spin_lock_irqsave(&uniq_lock, flags);
+    lo = 0; hi = n_uniq;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+
+        if (sus_mount_uniq[mid] < uid)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (lo < n_uniq && sus_mount_uniq[lo] == uid)
+        found = true;
+    spin_unlock_irqrestore(&uniq_lock, flags);
+    return found;
+}
 #endif
 
 static bool sus_mount_ida_ready(void)
@@ -1156,6 +1243,14 @@ static int sus_mount_newmnt_ret(struct kretprobe_instance *ri, struct pt_regs *r
 
     sus_mount_ident_add(r);
     sus_mount_note_id(r);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+    /* This path cannot give the mount a KSU-range id (ida_alloc sleeps, a kretprobe must not), so
+     * it keeps the kernel's own unique id, record that one, so listmount/statmount hide it just
+     * as the identity record hides it from /proc/mounts.  Upstream's listmount filter keys on the
+     * KSU-range mnt_id and so misses these later mounts. Recording by identity here is the same
+     * deliberate widening the show_* hooks already do (see sus_mount_is_ours()). */
+    sus_mount_uniq_add(r->mnt_id_unique);
+#endif
     atomic_inc(&n_newmnt_recorded);
     SUSFS_LOGI("sus_mount: learned mount at %s (mnt_id %d, devname %s)\n",
             why, r->mnt_id, r->mnt_devname ? r->mnt_devname : "none");
@@ -1170,6 +1265,308 @@ static struct kretprobe kr_newmnt = {
     .maxactive = 16,
 };
 static bool kr_newmnt_ok;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+/* ---- listmount(2) / statmount(2) ----
+ *
+ * These two syscalls (6.8+, so only the 6.12 and 6.18 KMIs here) are the modern replacement for
+ * reading /proc/mounts: listmount returns the 64-bit mnt_id_unique of every reachable mount, and
+ * statmount details one of them by that id.  The show_* hooks do not touch either, so without this
+ * a non-su app that is refused /proc/mounts can still enumerate the hidden mounts here.
+ *
+ * Hook points are chosen by what GKI keeps out of line.  On android16-6.12 builds (6.12.23 and
+ * 6.12.69, kallsyms and call sites checked) do_statmount() is always inlined into the syscall,
+ * do_listmount() is on one build and not the other, and is_path_reachable() (where upstream's
+ * listmount hunk sits) is inlined into every caller that matters, so a probe on it arms and never
+ * fires.  What both builds keep out of line, and call from exactly these two syscalls, is
+ * grab_requested_root(). The syscall wrappers are kept too, being in the syscall table.
+ *
+ * grab_requested_root(ns, root) runs in both syscalls before anything is copied out: in statmount
+ * right after the requested mount was looked up (s->mnt), in listmount before the parent is.  For a
+ * hidden reader asking about one of our mounts (the statmount target, or listmount's
+ * mnt_parent_id), its return is forced to -ENOENT, an errno it returns itself.  The syscall then
+ * fails with nothing copied, the answer an unknown id gets, so neither call is a one-call oracle
+ * for an id a detector already holds.  The root reference it may have taken is dropped by both
+ * callers on every path (path_put(&ks->root), klistmount_free).  The id is read from kernel memory,
+ * so a second thread rewriting the user request cannot race the check.  Upstream hides neither the
+ * statmount target nor the listmount parent: a deliberate, documented widening.  If
+ * grab_requested_root() cannot be probed, a __arm64_sys_statmount return probe stands in: it reads
+ * the id back from the request and zeroes the copied buffer, which a racing thread can beat.
+ *
+ * listmount's own enumeration cannot be filtered while the page is filled: nothing per-mount in
+ * that loop is out of line.  So the __arm64_sys_listmount return probe compacts the ids already
+ * copied to the caller's array and lowers the count.  The kernel resumes after the last id the caller
+ * passes back (mnt_find_id_at(ns, last_mnt_id + 1)), so for a caller that stops on a return <= 0 (the
+ * kernel's samples/vfs) a shorter page loses nothing. But a full page that is entirely ours cannot be lowered to 0 without ending the enumeration and goes out
+ * as built.  A buffer of 1 reaches that on every hidden mount. It is counted as full_leak.  A full
+ * page we shorten also reads as the last one to a caller that stops on a short page (util-linux
+ * libmount does), which then misses the mounts after it. The kernel never returns a short page
+ * before the end, so that is also visible.  The ids sit in the caller's array between the kernel's
+ * copy and our compaction, a window a second thread polling that array can read. The slots past the
+ * lowered count are cleared after the shift so no id outlives it there.  All are limits of
+ * editing the result after the fact, which is all these builds leave room for.
+ *
+ * User memory is touched only in return handlers and only where the syscall body just read or wrote
+ * it, so the pages are present. From this preempt-disabled context a fault would fail the copy with
+ * -EFAULT rather than sleep, and every failure leaves the call as the kernel answered it.
+ *
+ * struct klistmount and struct kstatmount are file-local in fs/namespace.c.  The mirrors below match
+ * android16-6.12 and android17-6.18 (6.18 adds kstatmount.idmap) and are checked at run time
+ * against the syscall's own saved arguments before anything is read through them. */
+struct sus_mount_klistmount {
+    u64 last_mnt_id;
+    u64 mnt_parent_id;
+    u64 *kmnt_ids;
+    u32 nr_mnt_ids;
+    struct mnt_namespace *ns;
+    struct path root;
+};
+
+struct sus_mount_kstatmount {
+    void __user *buf;
+    size_t bufsize;
+    struct vfsmount *mnt;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+    struct mnt_idmap *idmap;
+#endif
+    u64 mask;
+    struct path root;
+};
+
+/* New syscalls share one number on arm64 and AArch32, so one test covers compat callers too. */
+#define SUS_MOUNT_NR_STATMOUNT	457
+#define SUS_MOUNT_NR_LISTMOUNT	458
+#ifdef __NR_statmount
+static_assert(__NR_statmount == SUS_MOUNT_NR_STATMOUNT);
+#endif
+#ifdef __NR_listmount
+static_assert(__NR_listmount == SUS_MOUNT_NR_LISTMOUNT);
+#endif
+
+/* uapi struct mnt_id_req { __u32 size; __u32 mnt_ns_fd; __u64 mnt_id; ... }: the requested id is at
+ * offset 8 on both KMIs (copy_mnt_id_req() BUILD_BUG_ONs the struct size). */
+#define SUS_MNT_ID_REQ_MNT_ID_OFF 8
+
+#define SUS_MOUNT_LM_CHUNK 32
+
+static atomic_t n_root_statmount = ATOMIC_INIT(0);
+static atomic_t n_root_parent = ATOMIC_INIT(0);
+static atomic_t n_root_layout = ATOMIC_INIT(0);
+static atomic_t n_listmount_ret = ATOMIC_INIT(0);
+static atomic_t n_listmount_dropped = ATOMIC_INIT(0);
+static atomic_t n_listmount_full = ATOMIC_INIT(0);
+static atomic_t n_listmount_tailfail = ATOMIC_INIT(0);
+static atomic_t n_listmount_parent = ATOMIC_INIT(0);
+static atomic_t n_statmount_ret = ATOMIC_INIT(0);
+static atomic_t n_statmount_hidden = ATOMIC_INIT(0);
+
+/* The reader this feature hides from, exactly as upstream's listmount hunk decides it: a process
+ * KernelSU would umount modules for.  su, the manager and su-granted apps answer false (their
+ * profile->allow_su is set), so they keep seeing their mounts.  Safe from a kretprobe handler: the
+ * predicate reads current's uid and, when KernelSU is present, calls ksu_uid_should_umount(), which
+ * takes only rcu_read_lock() (confirmed across every supported fork) and never sleeps. */
+static bool sus_mount_hidden_reader(void)
+{
+    return READ_ONCE(susfs_ksu_umount_gate_off)
+           ? susfs_is_current_proc_umounted_app()
+           : susfs_is_current_proc_umounted();
+}
+
+/* grab_requested_root(struct mnt_namespace *ns, struct path *root).  The decision is taken on entry,
+ * where s->mnt / kls->mnt_parent_id are already set. An entry that returns non-zero discards the
+ * instance, so every call we leave alone skips the return trap. */
+static int sus_mount_root_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct pt_regs *u = current_pt_regs();
+    struct path *root = (struct path *)regs->regs[1];
+    int nr = u->syscallno;
+    u64 id;
+
+    if (nr != SUS_MOUNT_NR_STATMOUNT && nr != SUS_MOUNT_NR_LISTMOUNT)
+        return 1;
+    if (!susfs_ptr_plausible(root) || !sus_mount_hidden_reader())
+        return 1;
+    if (nr == SUS_MOUNT_NR_STATMOUNT) {
+        struct sus_mount_kstatmount *s = container_of(root, struct sus_mount_kstatmount, root);
+
+        /* prepare_kstatmount() stored the syscall's buf/bufsize there; if they do not match, the
+         * mirror is wrong for this kernel and nothing is read through it. */
+        if (s->buf != (void __user *)u->regs[1] || s->bufsize != (size_t)u->regs[2] ||
+            !susfs_ptr_plausible(s->mnt)) {
+            atomic_inc(&n_root_layout);
+            return 1;
+        }
+        id = real_mount(s->mnt)->mnt_id_unique;
+    } else {
+        struct sus_mount_klistmount *kls = container_of(root, struct sus_mount_klistmount, root);
+
+        /* nr_mnt_ids is small enough to match a misread field by chance, so the two pointers
+         * prepare_klistmount() set before this call must look like pointers as well. */
+        if (kls->nr_mnt_ids != (u32)u->regs[2] || !susfs_ptr_plausible(kls->kmnt_ids) ||
+            !susfs_ptr_plausible(kls->ns)) {
+            atomic_inc(&n_root_layout);
+            return 1;
+        }
+        id = kls->mnt_parent_id;	/* LSMT_ROOT (~0) is never a recorded id */
+    }
+    return sus_mount_uniq_has(id) ? 0 : 1;
+}
+
+/* -ENOENT is final for statmount: retry_statmount() (fs/namespace.c, 6.12 and 6.18) only loops on
+ * -EAGAIN (it doubles its string buffer and retries), so -ENOENT ends the call. */
+static int sus_mount_root_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    if ((long)regs_return_value(regs) != 0)
+        return 0;
+    regs->regs[0] = (unsigned long)(-ENOENT);
+    if (current_pt_regs()->syscallno == SUS_MOUNT_NR_STATMOUNT)
+        atomic_inc(&n_root_statmount);
+    else
+        atomic_inc(&n_root_parent);
+    return 0;
+}
+
+static struct kretprobe kr_mntroot = {
+    .kp.symbol_name = "grab_requested_root",
+    .entry_handler = sus_mount_root_entry,
+    .handler = sus_mount_root_ret,
+    .maxactive = 32,
+};
+static bool kr_mntroot_ok;
+
+/* Per-call state for the two syscall-wrapper probes. */
+struct sus_mount_sc_state {
+    unsigned long req;		/* user struct mnt_id_req * */
+    unsigned long ubuf;		/* listmount: u64 * ids, statmount: struct statmount * */
+    unsigned long len;		/* listmount: nr_mnt_ids, statmount: bufsize */
+};
+
+/* The wrapper is `long __arm64_sys_x(const struct pt_regs *)`: the user args are in the struct its
+ * x0 points to, as for statx above.  Only a hidden reader's call keeps its instance. */
+static int sus_mount_sc_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct sus_mount_sc_state *st = (struct sus_mount_sc_state *)ri->data;
+    const struct pt_regs *uregs = (const struct pt_regs *)regs->regs[0];
+
+    if (!uregs || !sus_mount_hidden_reader())
+        return 1;
+    st->req = (unsigned long)uregs->regs[0];
+    st->ubuf = (unsigned long)uregs->regs[1];
+    st->len = (unsigned long)uregs->regs[2];
+    return 0;
+}
+
+static bool sus_mount_req_id(unsigned long req, u64 *id)
+{
+    return req && !copy_from_user(id, (void __user *)(req + SUS_MNT_ID_REQ_MNT_ID_OFF), sizeof(*id));
+}
+
+static int sus_mount_listmount_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct sus_mount_sc_state *st = (struct sus_mount_sc_state *)ri->data;
+    u64 __user *ids = (u64 __user *)st->ubuf;
+    long ret = (long)regs_return_value(regs);
+    u64 chunk[SUS_MOUNT_LM_CHUNK];
+    long r, w, dropped = 0;
+    u64 parent = 0;
+
+    atomic_inc(&n_listmount_ret);
+    /* Fallback for the parent oracle when grab_requested_root() is not probed. */
+    if (!READ_ONCE(kr_mntroot_ok) && sus_mount_req_id(st->req, &parent) &&
+        sus_mount_uniq_has(parent)) {
+        if (ids && ret > 0 && clear_user(ids, (size_t)ret * sizeof(u64)))
+            return 0;
+        regs->regs[0] = (unsigned long)(-ENOENT);
+        atomic_inc(&n_listmount_parent);
+        return 0;
+    }
+    if (ret <= 0 || !ids)
+        return 0;
+    if (ret > (long)st->len)
+        return 0;			/* not the array we were told about */
+
+    /* Pass 1, read only: the common answer is "none of ours", and then nothing is written. */
+    for (r = 0; r < ret; r += SUS_MOUNT_LM_CHUNK) {
+        long n = min_t(long, SUS_MOUNT_LM_CHUNK, ret - r), i;
+
+        if (copy_from_user(chunk, ids + r, n * sizeof(u64)))
+            return 0;
+        for (i = 0; i < n; i++)
+            dropped += sus_mount_uniq_has(chunk[i]);
+    }
+    if (!dropped)
+        return 0;
+    /* A full page that is entirely ours goes out as built (see the section comment). */
+    if (dropped == ret && ret == (long)st->len) {
+        atomic_inc(&n_listmount_full);
+        return 0;
+    }
+
+    /* Pass 2: move the kept ids down over ours.  w never passes r and each chunk is read whole
+     * before any of it is written back, so no unread id is overwritten. */
+    for (r = 0, w = 0; r < ret; r += SUS_MOUNT_LM_CHUNK) {
+        long n = min_t(long, SUS_MOUNT_LM_CHUNK, ret - r), i, c = 0;
+
+        if (copy_from_user(chunk, ids + r, n * sizeof(u64)))
+            break;
+        for (i = 0; i < n; i++)
+            if (!sus_mount_uniq_has(chunk[i]))
+                chunk[c++] = chunk[i];
+        if (c && copy_to_user(ids + w, chunk, c * sizeof(u64)))
+            break;
+        w += c;
+    }
+    /* After a failed copy, ids[0..w) is still a correct, shorter page: the caller resumes after the
+     * last of them and the rest is listed again.  With nothing kept, the original answer stands. */
+    if (w == 0 && r < ret)
+        return 0;
+    /* The shift leaves the old values of ids[w..ret) in the caller's array, past the count it is
+     * about to get.  Ours sit in the last slots whenever the hidden mount is the newest one (ids
+     * are listed in ascending order), so they must not be left there.  A fault here is the
+     * caller's own unmapped buffer, which it will hit on its own read. */
+    if (clear_user(ids + w, (size_t)(ret - w) * sizeof(u64)))
+        atomic_inc(&n_listmount_tailfail);
+    atomic_add(dropped, &n_listmount_dropped);
+    regs->regs[0] = (unsigned long)w;
+    return 0;
+}
+
+static struct kretprobe kr_listmount = {
+    .kp.symbol_name = "__arm64_sys_listmount",
+    .entry_handler = sus_mount_sc_entry,
+    .handler = sus_mount_listmount_ret,
+    .data_size = sizeof(struct sus_mount_sc_state),
+    .maxactive = 32,
+};
+static bool kr_listmount_ok;
+
+/* Registered only when grab_requested_root() could not be: see the section comment. */
+static int sus_mount_statmount_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct sus_mount_sc_state *st = (struct sus_mount_sc_state *)ri->data;
+    u64 id = 0;
+
+    atomic_inc(&n_statmount_ret);
+    if ((long)regs_return_value(regs) != 0)
+        return 0;
+    if (!sus_mount_req_id(st->req, &id) || !sus_mount_uniq_has(id))
+        return 0;
+    if (st->ubuf && st->len && clear_user((void __user *)st->ubuf, st->len))
+        return 0;
+    regs->regs[0] = (unsigned long)(-ENOENT);
+    atomic_inc(&n_statmount_hidden);
+    return 0;
+}
+
+static struct kretprobe kr_statmount = {
+    .kp.symbol_name = "__arm64_sys_statmount",
+    .entry_handler = sus_mount_sc_entry,
+    .handler = sus_mount_statmount_ret,
+    .data_size = sizeof(struct sus_mount_sc_state),
+    .maxactive = 32,
+};
+static bool kr_statmount_ok;
+#endif /* >= 6.12 */
 
 /* ---- /proc/<pid>/fdinfo/N ----
  *
@@ -1520,6 +1917,12 @@ static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
                      "fdinfo: probes=%d entry=%d hits=%d rewrites=%d nolabel=%d\n"
                      "statx: entry=%d ret=%d hits=%d rewrites=%d nobuf=%d err=%d copyfail=%d nomap=%d "
                      "(sys=%d do=%d)\n"
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+                     "uniq: recorded=%d/%d full=%d\n"
+                     "mntroot: statmount=%d parent=%d layout=%d missed=%d (probe=%d)\n"
+                     "listmount: ret=%d dropped=%d full_leak=%d tailfail=%d parent=%d missed=%d (probe=%d)\n"
+                     "statmount_fallback: ret=%d hidden=%d (probe=%d)\n"
+#endif
                      "statfs: redirects=%d\n",
                      sus_mount_idmap_live(), n_idmap,
                      sus_mount_ident_live(), READ_ONCE(n_ident), mount_registered,
@@ -1549,6 +1952,17 @@ static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
                      atomic_read(&n_statx_nobuf), atomic_read(&n_statx_err),
                      atomic_read(&n_statx_copyfail), atomic_read(&n_statx_nomap),
                      (int)kr_statx_ok, (int)kr_statx_do_ok,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+                     READ_ONCE(n_uniq), SUS_MOUNT_UNIQ_MAX, atomic_read(&n_uniq_full),
+                     atomic_read(&n_root_statmount), atomic_read(&n_root_parent),
+                     atomic_read(&n_root_layout), (int)kr_mntroot.nmissed, (int)kr_mntroot_ok,
+                     atomic_read(&n_listmount_ret), atomic_read(&n_listmount_dropped),
+                     atomic_read(&n_listmount_full), atomic_read(&n_listmount_tailfail),
+                     atomic_read(&n_listmount_parent),
+                     (int)kr_listmount.nmissed, (int)kr_listmount_ok,
+                     atomic_read(&n_statmount_ret), atomic_read(&n_statmount_hidden),
+                     (int)kr_statmount_ok,
+#endif
                      atomic_read(&n_statfs_redirects));
 }
 static const struct kernel_param_ops sus_mount_stat_ops = {
@@ -2314,6 +2728,12 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long 
         if (n_replaced < (int)ARRAY_SIZE(replaced))
             replaced[n_replaced++] = r->mnt_id;
         r->mnt_id = new_id;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+        /* 6.12+ also names mounts by a 64-bit unique id (listmount, statmount).  Upstream crafts
+         * one at allocation (7d91da2). This mount is already in ns->mounts, keyed on that id, so it
+         * keeps the kernel's own (already in range, no gap) and the id is only recorded. */
+        sus_mount_uniq_add(r->mnt_id_unique);
+#endif
         /* After the id is replaced, exactly like upstream: the climb starts at a
          * mount that now carries a KSU-range id and stops at the first ancestor
          * that does not - i.e. the id mountinfo still prints for the host. */
@@ -2645,6 +3065,23 @@ static void sus_mount_unregister(void)
         susfs_krp_forget_addr(&kr_newmnt);
         kr_newmnt_ok = false;
     }
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+    if (kr_listmount_ok) {
+        unregister_kretprobe(&kr_listmount);
+        susfs_krp_forget_addr(&kr_listmount);
+        kr_listmount_ok = false;
+    }
+    if (kr_statmount_ok) {
+        unregister_kretprobe(&kr_statmount);
+        susfs_krp_forget_addr(&kr_statmount);
+        kr_statmount_ok = false;
+    }
+    if (kr_mntroot_ok) {
+        unregister_kretprobe(&kr_mntroot);
+        susfs_krp_forget_addr(&kr_mntroot);
+        WRITE_ONCE(kr_mntroot_ok, false);
+    }
+#endif
     mount_registered = false;
     mutex_unlock(&sus_mount_ctl_lock);
 }
@@ -2779,6 +3216,34 @@ static int sus_mount_register(void)
     } else {
         kr_newmnt_ok = true;
     }
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+    /* Optional, and only present on the two KMIs with these syscalls: without them our mounts stay
+     * hidden from /proc/mounts but are listable via listmount(2)/statmount(2).  grab_requested_root
+     * goes first so the listmount probe never runs its parent fallback while it is armed. */
+    rc = register_kretprobe(&kr_mntroot);
+    if (rc) {
+        susfs_krp_forget_addr(&kr_mntroot);
+        pr_warn("sus_mount: register_kretprobe(grab_requested_root) failed %d, statmount(2) and listmount(2) by parent fall back to rewriting the result\n", rc);
+    } else {
+        WRITE_ONCE(kr_mntroot_ok, true);
+    }
+    rc = register_kretprobe(&kr_listmount);
+    if (rc) {
+        susfs_krp_forget_addr(&kr_listmount);
+        pr_warn("sus_mount: register_kretprobe(__arm64_sys_listmount) failed %d, listmount(2) keeps returning our mounts\n", rc);
+    } else {
+        kr_listmount_ok = true;
+    }
+    if (!kr_mntroot_ok) {
+        rc = register_kretprobe(&kr_statmount);
+        if (rc) {
+            susfs_krp_forget_addr(&kr_statmount);
+            pr_warn("sus_mount: register_kretprobe(__arm64_sys_statmount) failed %d, statmount(2) still details our mounts by id\n", rc);
+        } else {
+            kr_statmount_ok = true;
+        }
+    }
+#endif
     mount_registered = true;
     mutex_unlock(&sus_mount_ctl_lock);
     return 0;
