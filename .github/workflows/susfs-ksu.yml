@@ -15,9 +15,10 @@ run-name: "susfs-ksu: ${{ inputs.title || (github.event_name == 'schedule' && 's
 # schedule. Tip runs weekly.
 #
 # A fork with no stable release, or one that cannot build as a loadable module, is listed in the
-# summary and not tested. Every kernel of every tested fork must pass. A boot with no verdict is
-# retried once, then counts as failed. The scripts under test come from the zip the build
-# produced, the ones in this repository only drive the VM.
+# summary and not tested. Every kernel of every tested fork must pass, except backslashxx, whose
+# own syscall table mirroring misses the live dispatch path on some kernels, see the boot job. A
+# boot with no verdict is retried once, then counts as failed. The scripts under test come from
+# the zip the build produced, the ones in this repository only drive the VM.
 #
 # susfs-pipeline.yml calls this with the run of its build. A schedule or a dispatch without a run
 # tests the newest pipeline build of the default branch.
@@ -232,6 +233,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.boots) }}
+    # backslashxx's own syscall table mirroring does not take effect on every kernel it claims to
+    # (observed on 5.10 regardless of source, and on the official Google GKI build of 6.12 and
+    # 6.18), so no syscall the module or KernelSU itself installs is ever reached. Its boots run
+    # and report their real verdict, but do not gate the pipeline until that is fixed upstream.
+    continue-on-error: ${{ matrix.fork == 'backslashxx' }}
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
