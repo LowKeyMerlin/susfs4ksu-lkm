@@ -18,8 +18,9 @@ kernel you already run, next to KernelSU. No kernel build, no SUSFS patches.
 * **Same functionality, no kernel build.** Hides paths, mounts, file stat, memory maps and more from
   apps, as SUSFS does when it is built into the kernel.
 * **Boot guard.** Disables the module when boots do not finish, so a bad load does not repeat.
-* **Early or late loading.** Loads at `post-fs-data`, earlier at `post-fs-data.d`, or by hand on a
-  running system. Open file descriptors and running apps are covered from the first rule.
+* **Early by default, or by hand.** Loads at `post-fs-data.d`, before `post-fs-data` and before
+  other modules mount. Can load later instead, or by hand on a running system. Open file
+  descriptors and running apps are covered from the first rule.
 * **No idle cost.** With no rules the module does nothing. It has no timers, threads or polling.
 * **Tested before it merges.** Every change is built, booted in QEMU, run against the KernelSU forks
   and run on an Android guest.
@@ -45,13 +46,15 @@ To remove it, disable the module in the manager, or run `rmmod susfs_guard_lkm` 
 
 | Stage | How |
 | --- | --- |
-| `post-fs-data` | Default. |
-| `post-fs-data.d` | `touch /data/adb/modules/susfs_guard_lkm/early_load` and reboot. |
+| `post-fs-data.d` | Default. |
+| `post-fs-data` | Turn early loading off in the WebUI, or `early.sh off` and reboot. |
 | Manual | `ksud insmod <ko>`, or `susfs_insmod <ko>` without KernelSU. |
 
 > [!TIP]
-> Use `post-fs-data.d` when rules or kstat snapshots must exist before other modules mount.
-> Delete `early_load` and reboot to go back to the default.
+> `post-fs-data.d` is the default, so rules and kstat snapshots exist before other modules mount.
+> A manager that sends SUSFS settings in its own `post-fs-data` (brene and similar) needs this.
+> Turn it off in the WebUI, or run `/data/adb/modules/susfs_guard_lkm/early.sh off` and reboot,
+> to load at `post-fs-data` instead. `early.sh on` turns it back on.
 
 <details>
 <summary>Loading by hand</summary>
