@@ -36,6 +36,8 @@
 #include <linux/errno.h>
 #include <linux/delay.h>
 #include <linux/rcupdate.h>
+#include <linux/bitops.h>
+#include <linux/uaccess.h>
 #include <asm/unistd.h>
 
 #include "patch_memory.h"
@@ -94,9 +96,70 @@ static int fp_patch_entry(susfs_syscall_fn_t *table, int nr, const char *name,
 	return 0;
 }
 
+/* A KernelSU build can copy a syscall table and point the dispatcher at the copy by rewriting the adrp
+ * that loads the table's page (backslashxx does). The kernel then never reads the original table, so
+ * an entry patched there is never called. The table to patch is the one the dispatcher reads. */
+#define SUSFS_FP_SCAN_INSNS	64
+#define SUSFS_FP_PROBE_ENTRIES	64
+#define SUSFS_FP_PROBE_MIN	48
+
+/* The page an adrp at pc loads, false when insn is not an adrp. */
+static bool fp_adrp_page(unsigned long pc, u32 insn, unsigned long *page)
+{
+	long imm;
+
+	if ((insn & 0x9f000000u) != 0x90000000u)
+		return false;
+	imm = sign_extend64(((insn >> 5) & 0x7ffffu) << 2 | ((insn >> 29) & 3u), 20);
+	*page = (pc & ~0xfffUL) + ((unsigned long)imm << 12);
+	return true;
+}
+
+/* A copy keeps nearly every entry of the table it was made from. KernelSU replaces a few in it. */
+static bool fp_is_copy_of(const susfs_syscall_fn_t *cand, const susfs_syscall_fn_t *table)
+{
+	susfs_syscall_fn_t a, b;
+	int i, same = 0;
+
+	for (i = 0; i < SUSFS_FP_PROBE_ENTRIES; i++) {
+		if (copy_from_kernel_nofault(&a, &cand[i], sizeof(a)) ||
+		    copy_from_kernel_nofault(&b, &table[i], sizeof(b)))
+			return false;
+		if (a && a == b)
+			same++;
+	}
+	return same >= SUSFS_FP_PROBE_MIN;
+}
+
+static susfs_syscall_fn_t *fp_live_table(susfs_syscall_fn_t *table, const char *dispatcher)
+{
+	unsigned long fn = find_kernel_symbol_exact(dispatcher);
+	int i;
+
+	if (!fn)
+		return table;
+	for (i = 0; i < SUSFS_FP_SCAN_INSNS; i++) {
+		unsigned long pc = fn + i * sizeof(u32), page;
+		susfs_syscall_fn_t *cand;
+		u32 insn;
+
+		if (copy_from_kernel_nofault(&insn, (void *)pc, sizeof(insn)))
+			break;
+		if (!fp_adrp_page(pc, insn, &page))
+			continue;
+		if (page == ((unsigned long)table & ~0xfffUL))
+			return table;
+		cand = (susfs_syscall_fn_t *)(page | ((unsigned long)table & 0xfffUL));
+		if (fp_is_copy_of(cand, table))
+			return cand;
+	}
+	return table;
+}
+
 int susfs_fp_init(void)
 {
 	void *direct, *walked;
+	susfs_syscall_fn_t *live;
 
 	if (sys_call_table_ptr)
 		return 0;
@@ -124,6 +187,13 @@ int susfs_fp_init(void)
 		return -ENOENT;
 	}
 
+	live = fp_live_table(sys_call_table_ptr, "do_el0_svc");
+	if (live != sys_call_table_ptr) {
+		pr_info("susfs_fp: do_el0_svc reads a copy of sys_call_table, patching the copy at %px instead of %px\n",
+			live, sys_call_table_ptr);
+		sys_call_table_ptr = live;
+	}
+
 	pr_info("susfs_fp: sys_call_table at %px (entry 0 %px)\n",
 		sys_call_table_ptr, (void *)READ_ONCE(sys_call_table_ptr[0]));
 
@@ -134,6 +204,14 @@ int susfs_fp_init(void)
 	if (!compat_sys_call_table_ptr)
 		compat_sys_call_table_ptr =
 			(susfs_syscall_fn_t *)ksu_resolve_symbol_for_functable_hook("compat_sys_call_table");
+	if (compat_sys_call_table_ptr) {
+		live = fp_live_table(compat_sys_call_table_ptr, "do_el0_svc_compat");
+		if (live != compat_sys_call_table_ptr) {
+			pr_info("susfs_fp: do_el0_svc_compat reads a copy of compat_sys_call_table, patching the copy at %px instead of %px\n",
+				live, compat_sys_call_table_ptr);
+			compat_sys_call_table_ptr = live;
+		}
+	}
 	pr_info("susfs_fp: compat_sys_call_table at %px (%s)\n",
 		compat_sys_call_table_ptr, compat_sys_call_table_ptr ? "ok" : "absent");
 	return 0;
