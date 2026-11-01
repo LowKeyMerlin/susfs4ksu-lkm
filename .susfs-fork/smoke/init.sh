@@ -8,6 +8,10 @@ mount -t proc proc /proc
 mount -t sysfs sys /sys
 # The loader reads real addresses from /proc/kallsyms.
 echo 0 >/proc/sys/kernel/kptr_restrict
+# The kprobe list is read before the module loads and again after it is unloaded.
+mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+kprobe_count() { n=$(grep -c . /sys/kernel/debug/kprobes/list 2>/dev/null); echo "${n:-0}"; }
+kprobes_base=$(kprobe_count)
 
 . /smoke.env
 M=/module
@@ -428,6 +432,11 @@ say "kstat_fstatfs_app=$(kwho "$(ksb app fstatfs $KS)" "$kreal" "$ksmall")"
 say "kstat_statfs_app_compat=$(kwho "$(ksb app statfs $KS "$KSTAT32")" "$kreal" "$ksmall")"
 say "kstat_fstatfs_app_compat=$(kwho "$(ksb app fstatfs $KS "$KSTAT32")" "$kreal" "$ksmall")"
 say "kstat_statfs_root=$(kwho "$(ksb root statfs $KS)" "$kreal" "$ksmall")"
+# fstatfs takes an O_PATH descriptor (fs/statfs.c fd_statfs() uses fdget_raw), so the module's own
+# fd lookup must not reject one: an app and root get the same answers as for a plain descriptor.
+say "kstat_fstatfs_opath_app=$(kwho "$(ksb app fstatfs_opath $KS)" "$kreal" "$ksmall")"
+say "kstat_fstatfs_opath_app_compat=$(kwho "$(ksb app fstatfs_opath $KS "$KSTAT32")" "$kreal" "$ksmall")"
+say "kstat_fstatfs_opath_root=$(kwho "$(ksb root fstatfs_opath $KS)" "$kreal" "$ksmall")"
 say "kstat_other_path_app=$(yesno [ "$(ksb app statfs /proc)" = "$(ksb root statfs /proc)" ])"
 # A caller the rules apply to is answered by the module and not by the kernel, so what the kernel
 # fails with, and the bytes it fills in on the paths no rule names, have to come out the same.
@@ -478,6 +487,19 @@ say "kin_cleared_app=$(kwho "$(kin app $KS)" "$kin_before" "$kin_after")"
 # the first mount above it that is not, as upstream does in vfs_statfs. Root keeps the real ones.
 # The VM has no KernelSU, so "umounted" is the app half of the gate, as for the rest of the module.
 kmsn() { sed -n 's/.*statfs: redirects=\([0-9]*\).*/\1/p' /sys/module/susfs_guard_lkm/parameters/mount_stat; }
+# From 6.12 (the first KMI with listmount/statmount) the module reports three probe lines on
+# mount_stat.  grab_requested_root is the primary hook (it closes the statmount target and the
+# listmount parent), the listmount wrapper compacts the id array. The statmount wrapper is a
+# fallback armed only when grab_requested_root could not be.  "absent" means a kernel without them.
+MS=/sys/module/susfs_guard_lkm/parameters/mount_stat
+probe_of() { sed -n "s/^$1: .*(probe=\([01]\)).*/\1/p" "$MS"; }
+if grep -q '^mntroot: ' "$MS" 2>/dev/null; then
+  say "lm_mntroot_probe=$(probe_of mntroot)"
+  say "lm_listmount_probe=$(probe_of listmount)"
+  say "lm_statmount_fallback_probe=$(probe_of statmount_fallback)"
+else
+  say "lm_mntroot_probe=absent"
+fi
 mkdir -p /data/adb/ms /ms_bind
 kparent=$(ksb root statfs /data/adb)
 kroot_fs=$(ksb root statfs /)
@@ -502,6 +524,55 @@ mount --bind /data/adb/ms /ms_bind
 say "kms_ident_root=$(kwho "$(ksb root statfs /ms_bind)" "$kroot_fs" "$ktmp")"
 say "kms_ident_app=$(kwho "$(ksb app statfs /ms_bind)" "$kroot_fs" "$ktmp")"
 umount /ms_bind
+
+# listmount(2)/statmount(2) hiding, 6.12+ only.  The marked mount /data/adb/ms has a 64-bit unique
+# id. A detector enumerates it with listmount or confirms a held id with statmount.  Root is the
+# control: it must still see everything.  lm_id is read as root (the real unique id the module
+# recorded), the app half is the hidden reader on this KernelSU-less VM.
+# lmc KEY reads a listmount counter off mount_stat.
+lmc() { sed -n "s/^listmount: .*$1=\([0-9-]*\).*/\1/p" "$MS"; }
+# lids WHO NR [PARENT] lists the ids listmount gives WHO, NR per call, one per line.
+lids() {
+  if [ "$1" = root ]; then $KSTAT listmount "$2" $3; else as_user "$1" "$KSTAT listmount $2 $3"; fi |
+    sed -n 's/^id=//p'
+}
+# lhas WHO NR ID: yes if listmount gives WHO the id ID (whole pipeline, so yesno reads grep's status).
+lhas() { lids "$1" "$2" | grep -qx "$3"; }
+if grep -q '^mntroot: ' "$MS" 2>/dev/null; then
+  lm_id=$(kcall root $KSTAT mntid /data/adb/ms | sed -n 's/^mntid=//p')
+  say "lm_id_read=$(yesno [ -n "$lm_id" ])"
+  # Root sees the id when it lists the whole tree, both buffer sizes.
+  say "lm_root_sees_big=$(yesno lhas root 4096 "$lm_id")"
+  say "lm_root_sees_one=$(yesno lhas root 1 "$lm_id")"
+  # A hidden reader with a roomy buffer never sees it, and still reaches the real mounts (a non-zero
+  # count, so the list was not truncated to nothing).
+  say "lm_app_sees_big=$(yesno lhas app 4096 "$lm_id")"
+  say "lm_app_count_big=$(lids app 4096 | grep -c .)"
+  # The page is shortened by moving the kept ids down. The slots past the new count must not keep the
+  # old values.  lids only prints the reported slots, so listmount_tail reads the whole buffer.
+  # /data/adb/ms is the newest mount here, so it is in the last slot of the unfiltered answer.
+  say "lm_app_tail_hidden=$(as_app "$KSTAT listmount_tail 4096 $lm_id" | sed -n 's/^tail_hidden=//p')"
+  say "lm_root_tail_shows=$($KSTAT listmount_tail 4096 "$lm_id" | sed -n 's/^reported_hidden=.*/yes/p')"
+  # A buffer of one is the documented residual: a page that is entirely our id cannot be shortened to
+  # zero without ending the walk, so it goes out and the module counts it as full_leak.  The test
+  # records both, rather than pretending the leak is closed.
+  before_full=$(lmc full_leak)
+  say "lm_app_one_leaks=$(yesno lhas app 1 "$lm_id")"
+  say "lm_app_one_full_counted=$(yesno [ "$(lmc full_leak)" -gt "${before_full:-0}" ])"
+  # statmount of the marked id, held by a detector, is fully closed for the app and open for root.
+  say "lm_statmount_app=$(kcall app $KSTAT statmount "$lm_id" | sed -n 's/^rc=//p')"
+  say "lm_statmount_root_matches=$(yesno [ -n "$lm_id" ] &&
+    [ "$(kcall root $KSTAT statmount "$lm_id" | sed -n 's/^sm_mnt_id=//p')" = "$lm_id" ])"
+  say "lm_statmount_app_compat=$(kcall app $KSTAT32 statmount "$lm_id" | sed -n 's/^rc=//p')"
+  # A mount the module does not hide is still answered, so statmount is not blanket-denied: root's
+  # own id for / proves a normal lookup works.
+  root_id=$(kcall root $KSTAT mntid / | sed -n 's/^mntid=//p')
+  say "lm_statmount_app_other=$(kcall app $KSTAT statmount "$root_id" | sed -n 's/^rc=//p')"
+  # listmount under the hidden mount as the parent is closed too (the mnt_parent_id oracle).
+  say "lm_app_parent_rc=$(as_app "$KSTAT listmount 4 $lm_id" | sed -n 's/^rc=//p')"
+  # Same request from root has no children to list but succeeds, so the app's error is ours.
+  say "lm_root_parent_count=$($KSTAT listmount 4 "$lm_id" | sed -n 's/^count=//p')"
+fi
 # Readers while the mount is lazily unmounted and mounted again: each answer is one a mount can
 # give, an empty one while the path is gone, and nothing crashes.
 kms_bad=/data/local/tmp/kms_bad
@@ -629,6 +700,111 @@ say "installer_noksu_done=$(has '[5/5]' "$out")"
 say "installer_noksu_results=$(results "$out")"
 say "installer_noksu_log_result=$(logresult)"
 say "installer_log_rotated=$(yesno grep -q 'arm64 only' "$instlog.old")"
+
+# ---- soak, unload and reload ----------------------------------------------------------------
+# Not run with KernelSU loaded: those boots check the gates, and an unload there says nothing more.
+# Everything the module hooks is used at once by several readers while the marked mount is torn
+# down and made again and the rules change.  The kernel is not a debug build, so a use-after-free or
+# a deadlock shows only as a crash, a stall, or a VM that never reaches its last line, check.py
+# treats each of those as a failure.  Leaks show as slab growth between two identical rounds.
+if [ -z "$KSU" ]; then
+  SOAK_SECS=${SOAK_SECS:-12}
+  SD=/data/local/tmp/soak
+  say "soak_secs=$SOAK_SECS"
+  sus_map_add /bin/busybox >/dev/null
+  lm_id=${lm_id:-0}
+  # One worker: run the command over and over until the stop file exists, then store the count.
+  soak_worker() {
+    n=0
+    while [ ! -f $SD/stop ]; do "$2" >/dev/null 2>&1; n=$((n + 1)); done
+    echo $n >$SD/n.$1
+  }
+  w_statfs() {
+    out=$(ksb app statfs /data/adb/ms)
+    case "$out" in "$kparent" | "$ktmp" | "") ;; *) echo "statfs $out" >>$SD/bad ;; esac
+  }
+  w_fstatfs() {
+    out=$(ksb app fstatfs /data/adb/ms)
+    case "$out" in "$kparent" | "$ktmp" | "") ;; *) echo "fstatfs $out" >>$SD/bad ;; esac
+  }
+  w_list() { lids app 4096 >/dev/null; }
+  w_statmount() { kcall app $KSTAT statmount "$lm_id" >/dev/null; }
+  w_mountinfo() { as_app 'cat /proc/self/mountinfo /proc/self/mounts /proc/self/mountstats'; }
+  w_maps() { as_app 'grep -c busybox /proc/self/maps; ls /data/adb >/dev/null'; }
+  w_churn() {
+    umount -l /data/adb/ms 2>/dev/null
+    mount -t tmpfs -o size=2m tmpfs /data/adb/ms
+    echo reset >/proc/susfs_hide_mounts
+  }
+  w_rules() { wr root 'add /bin/sc'; wr root 'del /bin/sc'; }
+  SOAK_WORKERS="statfs fstatfs list statmount mountinfo maps churn rules"
+  soak_round() {
+    rm -rf $SD
+    mkdir -p $SD
+    umount -l /data/adb/ms 2>/dev/null
+    mount -t tmpfs -o size=2m tmpfs /data/adb/ms
+    echo reset >/proc/susfs_hide_mounts
+    pids=
+    for w in $SOAK_WORKERS; do
+      soak_worker "$w" "w_$w" &
+      pids="$pids $!"
+    done
+    sleep "$SOAK_SECS"
+    : >$SD/stop
+    wait $pids
+  }
+  # Memory the kernel cannot reclaim, in kB, after the caches are dropped and freed objects settle.
+  slab_kb() {
+    sync
+    echo 3 >/proc/sys/vm/drop_caches 2>/dev/null
+    sleep 2
+    sed -n 's/^SUnreclaim: *\([0-9]*\) kB.*/\1/p' /proc/meminfo
+  }
+  # The first round warms the caches, so the growth is measured over the second.
+  soak_round
+  slab_warm=$(slab_kb)
+  soak_round
+  slab_end=$(slab_kb)
+  idle=
+  for w in $SOAK_WORKERS; do
+    [ "$(cat $SD/n.$w 2>/dev/null || echo 0)" -gt 0 ] || idle="$idle $w"
+  done
+  say "soak_idle_workers=${idle:- none}"
+  say "soak_iterations=$(for w in $SOAK_WORKERS; do printf '%s=%s ' "$w" "$(cat $SD/n.$w 2>/dev/null)"; done)"
+  say "soak_bad_answers=$([ -f $SD/bad ] && wc -l <$SD/bad || echo 0)"
+  say "soak_slab_kb=$slab_warm/$slab_end"
+  say "soak_slab_growth_kb=$((slab_end - slab_warm))"
+  umount -l /data/adb/ms 2>/dev/null
+  say "soak_alive=$(yesno [ -d /sys/module/susfs_guard_lkm ])"
+
+  # Unload, then load again, three times.  An unload that leaves a hook behind crashes on the
+  # next call into freed text, so each cycle ends with the module in use again.
+  say "unload_kprobes_base=$kprobes_base"
+  say "unload_kprobes_loaded=$(kprobe_count)"
+  slab_c0=$(slab_kb)
+  for c in 1 2 3; do
+    rmmod susfs_guard_lkm >/tmp/rmmod.out 2>&1
+    say "unload${c}_rc=$?"
+    sed "s/^/RMMOD $c: /" /tmp/rmmod.out
+    sleep 1
+    say "unload${c}_sysfs=$(if [ -d /sys/module/susfs_guard_lkm ]; then echo present; else echo gone; fi)"
+    say "unload${c}_probe=$(probe)"
+    say "unload${c}_kprobes_left=$(kprobe_count)"
+    say "unload${c}_proc_nodes=$(ls /proc | grep -c '^susfs_')"
+    # Still a working kernel: the same calls the module hooked, with the hooks gone.
+    say "unload${c}_app_statfs=$(yesno [ -n "$(ksb app statfs /)" ])"
+    say "unload${c}_app_maps=$(yesno [ "$(as_app grep -c busybox /proc/self/maps)" -gt 0 ])"
+    ( cd "$M" && /system/bin/sh ./post-fs-data.sh )
+    say "reload${c}_rc=$?"
+    say "reload${c}_probe=$(probe)"
+    say "reload${c}_sysfs=$(if [ -d /sys/module/susfs_guard_lkm ]; then echo present; else echo gone; fi)"
+    say "reload${c}_map_rule=$(sus_map_add /bin/busybox)"
+    say "reload${c}_app_maps=$(yesno [ "$(as_app grep -c busybox /proc/self/maps)" -gt 0 ])"
+  done
+  slab_c3=$(slab_kb)
+  say "unload_slab_kb=$slab_c0/$slab_c3"
+  say "unload_slab_growth_kb=$((slab_c3 - slab_c0))"
+fi
 
 for f in load.log guard.log; do
   [ -f "$f" ] && sed "s/^/LOG $f: /" "$f"

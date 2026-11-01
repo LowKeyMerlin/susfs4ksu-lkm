@@ -34,7 +34,13 @@ FACT = re.compile(r"^SMOKE (\w+)=(.*)$")
 SCRIPT_LINE = re.compile(r"^(SMOKE |LOG |INSTALL[\w-]*: )")
 LAYER_FAILED = re.compile(r"\b\w+ init failed -?\d+ - that feature stays off")
 KERNEL_TAIL = re.compile(r"\[\s*\d+\.\d{6}\]")
-CRASH = re.compile(r"Kernel panic|Oops[:\s]|BUG:|Call trace:|Unable to handle kernel|Internal error:")
+# A healthy boot prints none of these.  The stalls and lock reports are what a deadlock or a
+# lockup under the soak looks like on a kernel that is not a debug build.
+CRASH = re.compile(
+    r"Kernel panic|Oops[:\s]|BUG:|Call trace:|Unable to handle kernel|Internal error:"
+    r"|soft lockup|hard LOCKUP|detected stalls? on CPUs|self-detected stall"
+    r"|blocked for more than \d+ seconds|possible (?:circular|recursive) locking"
+    r"|inconsistent lock state|refcount_t: (?:underflow|saturated|addition on 0)")
 
 # What a healthy run reports: key, expected value, what it shows.
 EXPECTED = [
@@ -116,6 +122,9 @@ KSTAT_EXPECTED = [
     ("kstat_statfs_app_compat", "real", "the same through the 32-bit statfs64"),
     ("kstat_fstatfs_app_compat", "real", "the same through the 32-bit fstatfs64"),
     ("kstat_statfs_root", "covered", "root is answered with the mount that is there"),
+    ("kstat_fstatfs_opath_app", "real", "fstatfs of an O_PATH descriptor is answered like one of a plain descriptor"),
+    ("kstat_fstatfs_opath_app_compat", "real", "the same through the 32-bit fstatfs64"),
+    ("kstat_fstatfs_opath_root", "covered", "and root still gets the mount that is there"),
     ("kfd_mounts_differ", "yes", "the mount over the path changes what fdinfo prints for a descriptor on it"),
     ("kfd_root", "covered", "root reads the mount id and inode that are there"),
     ("kfd_app", "real", "an app reads the mount id and inode the path had when the rule was added"),
@@ -265,6 +274,59 @@ KSU_DEBUG_EXPECTED = [
 ]
 
 
+# The soak, unload and reload stage (not run with KernelSU loaded).  Every unload cycle is checked
+# alike: the module is gone, the kprobe list is what it was before the load, the calls it hooked
+# still work, and a reload brings the hooks back.
+SOAK_EXPECTED = [
+    ("soak_idle_workers", "none", "every reader and writer of the soak made progress, so none was stuck"),
+    ("soak_bad_answers", "0", "no reader of a mount that is torn down and made again got an answer no mount gives"),
+    ("soak_alive", "yes", "the module is still loaded after the soak"),
+]
+UNLOAD_EXPECTED = [
+    ("unload{c}_rc", "0", "rmmod of the module succeeds"),
+    ("unload{c}_sysfs", "gone", "/sys/module/susfs_guard_lkm is gone after the unload"),
+    ("unload{c}_probe", "1", "SUSFS no longer answers after the unload"),
+    ("unload{c}_proc_nodes", "0", "no /proc/susfs_* node is left after the unload"),
+    ("unload{c}_app_statfs", "yes", "an app's statfs still works after the unload"),
+    ("unload{c}_app_maps", "yes", "with the module gone an app sees the mapping the rule hid"),
+    ("reload{c}_rc", "0", "post-fs-data.sh loads the module again"),
+    ("reload{c}_probe", "0", "SUSFS answers again after the reload"),
+    ("reload{c}_sysfs", "present", "/sys/module/susfs_guard_lkm exists again after the reload"),
+    ("reload{c}_map_rule", "0", "a sus_map rule is accepted after the reload"),
+    ("reload{c}_app_maps", "no", "the reloaded module hides the mapping again"),
+]
+# Growth of memory the kernel cannot reclaim, in kB.  Measured over a second identical round, so
+# warm-up is not counted. A leak per call grows with the thousands of calls a round makes.
+SLAB_LIMITS = [
+    ("soak_slab_growth_kb", 1024, "unreclaimable slab grew over a second identical soak round"),
+    ("unload_slab_growth_kb", 512, "unreclaimable slab grew over three unload and reload cycles"),
+]
+
+
+def soak_problems(facts):
+    problems = []
+    for key, want, shows in SOAK_EXPECTED:
+        got = facts.get(key)
+        if got != want:
+            problems.append(f"{shows}: expected {key}={want}, got {got if got is not None else 'nothing'}")
+    base = facts.get("unload_kprobes_base")
+    for c in (1, 2, 3):
+        for key, want, shows in UNLOAD_EXPECTED:
+            key = key.format(c=c)
+            got = facts.get(key)
+            if got != want:
+                problems.append(f"{shows}: expected {key}={want}, got {got if got is not None else 'nothing'}")
+        key = f"unload{c}_kprobes_left"
+        if facts.get(key) != base or base is None:
+            problems.append("no kprobe of the module is left after the unload: expected "
+                            f"{key}={base} (the count before the load), got {facts.get(key)}")
+    for key, limit, shows in SLAB_LIMITS:
+        got = facts.get(key)
+        if not (got is not None and got.lstrip("-").isdigit() and int(got) <= limit):
+            problems.append(f"{shows}: expected {key}<={limit}, got {got if got is not None else 'nothing'}")
+    return problems
+
+
 def split_tail(line):
     """Return (line without a kernel message that ran into it, that message)."""
     m = KERNEL_TAIL.search(line)
@@ -278,6 +340,50 @@ def facts_of(lines):
         if m:
             found[m[1]] = m[2].strip()
     return found
+
+
+# listmount(2)/statmount(2) exist from 6.12 on the KMIs here. A marked mount is hidden from an app;
+# root is the control. lm_app_one_leaks=yes is the documented residual (a page of one that is
+# entirely ours cannot be shortened to zero), so it is expected, and counted as full_leak.
+LISTMOUNT_EXPECTED = [
+    ("lm_listmount_probe", "1", "the __arm64_sys_listmount probe armed"),
+    ("lm_id_read", "yes", "the test read the unique id of the marked mount"),
+    ("lm_root_sees_big", "yes", "root listing the tree sees the marked mount"),
+    ("lm_root_sees_one", "yes", "root listing one id per call sees the marked mount"),
+    ("lm_app_sees_big", "no", "an app listing the tree with a roomy buffer does not see the marked mount"),
+    ("lm_root_tail_shows", "yes", "root's whole-buffer listing contains the marked id, so the tail check below is not vacuous"),
+    ("lm_app_tail_hidden", "0", "no slot past an app's returned count still holds the marked id"),
+    ("lm_app_one_leaks", "yes", "a page of one that is only the marked mount goes out (documented residual)"),
+    ("lm_app_one_full_counted", "yes", "that residual is counted as full_leak"),
+    ("lm_statmount_app", "-2", "an app's statmount of the marked id fails with ENOENT"),
+    ("lm_statmount_app_compat", "-2", "the same through the 32-bit table"),
+    ("lm_statmount_root_matches", "yes", "root's statmount of the marked id answers that mount"),
+    ("lm_statmount_app_other", "0", "an app's statmount of an unmarked mount still works"),
+    ("lm_app_parent_rc", "-2", "an app's listmount under the marked mount fails with ENOENT"),
+    ("lm_root_parent_count", "0", "root's listmount under the marked mount succeeds (no children)"),
+]
+
+
+def listmount_problems(facts):
+    m = re.match(r"(\d+)\.(\d+)", facts["kernel"])
+    if not (m and (int(m[1]), int(m[2])) >= (6, 12)):
+        got = facts.get("lm_mntroot_probe")
+        return [] if got == "absent" else [
+            f"a kernel without listmount reports no listmount probes: expected lm_mntroot_probe=absent, got {got}"]
+    problems = []
+    # grab_requested_root is the primary hook. The statmount wrapper stands in only when it is missing.
+    modes = (facts.get("lm_mntroot_probe"), facts.get("lm_statmount_fallback_probe"))
+    if modes not in (("1", "0"), ("0", "1")):
+        problems.append("exactly one of grab_requested_root and the statmount fallback armed: expected "
+                        f"lm_mntroot_probe/lm_statmount_fallback_probe=1/0 or 0/1, got {modes[0]}/{modes[1]}")
+    for key, want, shows in LISTMOUNT_EXPECTED:
+        got = facts.get(key)
+        if got != want:
+            problems.append(f"{shows}: expected {key}={want}, got {got if got is not None else 'nothing'}")
+    got = facts.get("lm_app_count_big")
+    if not (got and got.isdigit() and int(got) > 0):
+        problems.append(f"an app listing the tree still gets the real mounts: expected lm_app_count_big>0, got {got}")
+    return problems
 
 
 def judge(lines, qemu_rc, ksu_cfg=None):
@@ -307,6 +413,9 @@ def judge(lines, qemu_rc, ksu_cfg=None):
         got = facts.get(key)
         if not (got is not None and got.lstrip("-").isdigit() and int(got) > 0):
             problems.append(f"{shows}: expected {key}>0, got {got if got is not None else 'nothing'}")
+    problems += listmount_problems(facts)
+    if not ksu_cfg:
+        problems += soak_problems(facts)
     seen = crashed = False
     for line in lines:
         seen = seen or line.startswith("SMOKE kernel=")

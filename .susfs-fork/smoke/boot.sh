@@ -86,9 +86,11 @@ chmod 0755 "$root/init"
 (cd "$root" && find . | cpio -o -H newc -R 0:0 --quiet | gzip -1) > "$work/initrd.gz"
 
 # 3. Boot. A panic reboots at once and -no-reboot ends QEMU there. A hang is cut off by timeout.
+# 600 s: the 5.15 kernels take 45-52 s per module load under TCG and the run does four of them, so
+# a healthy boot ends at 330-345 s. 360 s left no room for a slower runner (run 41286620334).
 # No NIC: the default one needs a ROM from ipxe-qemu, which --no-install-recommends skips.
 rc=0
-timeout --foreground -k 10 360 qemu-system-aarch64 \
+timeout --foreground -k 10 600 qemu-system-aarch64 \
   -machine virt -cpu max -m 2048 -smp 2 -nographic -no-reboot -nic none \
   -kernel "$work/Image" -initrd "$work/initrd.gz" \
   -append "console=ttyAMA0 panic=-1 loglevel=7 rdinit=/init" \
