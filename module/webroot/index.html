@@ -1,0 +1,766 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>SUSFS (LKM Edition)</title>
+<style>
+  :root {
+    --bg: #f6f5f1; --text: #1b1b19; --muted: #6a6963; --line: #dad8d0; --soft: #ebe9e2;
+    --ok: #2a7a4b; --note: #3b5b8f; --warn: #9c5a00; --fail: #b3261e;
+    /* The header band is dark in both themes, so it has its own text and state colours. */
+    --head-bg: #1f2824; --head-text: #efede6; --head-muted: #a2aca6; --head-line: #3a4640;
+    --on-ok: #6cc38e; --on-note: #8fadde; --on-warn: #e2a64d; --on-fail: #f08b7e;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121211; --text: #ecebe6; --muted: #918f87; --line: #2b2b28; --soft: #1c1c1a;
+      --ok: #6cc38e; --note: #8fadde; --warn: #e2a64d; --fail: #f08b7e;
+      --head-bg: #1a231f; --head-line: #34403a;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: 0 env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  main { max-width: 600px; margin: 0 auto; padding: 0 20px 56px; }
+  [hidden] { display: none !important; }
+  button, input { font: inherit; color: inherit; }
+  button:focus-visible, input:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+
+  /* The state, one word, on a band of its own. The dot and the strip under it take the colour of the
+   * worst finding. The band is a plain full-width block outside the column, so nothing in the page
+   * is ever wider than the screen. */
+  .masthead { padding-top: env(safe-area-inset-top); background: var(--head-bg); color: var(--head-text); border-bottom: 3px solid var(--rail, var(--head-line)); }
+  .masthead .inner { max-width: 600px; margin: 0 auto; padding: 26px 20px 20px; }
+  .brand { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; font: 600 11px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase; }
+  .brand .edition { padding: 4px 7px; border-radius: 4px; background: var(--head-line); letter-spacing: .08em; }
+  .brand .by { margin-left: auto; color: var(--head-muted); font-weight: 500; letter-spacing: .04em; text-transform: none; }
+  h1 { display: flex; align-items: center; gap: 12px; margin: 12px 0 12px; font-size: 34px; line-height: 1.05; font-weight: 600; letter-spacing: -.025em; }
+  .dot { flex: none; width: 12px; height: 12px; border-radius: 50%; background: var(--rail, var(--head-line)); }
+  .ident { display: flex; flex-wrap: wrap; gap: 6px; font: 12px/1 var(--mono); color: var(--head-muted); }
+  .ident span { padding: 5px 8px; border: 1px solid var(--head-line); border-radius: 4px; }
+
+  .tabs { display: flex; gap: 22px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); z-index: 1; }
+  .tabs button { background: none; border: 0; padding: 14px 0 12px; color: var(--muted); font-weight: 600; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+  .tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--text); }
+  .count { margin-left: 6px; font: 600 11px var(--mono); padding: 1px 6px; border-radius: 3px; background: var(--soft); color: var(--muted); }
+  .count.warn { background: var(--warn); color: var(--bg); }
+  .count.fail { background: var(--fail); color: var(--bg); }
+
+  .label { margin: 32px 0 4px; font: 600 11px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+  .list { border-bottom: 1px solid var(--line); }
+  .list > * { border-top: 1px solid var(--line); }
+  .help { margin: 8px 0 0; color: var(--muted); font-size: 13px; }
+
+  .kv { display: grid; grid-template-columns: 7.5rem 1fr; gap: 14px; padding: 12px 0; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; font-family: var(--mono); font-size: 13.5px; word-break: break-word; }
+  .kv dd small { display: block; margin-top: 2px; color: var(--muted); font-size: 12px; }
+  dl { margin: 0; }
+
+  .finding { padding: 14px 0 14px 14px; border-left: 3px solid var(--line); }
+  .finding.warn { border-left-color: var(--warn); }
+  .finding.fail { border-left-color: var(--fail); }
+  .finding.info { border-left-color: var(--note); }
+  .finding.ok { border-left-color: var(--ok); }
+  .finding .head { display: flex; gap: 12px; align-items: baseline; justify-content: space-between; }
+  .finding .title { font-weight: 600; }
+  .finding .tag { flex: none; font: 600 11px var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+  .finding.warn .tag { color: var(--warn); }
+  .finding.fail .tag { color: var(--fail); }
+  .finding.info .tag { color: var(--note); }
+  .finding.ok .tag { color: var(--ok); }
+  .finding p { margin: 6px 0 0; color: var(--muted); font-size: 14px; }
+  .finding button.head { width: 100%; background: none; border: 0; padding: 0; text-align: left; cursor: pointer; }
+  .quiet { padding: 16px 0; color: var(--muted); }
+  .list.busy > * { opacity: .4; }
+
+  .line { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin: 18px 0 4px; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+  .btn { min-height: 40px; padding: 0 16px; border: 1px solid var(--text); border-radius: 6px; background: none; font-weight: 600; cursor: pointer; transition: transform .06s, background-color .1s; }
+  .btn.solid { background: var(--text); color: var(--bg); }
+  .btn:active:not(:disabled) { transform: translateY(1px); }
+  .btn.solid:active:not(:disabled) { background: var(--muted); }
+  .btn:disabled { opacity: .4; cursor: default; }
+  /* A running button reads as working rather than greyed out, with no looping animation to spend. */
+  .btn.busy, .btn.busy:disabled { opacity: 1; background: var(--soft); color: var(--muted); border-color: var(--line); cursor: progress; }
+  .btn.small { min-height: 32px; padding: 0 10px; font-size: 13px; border-color: var(--line); }
+
+  .row { display: flex; gap: 18px; align-items: center; justify-content: space-between; padding: 14px 0; }
+  .row .text { flex: 1; min-width: 0; }
+  .row .title { font-weight: 600; }
+  .row .note { margin-top: 2px; color: var(--muted); font-size: 13.5px; }
+  .row.locked .title::after { content: "MANAGED"; margin-left: 8px; font: 600 10px var(--mono); letter-spacing: .1em; padding: 2px 5px; border: 1px solid var(--line); border-radius: 3px; color: var(--muted); vertical-align: 2px; }
+
+  .switch { position: relative; flex: none; width: 44px; height: 24px; }
+  .switch input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+  .switch .track { position: absolute; inset: 0; border: 1.5px solid var(--text); border-radius: 5px; pointer-events: none; }
+  .switch .track::after { content: ""; position: absolute; top: 3px; left: 3px; width: 15px; height: 15px; border-radius: 2px; background: var(--text); transition: transform .12s; }
+  .switch input:checked + .track { background: var(--text); }
+  .switch input:checked + .track::after { background: var(--bg); transform: translateX(20px); }
+  .switch input:disabled { cursor: default; }
+  .switch input:disabled + .track { opacity: .35; }
+
+  .seg { display: grid; grid-template-columns: repeat(3, 1fr); border: 1px solid var(--text); border-radius: 6px; overflow: hidden; margin-top: 12px; }
+  .seg button { min-height: 42px; border: 0; border-left: 1px solid var(--text); background: none; font-weight: 600; cursor: pointer; padding: 0 4px; }
+  .seg button:first-child { border-left: 0; }
+  .seg button[aria-checked="true"] { background: var(--text); color: var(--bg); }
+  .seg button:disabled { opacity: .5; cursor: default; }
+
+  .paths > .path { display: flex; gap: 12px; align-items: center; justify-content: space-between; padding: 8px 0; }
+  .path code { font: 13px var(--mono); word-break: break-all; }
+  .add { display: flex; gap: 8px; margin-top: 14px; }
+  .add input { flex: 1; min-width: 0; min-height: 40px; padding: 0 12px; border: 1px solid var(--line); border-radius: 6px; background: none; font-family: var(--mono); font-size: 13.5px; }
+
+  #toast { position: fixed; left: 20px; right: 20px; bottom: calc(20px + env(safe-area-inset-bottom)); max-width: 560px; margin: 0 auto; padding: 12px 16px; border-radius: 6px; background: var(--text); color: var(--bg); font-size: 14px; }
+  @media (prefers-reduced-motion: reduce) { .switch .track::after, .btn { transition: none; } }
+</style>
+</head>
+<body>
+<header class="masthead" id="masthead">
+  <div class="inner">
+    <div class="brand">
+      <span class="name">SUSFS</span>
+      <span class="edition">LKM Edition</span>
+      <span class="by" id="by" hidden></span>
+    </div>
+    <h1><span class="dot"></span><span id="state">Reading</span></h1>
+    <div class="ident" id="ident"><span>Reading module state</span></div>
+  </div>
+</header>
+<main>
+
+  <div class="tabs" role="tablist" aria-label="Sections">
+    <button role="tab" id="tab-status" aria-controls="panel-status" aria-selected="true">Status</button>
+    <button role="tab" id="tab-checks" aria-controls="panel-checks" aria-selected="false">Checks<span class="count" id="checks-count" hidden></span></button>
+    <button role="tab" id="tab-controls" aria-controls="panel-controls" aria-selected="false">Controls</button>
+  </div>
+
+  <section id="panel-status" role="tabpanel" aria-labelledby="tab-status">
+    <div class="label">Needs attention</div>
+    <div class="list" id="attention"></div>
+    <div class="label">Module</div>
+    <dl class="list" id="facts"></dl>
+    <div class="line">
+      <span class="help" id="status-hint"></span>
+      <span class="actions">
+        <button class="btn small" id="refresh" type="button">Refresh</button>
+        <button class="btn small" id="capture" type="button">Capture logs</button>
+        <button class="btn small" id="copy" type="button" disabled>Copy report</button>
+      </span>
+    </div>
+    <p class="help">Capture logs writes a single report to /sdcard/Download to attach when a detection or leak needs triaging. It reads only.</p>
+  </section>
+
+  <section id="panel-checks" role="tabpanel" aria-labelledby="tab-checks" hidden>
+    <div class="line">
+      <span class="help" id="summary">Not run yet</span>
+      <button class="btn solid" id="run">Run checks</button>
+    </div>
+    <div class="list" id="checks"></div>
+  </section>
+
+  <section id="panel-controls" role="tabpanel" aria-labelledby="tab-controls" hidden>
+    <div class="label">Boot</div>
+    <div class="list">
+      <div class="row">
+        <div class="text">
+          <div class="title">Load early</div>
+          <div class="note">Load in post-fs-data, before your root manager sends its SUSFS settings. Applies from the next boot.</div>
+        </div>
+        <label class="switch"><input type="checkbox" role="switch" id="early" aria-label="Load early" disabled><span class="track"></span></label>
+      </div>
+      <div>
+        <div class="row" style="padding-bottom: 0">
+          <div class="text">
+            <div class="title">Bootloop guard</div>
+            <div class="note">What happens when boots keep ending early.</div>
+          </div>
+        </div>
+        <div class="seg" role="radiogroup" aria-label="Bootloop guard scope" id="scope"></div>
+        <p class="help" id="scope-help"></p>
+        <div style="height: 14px"></div>
+      </div>
+    </div>
+
+    <div class="label">Kernel</div>
+    <div class="list" id="toggles"></div>
+
+    <div class="label">Hidden mounts</div>
+    <div class="list paths" id="paths"></div>
+    <form class="add" id="add-form" autocomplete="off">
+      <input id="add-path" type="text" inputmode="url" spellcheck="false" autocapitalize="off" placeholder="/system/etc/hosts" aria-label="Mount point to hide">
+      <button class="btn" id="add-button" type="submit">Add</button>
+    </form>
+    <p class="help" id="paths-help">Mounts under /data/adb are already covered. Name any other path a module mounts over, such as a hosts file.</p>
+
+    <div class="label">Hidden SELinux types</div>
+    <div class="list paths" id="ctxtypes"></div>
+    <form class="add" id="ctx-form" autocomplete="off">
+      <input id="ctx-input" type="text" inputmode="text" spellcheck="false" autocapitalize="off" placeholder="adbroot" aria-label="SELinux context type to hide">
+      <button class="btn" id="ctx-button" type="submit">Add</button>
+    </form>
+    <p class="help" id="ctx-help">adbroot on by default, remove it if your ROM has no such domain. Add any other type a custom ROM's sepolicy introduces, not su or ksu, which this would also hide from su tooling.</p>
+
+    <div class="label">Handled elsewhere</div>
+    <div class="list"><div class="row"><div class="text">
+      <div class="title">SELinux hide</div>
+      <div class="note" id="selinux-note"></div>
+    </div></div></div>
+  </section>
+</main>
+<div id="toast" role="status" aria-live="polite" hidden></div>
+
+<script>
+"use strict";
+var DIR = "/data/adb/modules/susfs_guard_lkm/";
+var seq = 0;
+
+// ksu.exec reports through a named global callback: (errno, stdout, stderr).
+function run(script, args) {
+  return new Promise(function (resolve) {
+    var cb = "susfs_cb_" + (seq++);
+    window[cb] = function (code, out, err) {
+      delete window[cb];
+      resolve({ code: code, out: String(out || ""), err: String(err || "") });
+    };
+    window.ksu.exec("/system/bin/sh " + DIR + script + (args ? " " + args : ""), "{}", cb);
+  });
+}
+
+function el(tag, cls, text) {
+  var e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+function $(id) { return document.getElementById(id); }
+
+function pairs(out) {
+  var o = {};
+  out.split("\n").forEach(function (line) {
+    var i = line.indexOf("=");
+    if (i > 0) o[line.slice(0, i)] = line.slice(i + 1);
+  });
+  return o;
+}
+
+var LEVELS = {
+  fail: { label: "Problem", rank: 3 },
+  warn: { label: "Warning", rank: 2 },
+  info: { label: "Note", rank: 1 },
+  ok: { label: "Pass", rank: 0 }
+};
+var STATES = {
+  "Active": "ok", "Standing by": "info", "Degraded": "warn", "Not loaded": "fail", "Disabled": "fail"
+};
+var RAIL = { ok: "var(--on-ok)", info: "var(--on-note)", warn: "var(--on-warn)", fail: "var(--on-fail)" };
+// The header band takes a dark tint of the state colour so "Active" and "Not loaded" read apart at
+// a glance, while the light head text stays legible. These are dark in both themes by design.
+var HEAD_BG = { ok: "#16241b", info: "#172230", warn: "#2a2111", fail: "#2a1613" };
+
+var state = { facts: {}, checks: [], toggles: {}, paths: [], ctxTypes: [] };
+var toastTimer = 0;
+function toast(text) {
+  var t = $("toast");
+  t.textContent = text;
+  t.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(function () { t.hidden = true; }, 2800);
+}
+
+// Tabs
+var TABS = ["status", "checks", "controls"];
+function select(name) {
+  TABS.forEach(function (n) {
+    $("tab-" + n).setAttribute("aria-selected", String(n === name));
+    $("panel-" + n).hidden = n !== name;
+  });
+}
+TABS.forEach(function (n) { $("tab-" + n).addEventListener("click", function () { select(n); }); });
+
+// Status
+var SCOPES = [
+  { key: "self", label: "This module", help: "A failed boot disables only this module. Volume down at install." },
+  { key: "all", label: "All modules", help: "A failed boot disables every module until you enable this one again. The default. Volume up at install." },
+  { key: "none", label: "None", help: "The boot watch is off and nothing is disabled. A bootloop then needs a manual recovery." }
+];
+function scopeLabel(key) {
+  for (var i = 0; i < SCOPES.length; i++) if (SCOPES[i].key === key) return SCOPES[i].label;
+  return "All modules";
+}
+
+function worst() {
+  var top = STATES[stateWord()] || "info";
+  state.checks.forEach(function (c) { if (LEVELS[c.level].rank > LEVELS[top].rank) top = c.level; });
+  return top;
+}
+function stateWord() {
+  var card = state.facts.card || "";
+  var i = card.indexOf(" | ");
+  // The card carries a leading glyph per field now. Drop it before reading the state word.
+  var word = (i < 0 ? card : card.slice(0, i)).replace(/^[^\x20-\x7E]+\s*/, "").trim();
+  return STATES[word] ? word : (state.facts.loaded === "1" ? "Active" : "Not loaded");
+}
+
+function renderMasthead() {
+  var f = state.facts;
+  var word = stateWord();
+  $("state").textContent = word;
+  var bits = [f.version || "unknown version"];
+  // Match the KMI anywhere in the card: a leading glyph now sits in front of it.
+  var kmi = ((f.card || "").match(/android\d+-[\w.]+/i) || [])[0];
+  if (kmi) bits.push(kmi);
+  if (f.susfs_base) bits.push("SUSFS v" + String(f.susfs_base).replace(/^v/i, ""));
+  var ident = $("ident");
+  ident.textContent = "";
+  bits.forEach(function (b) { ident.appendChild(el("span", "", b)); });
+  // Show only the primary author (first entry of module.prop's author field). The fork-origin
+  // credit that trails after the comma is kept in module.prop, not surfaced here.
+  var by = $("by");
+  var author = String(f.author || "").split(",")[0].trim();
+  by.textContent = author;
+  by.hidden = !author;
+  var head = $("masthead");
+  head.style.setProperty("--rail", RAIL[worst()]);
+  head.style.setProperty("--head-bg", HEAD_BG[STATES[word] || "info"]);
+}
+
+function kv(dl, label, value, small) {
+  var dd = el("dd", "", value);
+  if (small) dd.appendChild(el("small", "", small));
+  var wrap = el("div", "kv");
+  wrap.appendChild(el("dt", "", label));
+  wrap.appendChild(dd);
+  dl.appendChild(wrap);
+}
+
+function renderFacts() {
+  var f = state.facts;
+  var dl = $("facts");
+  dl.textContent = "";
+  kv(dl, "Load stage", f.early_load === "1" ? "Early, post-fs-data" : "Boot, after the manager");
+  kv(dl, "Kernel", f.kernel || "unknown");
+  var susfs = (f.susfs_version || (f.susfs_base ? "v" + f.susfs_base : "")) + (f.susfs_variant ? " / " + f.susfs_variant : "");
+  if (susfs) kv(dl, "SUSFS", susfs);
+  if (f.features) {
+    var names = f.features.split(",");
+    kv(dl, "Features", names.length + " on", names.join(", ").toLowerCase().replace(/_/g, " "));
+  }
+  if (f.mount_prefixes) kv(dl, "Hidden mounts", f.mounts_hidden + " hidden", f.mount_prefixes.split("/")[0] + " of " + f.mount_prefixes.split("/")[1] + " paths in the list");
+  if (f.selinux_ctx_types && Number(f.selinux_ctx_types) > 0) kv(dl, "Hidden SELinux types", f.selinux_ctx_types + (f.selinux_ctx_types === "1" ? " type" : " types"), f.selinux_ctx_armed === "1" ? "Hooks armed" : "Hooks not armed, reload the module");
+  var fails = Number(f.guard_fails) || 0;
+  kv(dl, "Bootloop guard", f.guard_tripped === "1" ? "Tripped" : scopeLabel(f.guard_scope), f.guard_scope === "none" ? "Watch is off" : (fails ? fails + " early boot recorded" : "No early boots recorded"));
+  kv(dl, "Module", f.disabled === "1" ? "Disabled" : "Enabled");
+}
+
+function renderAttention() {
+  var box = $("attention");
+  box.textContent = "";
+  var open = state.checks.filter(function (c) { return c.level === "warn" || c.level === "fail"; });
+  open.sort(function (a, b) { return LEVELS[b.level].rank - LEVELS[a.level].rank; });
+  open.forEach(function (c) { box.appendChild(finding(c, false)); });
+  if (!open.length) box.appendChild(el("div", "quiet", state.checks.length ? "Nothing needs attention." : "Checks have not finished."));
+}
+
+// Checks
+function finding(c, collapsible) {
+  var box = el("div", "finding " + c.level);
+  var head = el(collapsible ? "button" : "div", "head");
+  head.appendChild(el("span", "title", c.title));
+  head.appendChild(el("span", "tag", LEVELS[c.level].label));
+  box.appendChild(head);
+  var body = el("p", "", c.detail);
+  box.appendChild(body);
+  if (collapsible) {
+    head.type = "button";
+    body.hidden = c.level === "ok" || c.level === "info";
+    head.setAttribute("aria-expanded", String(!body.hidden));
+    head.addEventListener("click", function () {
+      body.hidden = !body.hidden;
+      head.setAttribute("aria-expanded", String(!body.hidden));
+    });
+  }
+  return box;
+}
+
+function parseChecks(out) {
+  var list = [];
+  out.split("\n").forEach(function (line) {
+    var p = line.split("|");
+    if (p.length >= 4 && LEVELS[p[1]]) list.push({ id: p[0], level: p[1], title: p[2], detail: p.slice(3).join("|") });
+  });
+  return list;
+}
+
+function renderChecks() {
+  var box = $("checks");
+  box.textContent = "";
+  var sorted = state.checks.slice().sort(function (a, b) { return LEVELS[b.level].rank - LEVELS[a.level].rank; });
+  sorted.forEach(function (c) { box.appendChild(finding(c, true)); });
+  if (!sorted.length) box.appendChild(el("div", "quiet", "No result. Run the checks again."));
+  var n = { fail: 0, warn: 0, info: 0, ok: 0 };
+  sorted.forEach(function (c) { n[c.level]++; });
+  var parts = [];
+  if (n.fail) parts.push(n.fail + (n.fail === 1 ? " problem" : " problems"));
+  if (n.warn) parts.push(n.warn + (n.warn === 1 ? " warning" : " warnings"));
+  parts.push(n.ok + " passed");
+  if (n.info) parts.push(n.info + (n.info === 1 ? " note" : " notes"));
+  $("summary").textContent = sorted.length ? parts.join(", ") + (state.ranAt ? " at " + state.ranAt : "") : "Not run yet";
+  var count = $("checks-count");
+  var bad = n.fail + n.warn;
+  count.hidden = !bad;
+  count.textContent = String(bad);
+  count.className = "count " + (n.fail ? "fail" : "warn");
+  $("copy").disabled = !sorted.length;
+}
+
+// A manual run keeps its busy state for at least this long. The checks take well under a second on
+// most devices, which is too quick to notice that anything happened.
+var MIN_BUSY_MS = 600;
+function runChecks(manual) {
+  var btn = $("run");
+  var started = Date.now();
+  btn.disabled = true;
+  btn.classList.add("busy");
+  btn.textContent = "Running checks";
+  $("checks").classList.add("busy");
+  $("checks").setAttribute("aria-busy", "true");
+  $("summary").textContent = "Running the checks";
+  return run("check.sh").then(function (r) {
+    var wait = manual === true ? Math.max(0, MIN_BUSY_MS - (Date.now() - started)) : 0;
+    return new Promise(function (go) { setTimeout(go, wait); }).then(function () { return r; });
+  }).then(function (r) {
+    state.checks = parseChecks(r.out);
+    state.ranAt = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    renderChecks();
+    renderAttention();
+    renderMasthead();
+    $("checks").classList.remove("busy");
+    $("checks").removeAttribute("aria-busy");
+    btn.disabled = false;
+    btn.classList.remove("busy");
+    btn.textContent = "Run checks";
+    if (r.code !== 0 && !state.checks.length) toast("The checks did not run: " + (r.err.trim() || "exit " + r.code));
+    else if (manual === true) toast("Checks finished: " + $("summary").textContent);
+  });
+}
+$("run").addEventListener("click", function () { runChecks(true); });
+
+function report() {
+  var f = state.facts;
+  var lines = [
+    (f.name || "SUSFS") + " " + (f.version || "") + " (SUSFS " + (f.susfs_base || "?") + ")",
+    "Kernel: " + (f.kernel || "?"),
+    "State: " + (f.card || "?"),
+    "Load stage: " + (f.early_load === "1" ? "early" : "boot") + ", guard scope: " + (f.guard_scope || "?"),
+    ""
+  ];
+  state.checks.forEach(function (c) { lines.push("[" + LEVELS[c.level].label + "] " + c.title + ": " + c.detail); });
+  return lines.join("\n");
+}
+
+// The manager's WebView may not expose the async clipboard API, so fall back to a selection.
+function copyText(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(text);
+  return new Promise(function (resolve, reject) {
+    var ta = el("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    var ok = false;
+    try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+    document.body.removeChild(ta);
+    ok ? resolve() : reject(new Error("copy refused"));
+  });
+}
+$("copy").addEventListener("click", function () {
+  copyText(report()).then(function () { toast("Report copied"); }, function () { toast("Copy is not available here"); });
+});
+
+// Controls
+function failed(what, r) { toast(what + " was not changed: " + (r.err.trim() || "exit " + r.code)); }
+
+function renderEarly() {
+  var input = $("early");
+  input.checked = state.facts.early_load === "1";
+  input.disabled = false;
+}
+$("early").addEventListener("change", function () {
+  var input = this;
+  var want = input.checked;
+  input.disabled = true;
+  run("early.sh", want ? "on" : "off").then(function (r) {
+    input.disabled = false;
+    if (r.code !== 0) { input.checked = !want; failed("Load early", r); return; }
+    state.facts.early_load = want ? "1" : "0";
+    renderFacts();
+    toast(want ? "Loads early from the next boot" : "Loads at the manager's boot stage from the next boot");
+  });
+});
+
+function renderScope() {
+  var box = $("scope");
+  box.textContent = "";
+  var current = state.facts.guard_scope || "all";
+  SCOPES.forEach(function (s) {
+    var b = el("button", "", s.label);
+    b.type = "button";
+    b.setAttribute("role", "radio");
+    b.setAttribute("aria-checked", String(s.key === current));
+    b.addEventListener("click", function () { setScope(s.key); });
+    box.appendChild(b);
+  });
+  for (var i = 0; i < SCOPES.length; i++) if (SCOPES[i].key === current) $("scope-help").textContent = SCOPES[i].help;
+}
+function setScope(key) {
+  if (key === state.facts.guard_scope) return;
+  var buttons = $("scope").children;
+  for (var i = 0; i < buttons.length; i++) buttons[i].disabled = true;
+  run("scope.sh", "set " + key).then(function (r) {
+    if (r.code !== 0) failed("Guard scope", r); else state.facts.guard_scope = key;
+    renderScope();
+    renderFacts();
+    if (r.code === 0) toast("Guard scope: " + scopeLabel(key));
+  });
+}
+
+var TOGGLES = [
+  { key: "enable_log", title: "Kernel log", note: "Write module activity to the kernel log. Leave off for daily use." },
+  { key: "avc_spoof", title: "AVC spoof", note: "Rewrite the root domain in SELinux denial lines." }
+];
+function renderToggles() {
+  var box = $("toggles");
+  box.textContent = "";
+  TOGGLES.forEach(function (t) {
+    var v = state.toggles[t.key];
+    var owner = state.facts["owner_" + t.key] || "";
+    var external = state.facts["external_" + t.key] === "1";
+    var locked = owner !== "" || external;
+    var row = el("div", "row" + (locked ? " locked" : ""));
+    var text = el("div", "text");
+    text.appendChild(el("div", "title", t.title));
+    var note;
+    if (owner) note = "Set every boot by the module " + owner + ". Shown here, changed there.";
+    else if (external) note = "Enabled outside this module. Your root manager or another tool sets it. Shown here, changed there.";
+    else note = (v === "0" || v === "1") ? t.note : "Available once the module is loaded.";
+    text.appendChild(el("div", "note", note));
+    var sw = el("label", "switch");
+    var input = el("input");
+    input.type = "checkbox";
+    input.setAttribute("role", "switch");
+    input.setAttribute("aria-label", t.title);
+    input.checked = v === "1";
+    input.disabled = locked || (v !== "0" && v !== "1");
+    input.addEventListener("change", function () { setToggle(t, input); });
+    sw.appendChild(input);
+    sw.appendChild(el("span", "track"));
+    row.appendChild(text);
+    row.appendChild(sw);
+    box.appendChild(row);
+  });
+}
+function setToggle(t, input) {
+  var want = input.checked ? "1" : "0";
+  input.disabled = true;
+  run("toggle.sh", "set " + t.key + " " + want).then(function (r) {
+    input.disabled = false;
+    if (r.code !== 0) { input.checked = !input.checked; failed(t.title, r); return; }
+    state.toggles[t.key] = want;
+    toast(t.title + (want === "1" ? " on" : " off") + ". Kept across reboots.");
+  });
+}
+
+// A path goes to a shell command line, so only characters that no shell reads specially are accepted.
+var SAFE_PATH = /^\/[A-Za-z0-9._@+\/-]*$/;
+function pathOk(p) { return SAFE_PATH.test(p) && p.length <= 255 && p.indexOf("/../") < 0 && !/\/\.\.$/.test(p); }
+
+function renderPaths() {
+  var box = $("paths");
+  box.textContent = "";
+  state.paths.forEach(function (p) {
+    var row = el("div", "path");
+    row.appendChild(el("code", "", p));
+    if (pathOk(p)) {
+      var b = el("button", "btn small", "Remove");
+      b.type = "button";
+      b.setAttribute("aria-label", "Remove " + p);
+      b.addEventListener("click", function () { changePath("remove", p, b); });
+      row.appendChild(b);
+    }
+    box.appendChild(row);
+  });
+  if (!state.paths.length) box.appendChild(el("div", "quiet", "No paths in the list."));
+}
+function loadPaths() {
+  return run("hide_mounts.sh", "list").then(function (r) {
+    state.paths = r.code === 0 ? r.out.split("\n").filter(Boolean) : [];
+    renderPaths();
+  });
+}
+function changePath(cmd, p, button) {
+  button.disabled = true;
+  run("hide_mounts.sh", cmd + " " + p).then(function (r) {
+    button.disabled = false;
+    if (r.code !== 0) { failed("The list", r); return; }
+    return Promise.all([loadPaths(), run("status.sh")]).then(function (all) {
+      state.facts = pairs(all[1].out);
+      renderFacts();
+      toast(cmd === "add" ? "Added " + p : "Removed " + p);
+    });
+  });
+}
+$("add-form").addEventListener("submit", function (e) {
+  e.preventDefault();
+  var input = $("add-path");
+  var p = input.value.trim();
+  if (!pathOk(p)) { toast("Use an absolute path of letters, digits and . _ - + @ /"); return; }
+  if (state.paths.indexOf(p) >= 0) { toast("Already in the list"); return; }
+  changePath("add", p, $("add-button"));
+  input.value = "";
+});
+
+// An SELinux type name, nothing else: the kernel side only ever compares this against the third
+// field of a context string, never treats it as a path or a shell token.
+var SAFE_TYPE = /^[A-Za-z0-9_]{1,63}$/;
+function ctxOk(t) { return SAFE_TYPE.test(t); }
+
+function renderCtxTypes() {
+  var box = $("ctxtypes");
+  box.textContent = "";
+  state.ctxTypes.forEach(function (t) {
+    var row = el("div", "path");
+    row.appendChild(el("code", "", t));
+    var b = el("button", "btn small", "Remove");
+    b.type = "button";
+    b.setAttribute("aria-label", "Stop hiding " + t);
+    b.addEventListener("click", function () { changeCtxType("remove", t, b); });
+    row.appendChild(b);
+    box.appendChild(row);
+  });
+  if (!state.ctxTypes.length) box.appendChild(el("div", "quiet", "Nothing hidden, hooks are off until a type is added."));
+}
+function loadCtxTypes() {
+  return run("selinux_ctx.sh", "list").then(function (r) {
+    state.ctxTypes = r.code === 0 ? r.out.split("\n").filter(Boolean) : [];
+    renderCtxTypes();
+  });
+}
+function changeCtxType(cmd, t, button) {
+  button.disabled = true;
+  run("selinux_ctx.sh", cmd + " " + t).then(function (r) {
+    button.disabled = false;
+    if (r.code !== 0) { failed("The list", r); return; }
+    return Promise.all([loadCtxTypes(), run("status.sh")]).then(function (all) {
+      state.facts = pairs(all[1].out);
+      renderFacts();
+      toast(cmd === "add" ? "Hiding " + t : "No longer hiding " + t);
+    });
+  });
+}
+$("ctx-form").addEventListener("submit", function (e) {
+  e.preventDefault();
+  var input = $("ctx-input");
+  var t = input.value.trim();
+  if (!ctxOk(t)) { toast("Use letters, digits and _ only"); return; }
+  if (state.ctxTypes.indexOf(t) >= 0) { toast("Already in the list"); return; }
+  changeCtxType("add", t, $("ctx-button"));
+  input.value = "";
+});
+
+var SELINUX_HIDE = {
+  native: "Handled by your root manager's own kernel patch.",
+  none: "Your root manager's kernel does not provide it and this module does not add it on its own.",
+  unavailable: "Not available until the module is loaded."
+};
+
+// requestIdleCallback where present, a short timeout otherwise: defers the costly kernel-log scan
+// to after the first paint, so opening the page never waits on it.
+function idle(fn) {
+  if (window.requestIdleCallback) requestIdleCallback(fn, { timeout: 1500 });
+  else setTimeout(fn, 200);
+}
+
+// Load what the Controls tab needs and arm its renderers. Shared by the first open and Refresh.
+function loadControls() {
+  return Promise.all([run("toggle.sh", "get"), run("hide_mounts.sh", "list"), run("selinux_ctx.sh", "list")]).then(function (r) {
+    state.toggles = pairs(r[0].out);
+    state.paths = r[1].code === 0 ? r[1].out.split("\n").filter(Boolean) : [];
+    state.ctxTypes = r[2].code === 0 ? r[2].out.split("\n").filter(Boolean) : [];
+    $("selinux-note").textContent = SELINUX_HIDE[state.toggles.selinux_hide] || SELINUX_HIDE.unavailable;
+    renderEarly();
+    renderScope();
+    renderToggles();
+    renderPaths();
+    renderCtxTypes();
+  });
+}
+
+function refreshAll() {
+  var btn = $("refresh");
+  btn.disabled = true;
+  btn.classList.add("busy");
+  run("status.sh").then(function (s) {
+    state.facts = pairs(s.out);
+    renderMasthead();
+    renderFacts();
+    return loadControls();
+  }).then(function () {
+    return runChecks(true);
+  }).then(function () {
+    btn.disabled = false;
+    btn.classList.remove("busy");
+  });
+}
+$("refresh").addEventListener("click", refreshAll);
+
+// Write the diagnostics bundle and tell the user where it landed. Reads only on the device side.
+function capture() {
+  var btn = $("capture");
+  var label = btn.textContent;
+  btn.disabled = true;
+  btn.classList.add("busy");
+  btn.textContent = "Capturing";
+  run("capture.sh").then(function (r) {
+    btn.disabled = false;
+    btn.classList.remove("busy");
+    btn.textContent = label;
+    var path = (r.out.match(/^path=(.+)$/m) || [])[1];
+    if (r.code === 0 && path) toast("Saved to " + path);
+    else toast("Capture failed: " + (r.err.trim() || "exit " + r.code));
+  });
+}
+$("capture").addEventListener("click", capture);
+
+function boot() {
+  if (!(window.ksu && window.ksu.exec)) {
+    $("state").textContent = "Not connected";
+    $("ident").textContent = "Open this page from the root manager";
+    return;
+  }
+  // First paint from the one cheap read, so the header stops saying "Reading" at once, and the Controls
+  // data and the kernel-log checks follow without holding it up.
+  run("status.sh").then(function (s) {
+    state.facts = pairs(s.out);
+    $("copy").disabled = false;
+    renderMasthead();
+    renderFacts();
+    renderAttention();
+    return loadControls();
+  }).then(function () {
+    idle(function () { runChecks(); });
+  });
+}
+boot();
+</script>
+</body>
+</html>
