@@ -44,6 +44,12 @@ Reboot to apply. Remove that file and reboot to return to normal loading; upgrad
 
 Use early loading when SUSFS rules or original kstat snapshots must be configured before module post-fs-data scripts and mounts. It makes the interface available sooner, so those operations can run at the required boot stage. If the manager applies SUSFS settings before common scripts, an earlier loading stage is still required. The module only loads the LKM; the manager applies settings.
 
+## WebUI
+
+The module page in the manager has two switches, the kernel log (`/proc/susfs_enable_log`) and the AVC log spoof (`/proc/susfs_avc_spoof`). A switch is written to its node at once and remembered in `/data/adb/susfs_guard_lkm/toggles`. The loader puts it back after the next successful load. A switch you never touched keeps the module's own default. Rules are not part of this, they still come from the manager.
+
+There is also a status line for `selinux_hide`, with no switch. If the installed root manager's own kernel patch already carries `selinux_hide`, it says so and this module leaves it alone, since a second implementation here would fight the one your manager already runs. If it does not, the line turns into a warning telling you to use KernelSU or a supported fork for this feature. This module does not implement its own (see `/proc/susfs_selinux_hide` in the interface docs for why).
+
 ## Interface docs
 
 All `/proc` control nodes: see **[PROC_INTERFACES.en.md](PROC_INTERFACES.en.md)**.
