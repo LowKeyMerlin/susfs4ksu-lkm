@@ -82,6 +82,39 @@ def self_reference(text):
     return text.replace(old, ".github/workflows/susfs-build.yml")
 
 
+def build_watch(text):
+    # susfs_propwait is a susfs-dev addition, so build-ddk.yml has no step for it. Insert one next
+    # to the supercall client, built the same freestanding way, so the later steps can treat it
+    # like susfs_sc: a second upload dropped by drop_probe_uploads, then bundled into the loader
+    # artifact by ship_probe.
+    anchor = (
+        "      - name: Upload userspace client\n"
+        "        uses: actions/upload-artifact@v6\n"
+        "        with:\n"
+        "          name: susfs_sc\n"
+        "          path: /tmp/susfs_sc\n"
+        "          if-no-files-found: error\n\n"
+    )
+    step = (
+        "      - name: Build the adbd watcher\n"
+        "        run: |\n"
+        "          set -e\n"
+        "          clang --target=aarch64-linux-gnu -O2 -nostdlib -static-pie \\\n"
+        "                -fno-stack-protector -fno-builtin -fuse-ld=lld -Wl,-e,_start \\\n"
+        "                -o /tmp/susfs_propwait tools/susfs_propwait.c\n"
+        "          file /tmp/susfs_propwait\n"
+        "          ls -la /tmp/susfs_propwait\n"
+        "\n"
+        "      - name: Upload the adbd watcher\n"
+        "        uses: actions/upload-artifact@v6\n"
+        "        with:\n"
+        "          name: susfs_propwait\n"
+        "          path: /tmp/susfs_propwait\n"
+        "          if-no-files-found: error\n\n"
+    )
+    return once(text, anchor, anchor + step, "watch: no susfs_sc upload step to anchor after")
+
+
 def drop_probe_uploads(text):
     # Only the module zip is published. The probe tools are still built as a compile check.
     return re.sub(
@@ -107,7 +140,7 @@ def ship_probe(text):
     return once(
         text,
         "          path: /tmp/susfs_insmod\n          if-no-files-found: error\n          retention-days: 1\n",
-        "          path: |\n            /tmp/susfs_insmod\n            /tmp/susfs_sc\n"
+        "          path: |\n            /tmp/susfs_insmod\n            /tmp/susfs_sc\n            /tmp/susfs_propwait\n"
         "          if-no-files-found: error\n          retention-days: 1\n",
         "probe: loader upload path")
 
@@ -137,7 +170,7 @@ def packing_job(text):
         text,
         "      actions: read\n    steps:\n      - uses: actions/checkout@v4\n",
         "      actions: write\n    steps:\n"
-        "      # Full history and tags, git describe below needs them.\n"
+        "      # Full history and tags, the pack step reads the tags on HEAD.\n"
         "      - uses: actions/checkout@v4\n        with:\n          fetch-depth: 0\n",
         "packing job: permissions and checkout")
     text = once(
@@ -157,38 +190,31 @@ def packing_job(text):
 
 
 PACK_AND_UPLOAD = '''\
-      # The fork does not keep upstream's tags, so they would not show on its tags page. They are
-      # read from the parent into this runner's clone, only to name the zip below.
-      - name: Fetch the upstream tags
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          parent="$(gh api "repos/$GITHUB_REPOSITORY" --jq '.parent.full_name // empty')"
-          if [ -n "$parent" ]; then
-            git fetch --quiet "https://github.com/$parent.git" 'refs/tags/*:refs/tags/*'
-          fi
-
       - name: Pack the module
         id: pack
         run: |
           set -euo pipefail
-          # Version the module by the nearest upstream release tag, then the commit. Fall back to
-          # the SUSFS version in the ABI header when no tag is reachable.
-          base="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)"
-          if [ -z "$base" ]; then
-            base="$(sed -n 's/^#define SUSFS_VERSION_STR[[:space:]]*"\\(.*\\)".*/\\1/p' kernel/susfs_abi.h)"
-            echo "::warning::no release tag reachable, using $base as the module version"
+          # The module has its own version, in .susfs-fork/VERSION. A commit tagged v<VERSION> is
+          # a release. Any other commit gets a -dev suffix and cannot be mistaken for one.
+          version="$(tr -d '[:space:]' < .susfs-fork/VERSION)"
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::.susfs-fork/VERSION is '$version', not MAJOR.MINOR.PATCH"; exit 1 ;;
+          esac
+          tag="v$version-dev.$(git rev-parse --short HEAD)"
+          tags="$(git tag --points-at HEAD --list 'v[0-9]*')"
+          if [ -n "$tags" ]; then
+            [ "$tags" = "v$version" ] || { echo "::error::HEAD is tagged '$tags' but VERSION is $version"; exit 1; }
+            tag="v$version"
           fi
-          [ -n "$base" ] || { echo "::error::no release tag and no SUSFS_VERSION_STR for the module version"; exit 1; }
-          tag="${base}-$(git rev-parse --short HEAD)"
           zip="dist/ksu_susfs_lkm-module-$tag-arm64.zip"
           python tools/pack_module.py --ko-dir ko --insmod bin/susfs_insmod \\
             --tag "$tag" --sha "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" \\
             --ddk-images ddk-images.json \\
             --out "$zip"
           # Add the bootloop guard. Upstream's module scripts are not edited, see pack_extra.py.
-          python .susfs-fork/pack_extra.py --zip "$zip" --sc bin/susfs_sc --rejects pack-rejects
+          python .susfs-fork/pack_extra.py --zip "$zip" --sc bin/susfs_sc --watch bin/susfs_propwait \\
+            --rejects pack-rejects
           ls -l dist
           echo "zip=$zip" >> "$GITHUB_OUTPUT"
 
@@ -267,8 +293,8 @@ def node24(text):
     return re.sub(r"(?<![\w./-])(actions/[\w-]+)@v(\d+)(?![\w.])", raise_pin, text)
 
 
-EDITS = [header, triggers, drop_concurrency, self_reference, drop_probe_uploads, short_retention, ship_probe,
-         patch_steps, packing_job, images, release_note, node24]
+EDITS = [header, triggers, drop_concurrency, self_reference, build_watch, drop_probe_uploads, short_retention,
+         ship_probe, patch_steps, packing_job, images, release_note, node24]
 
 
 def generate():

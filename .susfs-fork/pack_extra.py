@@ -36,12 +36,16 @@ OVERLAY = pathlib.Path(__file__).resolve().parent / "module"
 # Files taken from .susfs-fork/module/, and where they go in the zip.
 WRAPPER = "load.sh"
 INSTALLER = "customize.sh"
-ADDED = {"guard.sh": "guard.sh", "service.sh": "service.sh"}
+ADDED = {name: name for name in (
+    "guard.sh", "service.sh", "status.sh", "check.sh", "early.sh", "hide_mounts.sh", "selinux_ctx.sh",
+    "boot-completed.sh", "scope.sh", "clients.sh", "capture.sh", "adbd_guard.sh")}
 LOADER = "load.upstream.sh"
 INSTALLER_UPSTREAM = "customize.upstream.sh"
 # What upstream's script of that name becomes in the zip.
 RENAMED = {WRAPPER: LOADER, INSTALLER: INSTALLER_UPSTREAM}
 PROBE = "bin/susfs_sc"
+# The event-driven init.svc.adbd watcher started from service.sh (see adbd_guard.sh).
+WATCH = "bin/susfs_propwait"
 BUILD_WORKFLOW = ".github/workflows/susfs-build.yml"
 
 # Upstream's scripts that must exist, and the two that start the loader.
@@ -65,7 +69,7 @@ def contract(files):
     for name in REQUIRED:
         if name not in files:
             problems.append(f"upstream no longer has {name}")
-    for name in (LOADER, INSTALLER_UPSTREAM, PROBE, *ADDED.values()):
+    for name in (LOADER, INSTALLER_UPSTREAM, PROBE, WATCH, *ADDED.values()):
         if name in files:
             problems.append(f"upstream now ships {name}, which the guard adds")
     for name in ENTRY_POINTS:
@@ -120,11 +124,49 @@ def reject(problems, files, rejects):
         print(f"  {p}", file=sys.stderr)
 
 
+NAME = "SUSFS (LKM Edition)"
+AUTHOR = "LowKeyMerlin, inforcqb"
+ABI_HEADER = ROOT / "kernel" / "susfs_abi.h"
+
+
+def susfs_base():
+    """The SUSFS release the kernel code tracks, without the leading v."""
+    for line in ABI_HEADER.read_text(encoding="utf-8").splitlines():
+        parts = line.split()
+        if parts[:2] == ["#define", "SUSFS_VERSION_STR"] and len(parts) > 2:
+            return parts[2].strip('"').lstrip("v")
+    raise Reject([f"{ABI_HEADER.relative_to(ROOT)} has no SUSFS_VERSION_STR"])
+
+
+def kmi_range(kmis):
+    """Lowest and highest kernel version among KMI names like android14-6.1."""
+    versions = sorted((tuple(int(n) for n in k.split("-", 1)[1].split(".")), k.split("-", 1)[1]) for k in kmis)
+    return versions[0][1], versions[-1][1]
+
+
+def brand(prop, kmis):
+    """Our name, author and base version in the module.prop that pack_module.py wrote.
+
+    The version and versionCode stay as pack_module.py set them. The description is what the card
+    shows until the first boot, load.sh replaces it with the state of that boot.
+    """
+    base = susfs_base()
+    low, high = kmi_range(kmis)
+    props = dict(line.split("=", 1) for line in prop.splitlines() if "=" in line)
+    props.update(
+        name=NAME,
+        author=AUTHOR,
+        susfsBase=base,
+        description=f"Waiting for the first boot | {len(kmis)} kernel builds, {low} to {high} | SUSFS {base}",
+    )
+    return "".join(f"{k}={v}\n" for k, v in props.items())
+
+
 def read_tree():
     return {p.name: p.read_bytes() for p in MODULE.iterdir() if p.is_file()}
 
 
-def overlay(zip_path, sc_path):
+def overlay(zip_path, sc_path, watch_path):
     sources = overlay_sources()
     src = zipfile.ZipFile(zip_path)
     files = {i.filename: src.read(i) for i in src.infolist()}
@@ -134,10 +176,13 @@ def overlay(zip_path, sc_path):
             problems.append(f"the zip has no {name}")
     if not pathlib.Path(sc_path).is_file():
         problems.append(f"the probe binary {sc_path} does not exist")
+    if not pathlib.Path(watch_path).is_file():
+        problems.append(f"the watcher binary {watch_path} does not exist")
     if problems:
         raise Reject(problems, files)
 
     probe = pathlib.Path(sc_path).read_bytes()
+    watch = pathlib.Path(watch_path).read_bytes()
     provenance = json.loads(files["provenance.json"])
     provenance["build_workflow"] = BUILD_WORKFLOW
     # tools/pack_module.py names upstream's repository, but the commit it records is the one built here.
@@ -145,6 +190,7 @@ def overlay(zip_path, sc_path):
     if repo and sha:
         provenance["source"] = f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{repo}/tree/{sha}"
     provenance["assets_sha256"][pathlib.PurePosixPath(PROBE).name] = hashlib.sha256(probe).hexdigest()
+    provenance["assets_sha256"][pathlib.PurePosixPath(WATCH).name] = hashlib.sha256(watch).hexdigest()
     provenance["boot_loop_guard"] = {
         name: hashlib.sha256(data).hexdigest() for name, data in sorted(sources.items()) if name != INSTALLER
     }
@@ -159,8 +205,10 @@ def overlay(zip_path, sc_path):
                 info.filename = RENAMED[info.filename]
             elif info.filename == "provenance.json":
                 data = (json.dumps(provenance, indent=2) + "\n").encode()
+            elif info.filename == "module.prop":
+                data = brand(data.decode(), provenance["supported_kmis"]).encode()
             out.writestr(info, data)
-        entries = {WRAPPER: sources[WRAPPER], INSTALLER: sources[INSTALLER], PROBE: probe} | {
+        entries = {WRAPPER: sources[WRAPPER], INSTALLER: sources[INSTALLER], PROBE: probe, WATCH: watch} | {
             ADDED[n]: sources[n] for n in ADDED}
         for name, data in entries.items():
             info = zipfile.ZipInfo(name, date_time=now)
@@ -176,10 +224,11 @@ def main():
     ap.add_argument("--check", action="store_true", help="check the module directory, write nothing")
     ap.add_argument("--zip", help="the module zip to add the guard to, rewritten in place")
     ap.add_argument("--sc", help="the susfs_sc binary shipped as the probe")
+    ap.add_argument("--watch", help="the susfs_propwait binary shipped as the adbd watcher")
     ap.add_argument("--rejects", default="pack-rejects", help="where the reasons go when the checks fail")
     args = ap.parse_args()
-    if args.check == bool(args.zip) or (args.zip and not args.sc):
-        ap.error("give --check, or --zip together with --sc")
+    if args.check == bool(args.zip) or (args.zip and not (args.sc and args.watch)):
+        ap.error("give --check, or --zip together with --sc and --watch")
 
     try:
         if args.check:
@@ -188,7 +237,7 @@ def main():
             if problems:
                 raise Reject(problems, files)
         else:
-            overlay(args.zip, args.sc)
+            overlay(args.zip, args.sc, args.watch)
     except Reject as e:
         reject(e.problems, e.files, args.rejects)
         return 2
