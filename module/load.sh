@@ -120,6 +120,12 @@ else
   echo "load failed: no timeout utility for the ${LOAD_TIMEOUT}s module_init limit"
   rc=1
 fi
+# TERM is acted on only when init_module(2) returns to userspace, so a slow module_init() can
+# finish after the timeout fires and 124 arrives with the module up. That is a success.
+if [ "$rc" = 124 ] && { [ -e /proc/susfs_path ] || [ -d /sys/module/susfs_guard_lkm ]; }; then
+  echo "load took longer than ${LOAD_TIMEOUT}s but the module is up."
+  rc=0
+fi
 if [ "$rc" = 124 ]; then
   echo "load timed out after ${LOAD_TIMEOUT}s"
   dmesg_stop
@@ -141,7 +147,7 @@ dmesg_stop
 rm -f "$TIMEOUT_DMESG_LOG"
 if [ "$rc" = 0 ]; then
   echo "loaded ($MODE)."
-  # The nodes exist now (expose_proc=1); put back what the WebUI saved last boot.
+  # The nodes exist now (expose_proc=1). Put back what the WebUI saved last boot.
   /system/bin/sh "$MODDIR/toggle.sh" apply
   if [ "$MODE" = custom ]; then
     set_description "✅ custom load ($KMI) | kernel $REL"
@@ -150,6 +156,13 @@ if [ "$rc" = 0 ]; then
   else
     set_description "✅ auto-detected ($KMI) | kernel $REL"
   fi
+elif [ "$rc" = 17 ]; then
+  # EEXIST: the module refused to stack on a susfs that is already up (a built-in susfs, or a
+  # fork whose nodes the pre-check above does not see).  Same outcome as that pre-check, not a
+  # failure to flag, see susfs_builtin_present() in susfs_main.c.
+  echo "susfs already present (init_module EEXIST); nothing to do."
+  set_description "already present (built-in or loaded earlier)"
+  rc=0
 else
   echo "susfs_insmod failed: $rc"
   set_description "❌ load failed [$MODE] ($KMI): susfs_insmod rc=$rc | kernel $REL"
