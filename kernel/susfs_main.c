@@ -51,6 +51,7 @@ static const char *const susfs_self_hide_paths[] = {
     "/proc/susfs_enable_log",
     "/proc/susfs_avc_spoof",
     "/proc/susfs_selinux_hide",
+    "/proc/susfs_selinux_ctx",
     SUSFS_HIDE_MODULES_NODE,
     SUSFS_HIDE_MOUNTS_NODE,
     /* sus_path's own interface (the rule listing): it goes through the same table it
@@ -265,6 +266,7 @@ enum susfs_layer_id {
     SUSFS_L_HIDE_SYMS,
     SUSFS_L_PRIORITY_FILTER,
     SUSFS_L_SELINUX_HIDE,
+    SUSFS_L_SELINUX_CTX,
     SUSFS_L_COUNT,
 };
 
@@ -320,6 +322,10 @@ static struct susfs_layer {
     /* New layers append below, so the indices above never move. */
     /* Read-only detection, nothing to arm, not fatal either way. */
     { "selinux_hide",	susfs_selinux_hide_init,	susfs_selinux_hide_exit, false, -1 },
+    /* Opt-in and config-driven, nothing armed at load. The probes go up only once the admin's list
+     * (/proc/susfs_selinux_ctx) is non-empty. Not fatal, since without it those functions keep
+     * answering the kernel's own way. */
+    { "selinux_ctx",	susfs_selinux_ctx_init,		susfs_selinux_ctx_exit, false, -1 },
 };
 
 /* Diagnostic: make one layer's init fail, by 1-based index, to exercise the rollback path
@@ -332,7 +338,7 @@ static struct susfs_layer {
  *   1 fp_hook   2 ksu_umount_gate  3 ksu_allow_gate  4 lsm_hook   5 sus_path
  *   6 opath  7 dirent  8 uname  9 kstat  10 sus_map  11 sus_mount
  *   12 cmdline  13 open_redirect  14 enable_log  15 avc_spoof  16 supercall  17 hide_syms  18 priority_filter
- *   19 selinux_hide
+ *   19 selinux_hide  20 selinux_ctx
  */
 static int fail_layer;
 module_param_named(fail_layer, fail_layer, int, 0644);
@@ -379,6 +385,7 @@ static const struct {
     { SUSFS_L_HIDE_SYMS, false },
     { SUSFS_L_PRIORITY_FILTER, false },
     { SUSFS_L_SELINUX_HIDE, false },
+    { SUSFS_L_SELINUX_CTX, false },
 };
 
 static int susfs_load_layer(int id, bool fatal)
