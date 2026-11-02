@@ -333,15 +333,10 @@ int susfs_fp_install(struct susfs_fp_hook *h)
 	    (h->nr >= 0 && !fp_entry_callable((const void *)h->wrapper,
 					      (const void *)READ_ONCE(sys_call_table_ptr[h->nr]))) ||
 	    (cnr >= 0 && compat_sys_call_table_ptr &&
-	     !fp_entry_callable((const void *)h->wrapper,
+	     !fp_entry_callable((const void *)(h->wrapper_compat ? h->wrapper_compat : h->wrapper),
 				(const void *)READ_ONCE(compat_sys_call_table_ptr[cnr])))) {
 		pr_warn("susfs_fp: %s has no valid call landing pad (0x%08x), not installed\n",
 			h->name, h->wrapper ? READ_ONCE(*(const u32 *)h->wrapper) : 0);
-		return -EINVAL;
-	}
-	if (h->wrapper_compat && !fp_has_landing_pad((const void *)h->wrapper_compat)) {
-		pr_warn("susfs_fp: %s compat wrapper has no valid call landing pad (0x%08x), not installed\n",
-			h->name, READ_ONCE(*(const u32 *)h->wrapper_compat));
 		return -EINVAL;
 	}
 
