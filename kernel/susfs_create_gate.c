@@ -216,10 +216,12 @@ static __nocfi noinline long create_takeover_mkdirat(int dfd,
 		create_putname_fn(name);
 		return err;
 	}
+	/* filename_create() answers EEXIST for "/", ".", ".." and the like, which is what
+	 * mkdir -p relies on when it walks a path from the root. */
 	if (type != LAST_NORM) {
 		path_put(&path);
 		create_putname_fn(name);
-		return -EINVAL;
+		return -EEXIST;
 	}
 
 	err2 = mnt_want_write(path.mnt);
@@ -255,9 +257,10 @@ static __nocfi noinline long create_takeover_mkdirat(int dfd,
 		return err2;
 	}
 
+	/* Before 6.3 only the caller strips the umask, vfs_mkdir() does not. */
+	mode = create_strip_umask(d_inode(path.dentry), mode);
 	err = create_security_path_mkdir_fn ?
-		create_security_path_mkdir_fn(&path, dentry,
-					      create_strip_umask(d_inode(path.dentry), mode)) : 0;
+		create_security_path_mkdir_fn(&path, dentry, mode) : 0;
 	if (!err)
 		err = create_call_vfs_mkdir(&path, dentry, mode);
 
