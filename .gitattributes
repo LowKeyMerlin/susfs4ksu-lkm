@@ -2,4 +2,5 @@
 # checkout with core.autocrlf=true would add. Upstream files are not listed and keep their endings.
 .susfs-fork/** text eol=lf
 .github/workflows/susfs-*.yml text eol=lf
+.github/README.md text eol=lf
 module/** text eol=lf
