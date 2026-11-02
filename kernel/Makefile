@@ -14,6 +14,7 @@ susfs_guard_lkm-objs := susfs_main.o patch_memory.o symbol_resolver.o lsm_hook.o
               susfs_avc_spoof.o susfs_selinux_hide.o susfs_selinux_ctx.o susfs_supercall.o susfs_hide_syms.o imports_guard.o \
               ksu_umount_gate.o ksu_allow_gate.o susfs_fp_hook.o susfs_opath.o susfs_or_entry.o \
               susfs_priority_filter.o \
+              susfs_create_gate.o \
               fsnotify_lifetime.o btf_layout.o sus_dirent.o
 
 # The dcache/icache flush helper is NOT picked at build time any more: which spelling a kernel
