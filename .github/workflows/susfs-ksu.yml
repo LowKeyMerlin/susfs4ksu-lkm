@@ -279,7 +279,13 @@ jobs:
         run: |
           set -euo pipefail
           bash .susfs-fork/smoke/retry.sh gh run download "$GITHUB_RUN_ID" --name vm-tools-ksu --dir "$RUNNER_TEMP/tools"
-          sudo DEBIAN_FRONTEND=noninteractive dpkg -i --skip-same-version "$RUNNER_TEMP"/tools/debs/*.deb
+          # The tools job lists what its own runner image lacks. A newer image has fewer preinstalled
+          # libraries (libpmem1, librdmacm1t64), so dpkg can stop on a dependency the list never held.
+          # Let apt fetch whatever is still missing and finish the configuration.
+          sudo DEBIAN_FRONTEND=noninteractive dpkg -i --skip-same-version "$RUNNER_TEMP"/tools/debs/*.deb || {
+            sudo apt-get update -q -o Acquire::Retries=3
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends -f
+          }
           for tool in qemu-system-aarch64 cpio secilc; do
             command -v "$tool" > /dev/null || { echo "::error::$tool is missing after the install"; exit 1; }
           done
