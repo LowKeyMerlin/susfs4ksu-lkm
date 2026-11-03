@@ -268,6 +268,7 @@ enum susfs_layer_id {
     SUSFS_L_PRIORITY_FILTER,
     SUSFS_L_SELINUX_HIDE,
     SUSFS_L_SELINUX_CTX,
+    SUSFS_L_SELINUX_STATUS,
     SUSFS_L_COUNT,
 };
 
@@ -331,6 +332,10 @@ static struct susfs_layer {
      * (/proc/susfs_selinux_ctx) is non-empty. Not fatal, since without it those functions keep
      * answering the kernel's own way. */
     { "selinux_ctx",	susfs_selinux_ctx_init,		susfs_selinux_ctx_exit, false, -1 },
+    /* Behavioural mirror, always armed, no config. Keeps the SELinux status page unchanged by a
+     * KernelSU-origin policy edit. Not fatal: a symbol that does not resolve leaves the page to the
+     * kernel, and without KernelSU resolved the gate is inert. */
+    { "selinux_status",	susfs_selinux_status_init,	susfs_selinux_status_exit, false, -1 },
 };
 
 /* Diagnostic: make one layer's init fail, by 1-based index, to exercise the rollback path
@@ -343,7 +348,7 @@ static struct susfs_layer {
  *   1 fp_hook   2 ksu_umount_gate  3 ksu_allow_gate  4 lsm_hook   5 sus_path
  *   6 create_gate  7 opath  8 dirent  9 uname  10 kstat  11 sus_map  12 sus_mount
  *   13 cmdline  14 open_redirect  15 enable_log  16 avc_spoof  17 supercall  18 hide_syms  19 priority_filter
- *   20 selinux_hide  21 selinux_ctx
+ *   20 selinux_hide  21 selinux_ctx  22 selinux_status
  */
 static int fail_layer;
 module_param_named(fail_layer, fail_layer, int, 0644);
@@ -392,6 +397,7 @@ static const struct {
     { SUSFS_L_PRIORITY_FILTER, false },
     { SUSFS_L_SELINUX_HIDE, false },
     { SUSFS_L_SELINUX_CTX, false },
+    { SUSFS_L_SELINUX_STATUS, false },
 };
 
 static int susfs_load_layer(int id, bool fatal)

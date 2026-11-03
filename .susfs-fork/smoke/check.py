@@ -248,6 +248,14 @@ PRIO_EXPECTED = [
     ("prio_refresh_removed", f"{PRIO_TRUTH}/{PRIO_TRUTH}",
      "a package that is gone is not hidden any more, and a burst of writes is harmless"),
 ]
+# Only on a boot that loaded a SELinux policy (policy_load_rc below). The status page face arms on
+# every KMI, and PID 1 is not a KernelSU-origin caller, so its policy reload still bumps the page and
+# the skip counter does not move.
+SELSTATUS_EXPECTED = [
+    ("sel_status_armed", "11", "both SELinux status-page probes armed"),
+    ("sel_status_bump", "yes", "a policy reload by a non-ksu caller still bumps the status page"),
+    ("sel_status_skip", "0", "the status-page skip counter does not move for a non-ksu caller"),
+]
 KSU_EXPECTED = [
     ("policy_load_rc", "0", "the SELinux policy KernelSU needs was loaded"),
     ("ksu_load_rc", "0", "kernelsu.ko loaded"),
@@ -407,6 +415,8 @@ def judge(lines, qemu_rc, ksu_cfg=None):
                               f"{facts.get('probe_before', 'missing')}), so a load proves nothing"], facts
 
     expected = list(EXPECTED) + PRIO_EXPECTED + KSTAT_EXPECTED + MAPPROC_EXPECTED
+    if facts.get("policy_load_rc") == "0":
+        expected += SELSTATUS_EXPECTED
     if ksu_cfg:
         expected += KSU_EXPECTED
     if ksu_cfg == "debug":

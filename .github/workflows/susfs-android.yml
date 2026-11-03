@@ -291,6 +291,22 @@ jobs:
           expect sees_after_del yes
           expect missing no
           exit $bad
+      - name: Run the SELinux status-page face in the guest
+        run: |
+          source .susfs-fork/android/lib.sh
+          "$ADB" -s "$SERIAL" push .susfs-fork/android/status-guest.sh /data/local/tmp/status-guest.sh > /dev/null
+          "$ADB" -s "$SERIAL" shell sh /data/local/tmp/status-guest.sh 2>&1 | tr -d '\r' | tee /tmp/guest-status.out
+          bad=0
+          expect() {
+            got=$(sed -n "s/^ANDROID $1=//p" /tmp/guest-status.out)
+            if [ "$got" = "$2" ]; then echo "ok   $1=$got"; else echo "DIFF $1: wanted '$2', got '$got'"; bad=1; fi
+          }
+          expect selinux Enforcing
+          expect armed 11
+          expect su_enforce_bumped no
+          expect su_enforce_skipped yes
+          expect enforce_now Enforcing
+          exit $bad
       - name: Check the result
         run: |
           bad=0
@@ -344,6 +360,7 @@ jobs:
             /tmp/guest-prio.out
             /tmp/guest-kstat.out
             /tmp/guest-map.out
+            /tmp/guest-status.out
             /tmp/guest-dmesg.txt
             /tmp/guest-logcat.txt
             /tmp/create.out

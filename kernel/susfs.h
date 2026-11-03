@@ -158,6 +158,12 @@ void susfs_selinux_hide_exit(void);
 int susfs_selinux_ctx_init(void);
 void susfs_selinux_ctx_exit(void);
 
+/* Keeps the SELinux status page (/sys/fs/selinux/status) unchanged by a KernelSU-origin policy
+ * edit, so an app watching its sequence counter sees no sign of the manager's runtime sepolicy
+ * pushes (see susfs_selinux_status.c). Inert without KernelSU resolved. */
+int susfs_selinux_status_init(void);
+void susfs_selinux_status_exit(void);
+
 int susfs_supercall_init(void);
 void susfs_supercall_exit(void);
 /* True when the sys_call_table hook could not arm and the supercall is delivered

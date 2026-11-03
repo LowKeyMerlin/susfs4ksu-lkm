@@ -105,6 +105,23 @@ say "second_load_rc=$?"
 say "second_load_count=$(find /sys/module -maxdepth 1 -name susfs_guard_lkm | wc -l)"
 say "disabled_after=$(yesno [ -f disable ])"
 
+# SELinux status page (/sys/fs/selinux/status): susfs_selinux_status skips the page's sequence bump
+# for a KernelSU-origin policy change. PID 1 here is not such a caller (no ksu domain, and the gate
+# stays inert until KernelSU is resolved), so a policy reload it makes must still bump the page and
+# leave the skip counter where it was. This proves the probes arm on every KMI and that the face is
+# correctly inert for a caller it does not cover.
+if [ -n "$POLICY" ] && [ -r /proc/susfs_selinux_status ] && [ -r /sys/fs/selinux/status ]; then
+  # The page is five u32s: version sequence enforcing policyload deny_unknown.
+  sel_seq() { dd if=/sys/fs/selinux/status bs=4 skip=1 count=1 2>/dev/null | od -An -tu4 | tr -d ' \n'; }
+  sel_plskip() { sed -n 's/^skips: policyload=\([0-9]*\).*/\1/p' /proc/susfs_selinux_status; }
+  say "sel_status_armed=$(sed -n 's/^armed: policyload=\([01]\) setenforce=\([01]\).*/\1\2/p' /proc/susfs_selinux_status)"
+  sel_seq0=$(sel_seq)
+  sel_skip0=$(sel_plskip)
+  cat "$POLICY" >/sys/fs/selinux/load
+  say "sel_status_bump=$(yesno [ "$sel_seq0" != "$(sel_seq)" ])"
+  say "sel_status_skip=$(( $(sel_plskip) - ${sel_skip0:-0} ))"
+fi
+
 # Hooks that skip a function for the reader. Each is used as in practice: add a rule where one
 # is needed and read what the hook filters as an app uid. A skip that leaves the CPU in a wrong
 # state shows up as a crash on the console.
