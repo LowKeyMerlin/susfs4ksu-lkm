@@ -217,16 +217,25 @@ if [ -n "$KSU" ]; then
 fi
 
 # The priority uid filter answers "no such user" when a uid asks about another one. Hidden uids
-# are named like packages and looked up under /data/data, so a directory owned by a uid stands in
-# for an installed app, and a process of that uid must exist or every uid gets "no such user".
+# are named like packages and looked up in /data/system/packages.list, so a line of the list
+# stands in for an installed app, and a process of that uid must exist or every uid gets "no such
+# user". None of them has a /data/data directory.
 # A row is what getpriority, setpriority, ioprio_get, ioprio_set and ioprio_set with an invalid
 # class returned, with "ok" for any success.
 PRIO=/bin/prio_probe
 PRIO32=/bin/prio_probe32
-for d in hid:10005 vis:10006 low:9999 high:20000; do
-  mkdir -p "/data/data/${d%:*}"
-  chown "${d#*:}" "/data/data/${d%:*}"
-done
+# plist FILE NAME:UID ...: a package list with a line per package, as the package manager writes it.
+plist() {
+  out=$1
+  shift
+  : >"$out"
+  for e in "$@"; do
+    echo "${e%:*} ${e#*:} 0 /data/data/${e%:*} default none" >>"$out"
+  done
+}
+mkdir -p /data/system
+plist /data/system/packages.list hid:10005 vis:10006 low:9999 high:20000 bad:x
+say "prio_no_data_dir=$([ -e /data/data/hid ] && echo yes || echo no)"
 as_user hid 'exec sleep 3600' >/dev/null 2>&1 &
 hidpid=$!
 as_user vis 'exec sleep 3600' >/dev/null 2>&1 &
@@ -274,6 +283,17 @@ say "prio_set_low_uid=$(pset root low)"
 say "prio_set_high_uid=$(pset root high)"
 say "prio_set_unterminated=$("$PRIO" setfill | tr '\n' ' ' | sed 's/^set_rc=\(-*[0-9]*\) set_err=\(-*[0-9]*\) *$/\1,\2/')"
 say "prio_set_by_app=$(pset app hid)"
+# Only the name at the start of a line is a package: not the start of a longer name, not a longer
+# name than an installed one, not a word of another field.
+say "prio_set_prefix=$(pset root hi)"
+say "prio_set_longer=$(pset root hidx)"
+say "prio_set_midline=$(pset root default)"
+say "prio_set_baduid=$(pset root bad)"
+# The list is copied back, not moved, so putting it back is not the package list event.
+cp /data/system/packages.list /data/system/packages.list.keep
+rm /data/system/packages.list
+say "prio_set_nolist=$(pset root vis)"
+cp /data/system/packages.list.keep /data/system/packages.list
 say "prio_refused_keeps=$(row app 10005)/$(row app 10006)"
 say "prio_set_list=$(pset root ' hid, ,vis ,')"
 say "prio_list_hides=$(row app 10005)/$(row app 10006)"
@@ -316,11 +336,11 @@ say "prio_race_bad_rows=$bad"
 say "prio_after_race=$(pset root vis)"
 
 # The list is resolved again when the package manager writes packages.list, so a package that
-# returns under another uid is followed. The owner of "vis" changes as on a reinstall, and a
+# returns under another uid is followed. The uid of "vis" changes as on a reinstall, and a
 # process of each uid tells the old one from the new one. Nothing changes until the file is moved
 # into /data/system, a move elsewhere or of another name is not the event.
 as_user swp 'exec sleep 3600' >/dev/null 2>&1 &
-chown 10007 /data/data/vis
+plist /data/system/packages.list.new hid:10005 vis:10007 low:9999 high:20000
 say "prio_refresh_stale=$(row app 10006)/$(row app 10007)"
 mkdir -p /data/other /data/system
 : >/data/other/packages.list.new
@@ -329,17 +349,20 @@ mv -f /data/other/packages.list.new /data/other/packages.list
 mv -f /data/system/packages.xml.new /data/system/packages.xml
 sleep 3
 say "prio_refresh_not_event=$(row app 10006)/$(row app 10007)"
-: >/data/system/packages.list.new
 mv -f /data/system/packages.list.new /data/system/packages.list
 for i in 1 2 3 4 5 6; do
   [ "$(row app 10007)" = "-3,-3,-3,-3,-22" ] && break
   sleep 1
 done
 say "prio_refresh_followed=$(row app 10006)/$(row app 10007)"
+# A list that cannot be read leaves the last good filter in place.
+: >/data/system/packages.list.new
+mv -f /data/system/packages.list.new /data/system/packages.list
+sleep 3
+say "prio_refresh_unreadable=$(row app 10006)/$(row app 10007)"
 # A burst while a pass is waiting is one pass, and a removed package is no longer hidden.
-rmdir /data/data/vis
 for i in 1 2 3 4 5; do
-  : >/data/system/packages.list.new
+  plist /data/system/packages.list.new hid:10005 low:9999 high:20000
   mv -f /data/system/packages.list.new /data/system/packages.list
 done
 sleep 3

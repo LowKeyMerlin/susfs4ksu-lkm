@@ -17,12 +17,15 @@
  *  - A caller asking about its own uid is not filtered.
  *  - A caller KernelSU allows (the manager, an app granted root) sees the truth, as for every other
  *    hidden thing in this module. Upstream filters every app uid.
- *  - Hidden uids come from package names, resolved to the owner of /data/data/<package> when the
- *    command arrives and again when the package list changes, since a reinstalled package gets
- *    another uid. The event is packages.list being moved into /data/system, seen by a kprobe on
- *    d_move(), and it queues one delayed work item, so a burst is one pass and at most one pass
- *    runs a second. The pass runs with the credentials of whoever sent the list, since a kworker is
- *    refused /data/data/<package> by SELinux (as measured in sus_path).
+ *  - Hidden uids come from package names, looked up in /data/system/packages.list when the command
+ *    arrives and again when the package list changes, since a reinstalled package gets another
+ *    uid. The list names every installed package, also one with no directory under /data/data.
+ *    A name that is not installed fails the command, so a typo is reported, but is skipped by
+ *    the pass that follows a package change and picked up when installed. The event is packages.list
+ *    being moved into /data/system, seen by a kprobe on d_move(), and it queues one delayed work
+ *    item, so a burst is one pass and at most one pass runs a second. The pass runs with the
+ *    credentials of whoever sent the list, which can read packages.list, since a kworker cannot
+ *    read app data under SELinux (as measured in sus_path).
  *
  * Nothing runs unless a filtered syscall is made or the package list changes: no polling, timer
  * or thread. A lookup is one bit test.
@@ -42,8 +45,7 @@
 #include <linux/cred.h>
 #include <linux/uidgid.h>
 #include <linux/user_namespace.h>
-#include <linux/namei.h>
-#include <linux/path.h>
+#include <linux/err.h>
 #include <linux/fs.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
@@ -69,7 +71,9 @@
 /* Every Android user has its own block of uids, the app id is the offset in it. */
 #define PRIO_PER_USER_RANGE	100000
 #define PRIO_NAME_MAX		255
-#define PRIO_DATA_DIR		"/data/data/"
+#define PRIO_PKG_PATH		"/data/system/packages.list"
+/* A line is a few hundred bytes, so this is tens of thousands of packages. */
+#define PRIO_PKG_MAX		(4 * 1024 * 1024)
 
 struct prio_bitmap {
 	struct rcu_head rcu;
@@ -110,7 +114,7 @@ static bool prio_valid_name(const char *name)
 
 	if (!len || len > PRIO_NAME_MAX)
 		return false;
-	/* The name becomes a path component, so nothing that could leave /data/data. */
+	/* A lone "." or ".." passes the character set below but is not a package name. */
 	if (!strcmp(name, ".") || !strcmp(name, ".."))
 		return false;
 	for (; *name; name++) {
@@ -124,34 +128,100 @@ static bool prio_valid_name(const char *name)
 	return true;
 }
 
-/* The uid of an installed package, which is the owner of its data directory. */
-static int prio_resolve_name(const char *name, uid_t *uid)
+/*
+ * The whole package list as one string. O_NOATIME keeps the read from touching the file's atime,
+ * but the kernel refuses it with EPERM to a caller that neither owns the file nor holds
+ * CAP_FOWNER. Such a caller can still read the list, so it is opened again without the flag.
+ */
+static char *prio_read_packages(void)
 {
-	char path[sizeof(PRIO_DATA_DIR) + PRIO_NAME_MAX];
-	struct path p;
-	int rc;
+	struct file *fp;
+	loff_t pos = 0, size;
+	ssize_t got;
+	char *buf;
 
-	scnprintf(path, sizeof(path), PRIO_DATA_DIR "%s", name);
-	rc = kern_path(path, LOOKUP_FOLLOW, &p);
-	if (rc)
-		return rc;
-	*uid = from_kuid(&init_user_ns, d_inode(p.dentry)->i_uid);
-	path_put(&p);
-	if (*uid < SUSFS_PRIORITY_UID_FILTER_MIN_UID || *uid > SUSFS_PRIORITY_UID_FILTER_MAX_UID)
-		return -EINVAL;
-	return 0;
+	fp = filp_open(PRIO_PKG_PATH, O_RDONLY | O_NOATIME, 0);
+	if (fp == ERR_PTR(-EPERM))
+		fp = filp_open(PRIO_PKG_PATH, O_RDONLY, 0);
+	if (IS_ERR(fp))
+		return ERR_CAST(fp);
+
+	size = i_size_read(file_inode(fp));
+	if (size <= 0 || size > PRIO_PKG_MAX) {
+		filp_close(fp, NULL);
+		return ERR_PTR(-EFBIG);
+	}
+	buf = kvmalloc(size + 1, GFP_KERNEL);
+	if (!buf) {
+		filp_close(fp, NULL);
+		return ERR_PTR(-ENOMEM);
+	}
+	got = kernel_read(fp, buf, size, &pos);
+	filp_close(fp, NULL);
+	if (got != size) {
+		kvfree(buf);
+		return ERR_PTR(got < 0 ? got : -EIO);
+	}
+	buf[size] = '\0';
+	return buf;
+}
+
+/*
+ * The uid of an installed package. A line of the list is "<package> <uid> <debuggable> ...", where
+ * the uid is the app id. Only the part below the per-user range is kept.
+ */
+static int prio_lookup(const char *pkgs, const char *name, uid_t *uid)
+{
+	size_t len = strlen(name);
+	const char *line = pkgs;
+
+	while (*line) {
+		const char *eol = strchrnul(line, '\n');
+
+		if ((size_t)(eol - line) > len && !strncmp(line, name, len) &&
+		    (line[len] == ' ' || line[len] == '\t')) {
+			const char *num = line + len + 1;
+			char digits[16];
+			size_t n = 0;
+			unsigned int val;
+
+			while (num + n < eol && num[n] != ' ' && num[n] != '\t' &&
+			       n < sizeof(digits) - 1)
+				n++;
+			memcpy(digits, num, n);
+			digits[n] = '\0';
+			if (kstrtouint(digits, 10, &val))
+				return -EINVAL;
+			*uid = val % PRIO_PER_USER_RANGE;
+			if (*uid < SUSFS_PRIORITY_UID_FILTER_MIN_UID ||
+			    *uid > SUSFS_PRIORITY_UID_FILTER_MAX_UID)
+				return -EINVAL;
+			return 0;
+		}
+		line = *eol ? eol + 1 : eol;
+	}
+	return -ENOENT;
 }
 
 /*
  * Set the bit of every package in the comma separated list, ignoring blanks and empty items. The
  * list is modified while it is split.
  *
- * An unresolvable package fails the command, so a typo is reported. On a refresh after a package
- * change (lenient) a removed package is skipped and picked up again when installed.
+ * A package with no uid fails the command, so a typo is reported. Upstream skips it, a deliberate
+ * difference. On a refresh after a package change (lenient) a removed package is skipped and
+ * picked up again when installed. A name that is not a package name, or a package list that
+ * cannot be read, fails in both cases.
  */
 static int prio_parse(char *list, unsigned long *bits, bool lenient)
 {
+	char *pkgs;
 	char *item;
+
+	pkgs = prio_read_packages();
+	if (IS_ERR(pkgs)) {
+		pr_warn("priority_filter: cannot read %s (%ld)\n", PRIO_PKG_PATH, PTR_ERR(pkgs));
+		return PTR_ERR(pkgs);
+	}
 
 	while ((item = strsep(&list, ",")) != NULL) {
 		uid_t uid;
@@ -162,18 +232,21 @@ static int prio_parse(char *list, unsigned long *bits, bool lenient)
 			continue;
 		if (!prio_valid_name(item)) {
 			pr_warn("priority_filter: '%s' is not a package name\n", item);
+			kvfree(pkgs);
 			return -EINVAL;
 		}
-		rc = prio_resolve_name(item, &uid);
+		rc = prio_lookup(pkgs, item, &uid);
 		if (rc) {
 			if (lenient)
 				continue;
 			pr_warn("priority_filter: no uid for '%s' (%d)\n", item, rc);
+			kvfree(pkgs);
 			return rc;
 		}
 		set_bit(uid - SUSFS_PRIORITY_UID_FILTER_MIN_UID, bits);
 		SUSFS_LOGI("priority_filter: '%s' is uid %u\n", item, uid);
 	}
+	kvfree(pkgs);
 	return 0;
 }
 
@@ -220,6 +293,7 @@ static void prio_refresh(struct work_struct *work)
 	unsigned int gen = 0;
 	char *list = NULL;
 	size_t len;
+	int err;
 
 	mutex_lock(&prio_lock);
 	if (prio_names && prio_cred) {
@@ -239,11 +313,12 @@ static void prio_refresh(struct work_struct *work)
 	if (bitmap) {
 		/* One reference is ours and one is override_creds()'s, as in sus_path. */
 		saved = override_creds(cred);
-		prio_parse(list, bitmap->bits, true);
+		err = prio_parse(list, bitmap->bits, true);
 		revert_creds(saved);
 
+		/* A list that cannot be read leaves the last good one in place. */
 		mutex_lock(&prio_lock);
-		if (gen == prio_gen) {
+		if (!err && gen == prio_gen) {
 			prio_swap(bitmap);
 			bitmap = NULL;
 		}
