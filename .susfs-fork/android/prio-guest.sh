@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # The priority uid filter on an Android guest, after guest-test.sh has loaded KernelSU and the module.
-# The packages are installed ones, and the uid to hide is found through /data/data under SELinux, as
-# on a device. Prints one "ANDROID key=value" line per fact.
+# The packages are installed ones, and the uid to hide is found in /data/system/packages.list, as on
+# a device. Prints one "ANDROID key=value" line per fact.
 T=/data/local/tmp
 P=$T/prio_probe
 
@@ -29,10 +29,9 @@ PKG_B=$(sed -n 2p $T/pkgs | cut -d' ' -f1); UID_B=$(sed -n 2p $T/pkgs | cut -d' 
 UID_C=$(sed -n 3p $T/pkgs | cut -d' ' -f2)
 say "packages=$(wc -l < $T/pkgs)"
 say "pkg_a=$PKG_A uid_a=$UID_A pkg_b=$PKG_B uid_b=$UID_B uid_c=$UID_C"
-# The filter takes the owner of the data directory, which has to be the uid the package manager reports.
-say "owner_a=$([ "$(stat -c %u "/data/data/$PKG_A")" = "$UID_A" ] && echo yes || echo no)"
-say "owner_b=$([ "$(stat -c %u "/data/data/$PKG_B")" = "$UID_B" ] && echo yes || echo no)"
-say "data_is_link=$([ -L /data/data ] && echo yes || echo no)"
+# The filter takes the uid from the package list, which has to be the one the package manager reports.
+say "listed_a=$(grep -c "^$PKG_A $UID_A " /data/system/packages.list)"
+say "listed_b=$(grep -c "^$PKG_B $UID_B " /data/system/packages.list)"
 say "caller_uid=$(su "$UID_C" id -u)"
 
 # A uid without a process is answered with ESRCH whatever the filter says, so each target has one.
@@ -53,23 +52,23 @@ say "set_both=$(pset "$PKG_A,$PKG_B")"
 say "both_hidden=$(row "$UID_C" "$UID_A")/$(row "$UID_C" "$UID_B")"
 say "set_b=$(pset "$PKG_B")"
 say "replaced=$(row "$UID_C" "$UID_A")/$(row "$UID_C" "$UID_B")"
-# The package manager rewrites packages.list when a package is installed, and the filter follows the
-# package to the uid it has then. The data directory of PKG_A changes owner as it does when an app comes back
-# under another uid, so the uid of PKG_A is now UID_B. Nothing changes until the package manager writes.
-H="-3,-3,-3,-3,-22"
+# The package manager rewrites packages.list when a package is installed, and the filter reads the
+# list again. The owner of a data directory is not evidence of the uid: with PKG_A's directory owned by
+# UID_B, PKG_A stays hidden and UID_B stays visible, before and after the list is rewritten.
 say "set_a_again=$(pset "$PKG_A")"
+RUNS=$(dmesg | grep -c "priority_filter: '$PKG_A' is uid")
 ls -l /data/system/packages.list* > $T/pl.before 2>&1
 chown "$UID_B" "/data/data/$PKG_A"
-say "refresh_stale=$(row "$UID_C" "$UID_A")/$(row "$UID_C" "$UID_B")"
+say "owner_ignored=$(row "$UID_C" "$UID_A")/$(row "$UID_C" "$UID_B")"
 APK=$(ls /system/app/*/*.apk 2>/dev/null | head -n 1)
 say "reinstall_apk=$APK"
 say "reinstall_out=$(pm install -r -d "$APK" 2>&1 | tr '\n' ' ')"
 for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
-  [ "$(row "$UID_C" "$UID_B")" = "$H" ] && break
+  [ "$(dmesg | grep -c "priority_filter: '$PKG_A' is uid")" -gt "$RUNS" ] && break
   sleep 1
 done
-say "refresh_followed=$(row "$UID_C" "$UID_A")/$(row "$UID_C" "$UID_B")"
-say "owner_after=$(stat -c %u "/data/data/$PKG_A")"
+say "refresh_ran=$([ "$(dmesg | grep -c "priority_filter: '$PKG_A' is uid")" -gt "$RUNS" ] && echo yes || echo no)"
+say "refresh_kept=$(row "$UID_C" "$UID_A")/$(row "$UID_C" "$UID_B")"
 ls -l /data/system/packages.list* > $T/pl.after 2>&1
 say "list_changed=$(cmp -s $T/pl.before $T/pl.after && echo no || echo yes)"
 chown "$UID_A" "/data/data/$PKG_A"

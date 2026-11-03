@@ -7,8 +7,8 @@ run-name: "susfs-android: ${{ inputs.title || (inputs.run && format('manual, run
 #   guard  only when dispatched with guard=true. The module's bootloop guard test under Android's own shell, then a boot cut short with
 #          a reboot: the next boot must trip the guard and disable the modules it is told to.
 #   prio   KernelSU and the module loaded in the guest, then the priority uid filter against real
-#          packages: hidden and visible callers, owner and root, refused input, and the refresh
-#          after packages.list changes.
+#          packages: hidden and visible callers, owner and root, refused input, a data directory
+#          owner that is not trusted, and the refresh after packages.list changes.
 #
 # The module zip and the KernelSU modules come from one pipeline run, its build and its susfs-ksu
 # job. The scripts under test come from the zip, the ones in this repository only drive the guest.
@@ -305,8 +305,8 @@ jobs:
           expect layer 4
           expect layer_failed 0
           expect packages 3
-          expect owner_a yes
-          expect owner_b yes
+          expect listed_a 1
+          expect listed_b 1
           expect caller_uid "$(sed -n 's/^ANDROID pkg_a=.* uid_c=//p' /tmp/guest-prio.out)"
           expect before "$truth"
           expect set_a "0,0"
@@ -320,8 +320,10 @@ jobs:
           expect both_hidden "$hidden/$hidden"
           expect set_b "0,0"
           expect replaced "$truth/$hidden"
-          expect refresh_stale "$hidden/$truth"
-          expect refresh_followed "$truth/$hidden"
+          expect owner_ignored "$hidden/$truth"
+          expect list_changed yes
+          expect refresh_ran yes
+          expect refresh_kept "$hidden/$truth"
           expect avc_probe 0
           exit $bad
       - name: Collect the guest logs

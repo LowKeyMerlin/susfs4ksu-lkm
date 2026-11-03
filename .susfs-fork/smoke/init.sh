@@ -225,10 +225,15 @@ fi
 PRIO=/bin/prio_probe
 PRIO32=/bin/prio_probe32
 # plist FILE NAME:UID ...: a package list with a line per package, as the package manager writes it.
+# The users the VM runs as are always in it. ksuctl names their profiles ksuctl.uid.<uid>, and
+# KernelSU drops a profile whose uid and name the list does not carry.
 plist() {
   out=$1
   shift
   : >"$out"
+  for u in 10000 10001 10002 10003 10004; do
+    echo "ksuctl.uid.$u $u 0 /data/data/ksuctl.uid.$u default none" >>"$out"
+  done
   for e in "$@"; do
     echo "${e%:*} ${e#*:} 0 /data/data/${e%:*} default none" >>"$out"
   done
