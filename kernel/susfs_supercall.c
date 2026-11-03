@@ -103,6 +103,7 @@ static const struct feature_entry enabled_features[] = {
 	{ "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n",	SUSFS_FEAT_SPOOF_CMDLINE },
 	{ "CONFIG_KSU_SUSFS_OPEN_REDIRECT\n",	SUSFS_FEAT_OPEN_REDIRECT },
 	{ "CONFIG_KSU_SUSFS_SUS_MAP\n",		SUSFS_FEAT_SUS_MAP },
+	{ "CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER\n",	SUSFS_FEAT_PRIORITY_FILTER },
 	/* hide_modules is not upstream's, so it is not listed here - the feature itself is unchanged. */
 };
 

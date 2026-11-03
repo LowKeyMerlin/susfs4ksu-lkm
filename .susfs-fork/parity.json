@@ -2,13 +2,13 @@
   "about": "Every place the upstream kernel patch calls into SUSFS, and what this module does about it. Sites come from kernel_patches/50_add_susfs_in_gki-*.patch on the stable branches. They are identical on all seven except where a row names a branch. status: implemented, lkm-different (same effect through a hook an LKM can have), missing, unreviewed (not checked yet). evidence: static (read from the sources, no test yet) or tested.",
   "reviewed": {
     "level": "hook sites and ABI, plus the kernel_patches commits listed under triaged; older commit contents are not reviewed",
-    "gki-android12-5.10": "8930474a",
-    "gki-android13-5.10": "cfa82d53",
-    "gki-android13-5.15": "e30f1502",
-    "gki-android14-5.15": "251a2ec4",
-    "gki-android14-6.1": "ee155a1a",
-    "gki-android15-6.6": "93114563",
-    "gki-android16-6.12": "6b60a305"
+    "gki-android12-5.10": "b0e47464",
+    "gki-android13-5.10": "8a120081",
+    "gki-android13-5.15": "d5df1d93",
+    "gki-android14-5.15": "e22ceec7",
+    "gki-android14-6.1": "a0ac9069",
+    "gki-android15-6.6": "c7f670f5",
+    "gki-android16-6.12": "68f62fae"
   },
   "sites": [
     {"upstream": "block/ioprio.c susfs_is_priority_uid_filtered", "ours": "patch 0004 priority filter (ioprio_get/ioprio_set)", "status": "implemented", "evidence": "tested"},
@@ -46,6 +46,9 @@
     {"upstream": "kernel/reboot.c ksu_handle_sys_reboot (the supercall entry)", "ours": "susfs_supercall.c (syscall table entry, kprobe on the reboot syscall when the table cannot be hooked)", "status": "lkm-different", "evidence": "tested"},
     {"upstream": "security/selinux/avc.c susfs_is_avc_log_spoofing_enabled, susfs_ksu_sid, susfs_priv_app_sid (avc log spoofing)", "ours": "susfs_avc_spoof.c (kprobe on slow_avc_audit)", "status": "lkm-different", "evidence": "static"},
     {"upstream": "security/selinux/hooks.c, security/selinux/selinuxfs.c selinux_hide: ksu_selinux_hide_running, backup_sepolicy, my_setprocattr, my_security_* (an app is answered from the policy without KernelSU's rules)", "ours": "KernelSU side: kernel/feature/selinux_hide.c ships in tiann/KernelSU, SukiSU-Ultra, BakaSU, KernelSU-Next and backslashxx (not in rsuntk, which is lkm:false) and hooks selinuxfs write_op and setprocattr itself at run time. susfs_selinux_hide.c resolves ksu_selinux_hide_running via kallsyms at load and reports it read-only on /proc/susfs_selinux_hide, so a caller (the WebUI) can tell native support from none without guessing", "status": "ksu-side", "evidence": "static", "note": "Decided not to port, and read KernelSU's own kernel/selinux/rules.c to confirm why: selinux_hide answers from backup_sepolicy, a full ksu_dup_sepolicy() + isid load that KernelSU itself creates in apply_kernelsu_rules() and frees in ksu_selinux_hide_drop_backup_if_unused() the moment ITS OWN copy of the feature is off. A second, independent backup here would mean re-implementing that whole mechanism and tracking every policy reload the host's KernelSU does - not attempted. The module's AVC log spoof (susfs_avc_spoof.c) is a separate kprobe on slow_avc_audit and does not overlap. When native_supported=0, this module has NO override of its own yet; the WebUI shows that state rather than a switch that would do nothing. susfs_selinux_ctx.c (a new layer, no upstream row) covers the app-facing write/validity-oracle surface instead - the only app-reachable SELinux surface, since policy reads are MAC-blocked for apps - and is not a backup_sepolicy port. Its query node (selinux_transaction_write) is a kretprobe that runs the real write_op before redacting, so a hidden type is rejected with the same cost a genuinely-absent type shows, closing the reject-timing residual; the return handler drops the answer the body staged (simple_transaction_set, resolved at run time) so the -EINVAL is not belied by a readable canonical context, and falls back to a leak-safe pre-reject kprobe on any KMI where that helper is unresolvable. setprocattr stays a pre-reject because running its body would commit the transition it hides (see that file's header)."},
+    {"upstream": "security/selinux/hooks.c, security/selinux/selinuxfs.c, security/selinux/ss/services.c susfs_selinux_setprocattr, susfs_selinux_lsm_setattr (gki-android16-6.12, the helper behind susfs_selinux_setprocattr), susfs_security_context_to_sid, susfs_security_context_to_sid_core, susfs_security_context_str_to_sid, susfs_string_to_context_struct, susfs_sel_write_context, susfs_sel_write_access, susfs_is_sus_type_rcu", "ours": "susfs_selinux_ctx.c (kretprobe on selinux_transaction_write for the selinuxfs query nodes, kprobe on security_setprocattr)", "status": "lkm-different", "evidence": "static", "note": "Upstream hides every type that KernelSU adds with ksu_type(), recorded by the kernel patch, and only while KernelSU's selinux_hide runs. Here the hidden types are a list the admin sets through /proc/susfs_selinux_ctx. It is empty by default, so no type is hidden until one is added. The answer to a hidden type is the -EINVAL an absent type gets, as upstream."},
+    {"upstream": "security/selinux/selinuxfs.c, security/selinux/ss/services.c susfs_security_compute_av_user, susfs_spoof_avd_allowed_rcu", "ours": "KernelSU side: the selinux_hide that the KernelSU forks ship answers access queries from backup_sepolicy, see the selinux_hide row. susfs_selinux_hide.c reports whether it runs", "status": "ksu-side", "evidence": "static", "note": "Upstream records the allowed bits of each rule that ksu_allow() changes and puts the original bits back into the answer of an access query. The module keeps no such record, and susfs_selinux_ctx.c hides type names only. On a KernelSU without its own selinux_hide, an access query still sees the rules KernelSU added."},
+    {"upstream": "security/selinux/ss/services.c, security/selinux/status.c susfs_is_current_ksu_domain", "ours": "", "status": "missing", "evidence": "static", "note": "When KernelSU's own domain commits a policy, sets booleans or changes enforcing, upstream leaves latest_granting and the status page sequence, policyload and deny_unknown as they were, so an app that maps /sys/fs/selinux/status sees no sign of KernelSU's policy edits. The change is made in the middle of selinux_policy_commit(), security_set_bools() and selinux_status_update_setenforce() and selinux_status_update_policyload(), and the last two hold status_lock, a mutex. An LKM cannot edit the middle of a function, and a probe that skips a whole function cannot do its work because it cannot sleep on that mutex. Not ported."},
     {"upstream": "drivers/input/input.c ksu_handle_input_handle_event, fs/read_write.c ksu_handle_sys_read (KernelSU manual hooks)", "ours": "KernelSU side", "status": "ksu-side", "evidence": "static"},
     {"upstream": "fs/Makefile (builds susfs.o into the kernel)", "ours": "", "status": "not-applicable", "evidence": "static"},
     {"upstream": "fs/super.c susfs_is_current_ksu_domain", "ours": "sus_mount.c (generic_shutdown_super)", "status": "lkm-different", "evidence": "static"}
@@ -62,6 +65,34 @@
     {
       "commit": "8879282 SUS_MOUNT: allocate a KSU anonymous-bdev minor from a high range (get_anon_bdev / copy_mnt_ns CL_COPY_MNT_NS)",
       "result": "deliberate non-port, and not for one reason but two. (1) Prerequisite conflicts with the event-driven-only rule: the whole hunk is gated on static_branch_unlikely(&susfs_is_sdcard_android_data_not_decrypted), a static key that upstream keeps TRUE until /sdcard decrypts and then disables from a delayed_work armed by an fsnotify group watching /data/media/0 - 'code straightly borrowed from KernelSU's pkg_observer.c' (fs/susfs.c). That is a kthread/fsnotify/timer mechanism this module does not implement and the project forbids. Without the flag the branch never fires, so there is nothing to gate a port on. (2) Blast radius: get_anon_bdev runs for every anonymous superblock (overlayfs, fuse, tmpfs, nsfs, ...). Upstream pays nothing when the static key is off; a kprobe would add cost to every call system-wide, against the 'no cpu hogging' constraint, for a window (first boot before FBE decryption) that is marginal. Recorded as a tracked divergence, not implemented."
+    },
+    {
+      "commit": "kernel: priority_uid_filter: Refactor uid parser (fc9b6ca on 12-5.10 through f0939fc on 6.12)",
+      "result": "ported. susfs_priority_filter.c now looks the uid up in /data/system/packages.list (prio_read_packages(), prio_lookup()), which names every installed package, instead of reading the owner of /data/data/<package>. One deliberate difference: upstream now skips a package it cannot resolve or whose uid is out of range, while this module still refuses the command (ENOENT or EINVAL), so a typo or a system package is reported. Only the pass that follows a package change skips them."
+    },
+    {
+      "commit": "kernel: priority_uid_filter: Add extra flag O_NOATIME with filp_open() to avoid updating the inode atime (b0e4746 on 12-5.10 through 68f62fa on 6.12)",
+      "result": "ported with the parser above. The one difference is a second open without O_NOATIME when the kernel answers EPERM, which it does for a caller that neither owns the file nor holds CAP_FOWNER, since this module reads the list as whoever sent the command."
+    },
+    {
+      "commit": "kernel & KernelSU: Make priority_uid_filter as new feature (aa61fe0 on 12-5.10 through 2557ea2 on 6.12)",
+      "result": "ported in part. CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER is now listed by CMD_SUSFS_SHOW_ENABLED_FEATURES while the priority_filter layer is armed. The compile-time switch and the Kconfig and KernelSU patch parts are not applicable, since the layer loads on its own and stays off when it fails."
+    },
+    {
+      "commit": "kernel & KernelSU: Refactor selinux_hide, experimental, partially done (61fc8b7 on 12-5.10, 8934afa on 15-6.6, 15890c6 on 16-6.12)",
+      "result": "not ported as one piece. The refactor makes KernelSU's ksu_type() and ksu_allow() record what they add into lists inside the kernel, which needs the KernelSU patch that the module does not apply. Its parts are handled one by one. Hiding a type from the context validity check is done by susfs_selinux_ctx.c for a list the admin sets. Answering an access query without the rules KernelSU added is left to the selinux_hide that the KernelSU forks ship. Keeping the SELinux status page unchanged by KernelSU's own policy edits is not done, see the susfs_is_current_ksu_domain row."
+    },
+    {
+      "commit": "kernel & KernelSU: Remove unused code (c3358dd on 12-5.10, not on 15-6.6 and 16-6.12)",
+      "result": "not applicable: trims code that the selinux_hide refactor above added to the kernel patch and to the KernelSU patch."
+    },
+    {
+      "commit": "kernel: selinux_hide: Revert to the safer hash mechanism and full tuple comparison (3c8f72e on 12-5.10 through a8af3db on 6.12)",
+      "result": "not applicable: changes the hash of the allowed-rule list in fs/susfs.c, which only the selinux_hide refactor uses. The module keeps no such list."
+    },
+    {
+      "commit": "KernelSU: Sync with upstream (1508845 and 0f899d9 on 12-5.10 through 3b5162a on 6.12)",
+      "result": "not applicable: touches only kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch, which the module does not apply."
     }
   ],
   "audits": [
