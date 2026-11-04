@@ -46,6 +46,17 @@ sec() { printf '\n==== %s ====\n' "$1"; }
   sec "Health checks (check.sh)"
   sh "$MODDIR/check.sh" 2>&1
 
+  sec "Storage as root, and the mount hook counters"
+  for p in / /data /storage/emulated/0; do
+    printf -- '--- stat -f %s ---\n' "$p"
+    stat -f "$p" 2>&1
+  done
+  printf -- '--- mount_stat ---\n'
+  cat "/sys/module/$NAME/parameters/mount_stat" 2>&1
+
+  sec "Mounts of init"
+  cat "$PROC/1/mountinfo" 2>&1
+
   sec "module.prop"
   cat "$MODDIR/module.prop" 2>&1
 
