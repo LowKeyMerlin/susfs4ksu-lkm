@@ -151,6 +151,15 @@ KSTAT_EXPECTED = [
     ("kms_ident_app", "real", "an app is answered for it from the mount it sits on: it is recognised by identity"),
     ("kms_race_bad_answers", "0", "no answer outside the two a mount can give while it is unmounted and mounted again"),
     ("kin_cleared_app", "covered", "an app reads the real inode and device again once the rules are cleared"),
+    *[(f"dfs_{how}_{key}", want, shows.format(how=how))
+      for how in ("hook", "scan")
+      for key, want, shows in (
+          ("differs", "yes", "the stand-in for /data has other numbers than the root filesystem ({how})"),
+          ("statfs", "own", "an app gets the filesystem's own numbers, though a bind of its directory is marked ({how})"),
+          ("fstatfs", "own", "the same through fstatfs ({how})"),
+          ("compat", "own", "the same through the 32-bit statfs64 ({how})"),
+          ("sub", "own", "the same for a directory of that filesystem ({how})"))],
+    ("dfs_sweep_mismatch", "none", "no mount point outside the marked prefix is answered differently to an app and to root"),
     ("kfd_bind_root_differs", "yes", "root reads the real mount id of a bind mount of the path"),
     ("kfd_bind_app", "real", "an app is answered for a bind mount of the path as for the path, as upstream does"),
     ("kfd_other_dev_app", "yes", "a descriptor on another filesystem is not rewritten even if its inode number is the same"),

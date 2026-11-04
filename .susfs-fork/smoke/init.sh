@@ -641,6 +641,46 @@ say "kms_race_bad_answers=$([ -f $kms_bad ] && wc -l <$kms_bad || echo 0)"
 say "kms_redirects=$(kmsn)"
 umount /data/adb/ms
 
+# /data has a path as its source ("/dev/block/dm-N") and so does every bind of one of its
+# directories. A tmpfs with such a source stands in for it. The bind under the marked prefix is ours,
+# the filesystem it came from is not, and an app must still get that filesystem's numbers.
+# Both ways a mount is learned are run: the mount hook and the scan after a prefix change.
+DFS=/dfs
+dfs_who() { case $1 in "$2") echo own ;; "$3") echo parent ;; *) echo "other:$1" ;; esac; }
+dfs_case() {
+  mkdir -p $DFS
+  mount -t tmpfs -o size=3m /dev/block/dmfake $DFS
+  mkdir -p $DFS/adb/bind $DFS/sub
+  echo reset >/proc/susfs_hide_mounts
+  /bin/sc 0x55561 0100000000000000 >/dev/null 2>&1
+  if [ "$1" = hook ]; then
+    echo 'add /dfs/adb/' >/proc/susfs_hide_mounts
+    mount --bind $DFS/sub $DFS/adb/bind
+  else
+    mount --bind $DFS/sub $DFS/adb/bind
+    echo 'add /dfs/adb/' >/proc/susfs_hide_mounts
+  fi
+  dfs_real=$(ksb root statfs $DFS)
+  say "dfs_${1}_differs=$(yesno [ -n "$dfs_real" ] && [ "$dfs_real" != "$kroot_fs" ])"
+  say "dfs_${1}_statfs=$(dfs_who "$(ksb app statfs $DFS)" "$dfs_real" "$kroot_fs")"
+  say "dfs_${1}_fstatfs=$(dfs_who "$(ksb app fstatfs $DFS)" "$dfs_real" "$kroot_fs")"
+  say "dfs_${1}_compat=$(dfs_who "$(ksb app statfs $DFS "$KSTAT32")" "$dfs_real" "$kroot_fs")"
+  say "dfs_${1}_sub=$(dfs_who "$(ksb app statfs $DFS/sub)" "$dfs_real" "$kroot_fs")"
+  umount -l $DFS/adb/bind
+  umount -l $DFS
+  sleep 1
+}
+dfs_case hook
+dfs_case scan
+echo reset >/proc/susfs_hide_mounts
+# Any mount point outside the marked prefix must be answered alike to an app and to root.
+dfs_bad=
+for dfs_mp in $(cut -d' ' -f2 /proc/mounts | sort -u); do
+  case $dfs_mp in /data/adb | /data/adb/* | *'\'*) continue ;; esac
+  dfs_a=$(ksb app statfs "$dfs_mp")
+  [ -z "$dfs_a" ] || [ "$dfs_a" = "$(ksb root statfs "$dfs_mp")" ] || dfs_bad="$dfs_bad $dfs_mp"
+done
+say "dfs_sweep_mismatch=${dfs_bad:- none}"
 # /proc/susfs_map manages the rules the supercall added above, and the listing and map_stat count
 # the same table. A write is judged by its exit status: the shell fails on a negative return.
 MAPN=/proc/susfs_map
