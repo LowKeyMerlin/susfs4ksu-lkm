@@ -132,7 +132,8 @@ The guard sets a marker before the module loads and clears it once the boot has 
 minutes. If the marker is still there at the next boot, that boot ended early. It counts against
 the module unless someone asked for the end. A reboot or power-off from the menu, the manager or
 adb is never counted, however often you do it. A power cut, a panic or a forced power-off is.
-Two in a row disable the module instead of loading it again.
+Two in a row disable the module instead of loading it again. A cut-off boot more than an hour old
+no longer counts.
 
 The guard tells the two apart by two signals that do not depend on each other: the shutdown it saw
 begin, and the boot reason Android reports. Both have to be missing for a boot to count.

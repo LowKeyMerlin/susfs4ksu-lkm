@@ -23,6 +23,8 @@ GUARD_UP="$MODDIR/guard.up"
 GUARD_CLEAN="$MODDIR/guard.clean"
 # Boots in a row that ended too early without a request for it.
 GUARD_FAILS_FILE="$MODDIR/guard.fails"
+# When the last cut-off boot was counted, in epoch seconds.
+GUARD_FAILED_AT="$MODDIR/guard.failed_at"
 # What a trip disables: "all" modules (default) or only "self". "none" turns the boot watch off.
 # Chosen at install (see customize.sh) and changed later by scope.sh.
 GUARD_SCOPE_FILE="$MODDIR/guard.scope"
@@ -30,6 +32,9 @@ GUARD_DISABLED="$MODDIR/guard.disabled"
 
 # Boots in a row that ended too early before the guard trips.
 : "${GUARD_FAILS:=2}"
+# Seconds after which a counted boot no longer counts. A bootloop repeats within minutes, a flat
+# battery last week is not one. A clock that is unreadable or went backwards keeps the count.
+: "${GUARD_WINDOW:=3600}"
 # Seconds up after boot_completed before the boot counts as good. A crash after that is not ours.
 : "${GUARD_SETTLE:=600}"
 # Max wait for boot_completed and the poll step. Past it the marker stays armed.
@@ -239,7 +244,7 @@ guard_pick_key() {
 guard_trip() {
   guard_log "tripped: $1"
   echo "$1" >"$GUARD_TRIPPED"
-  rm -f "$GUARD_ARMED" "$GUARD_UP" "$GUARD_CLEAN" "$GUARD_FAILS_FILE"
+  rm -f "$GUARD_ARMED" "$GUARD_UP" "$GUARD_CLEAN" "$GUARD_FAILS_FILE" "$GUARD_FAILED_AT"
   : >"$MODDIR/disable"
   note=
   if [ "$(guard_scope)" = all ]; then
@@ -270,6 +275,15 @@ guard_requested_reason() {
   return 1
 }
 
+# Returns 0 when the last counted boot is older than GUARD_WINDOW.
+guard_count_expired() {
+  then=$(cat "$GUARD_FAILED_AT" 2>/dev/null)
+  now=$(date +%s 2>/dev/null)
+  case $then in '' | *[!0-9]*) return 1 ;; esac
+  case $now in '' | *[!0-9]*) return 1 ;; esac
+  [ "$now" -ge "$then" ] && [ $((now - then)) -gt "$GUARD_WINDOW" ]
+}
+
 # Returns 0 when boot $1 ended because someone asked it to.
 guard_ended_by_request() {
   reason=$(guard_reason)
@@ -288,12 +302,12 @@ guard_check() {
     # Enabling the module again in the manager removes the disable file.
     [ ! -f "$MODDIR/disable" ] || return 1
     guard_log "enabled again after a trip, starting over"
-    rm -f "$GUARD_TRIPPED" "$GUARD_ARMED" "$GUARD_UP" "$GUARD_CLEAN" "$GUARD_FAILS_FILE"
+    rm -f "$GUARD_TRIPPED" "$GUARD_ARMED" "$GUARD_UP" "$GUARD_CLEAN" "$GUARD_FAILS_FILE" "$GUARD_FAILED_AT"
   fi
   # Scope none turns the boot watch off. Nothing is armed, so nothing can trip, and what an
   # earlier scope left behind must not count against the next boot.
   if [ "$(guard_scope)" = none ]; then
-    rm -f "$GUARD_ARMED" "$GUARD_UP" "$GUARD_CLEAN" "$GUARD_FAILS_FILE"
+    rm -f "$GUARD_ARMED" "$GUARD_UP" "$GUARD_CLEAN" "$GUARD_FAILS_FILE" "$GUARD_FAILED_AT"
     return 0
   fi
   cur=$(guard_boot_id)
@@ -312,17 +326,22 @@ guard_check() {
     if guard_ended_by_request "$prev"; then
       # A finished boot that ended on request is a good one. An unfinished one proves nothing,
       # the user may have rebooted it by hand.
-      [ "$finished" = no ] || rm -f "$GUARD_FAILS_FILE"
+      [ "$finished" = no ] || rm -f "$GUARD_FAILS_FILE" "$GUARD_FAILED_AT"
     else
       # One cut-off boot can be a flat battery, so only GUARD_FAILS in a row trip.
       fails=$(cat "$GUARD_FAILS_FILE" 2>/dev/null)
       case $fails in '' | *[!0-9]*) fails=0 ;; esac
+      if [ "$fails" -gt 0 ] && guard_count_expired; then
+        guard_log "dropping $fails cut-off boot(s) older than ${GUARD_WINDOW}s"
+        fails=0
+      fi
       fails=$((fails + 1))
       if [ "$fails" -ge "$GUARD_FAILS" ]; then
         guard_trip "$fails boots in a row ended early without being asked to"
         return 1
       fi
       echo "$fails" >"$GUARD_FAILS_FILE"
+      date +%s >"$GUARD_FAILED_AT" 2>/dev/null
       guard_log "the previous boot was cut off ($fails of $GUARD_FAILS)"
     fi
     rm -f "$GUARD_ARMED" "$GUARD_UP" "$GUARD_CLEAN"
@@ -434,7 +453,7 @@ guard_settle() {
     wait $!
     waited=$((waited + GUARD_POLL))
   done
-  rm -f "$GUARD_ARMED" "$GUARD_UP" "$GUARD_CLEAN" "$GUARD_FAILS_FILE"
+  rm -f "$GUARD_ARMED" "$GUARD_UP" "$GUARD_CLEAN" "$GUARD_FAILS_FILE" "$GUARD_FAILED_AT"
   sync
   guard_log "boot settled"
 }

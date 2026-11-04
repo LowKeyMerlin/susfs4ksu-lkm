@@ -385,6 +385,44 @@ reason reboot
 failboot boot-1
 check "the shutdown record of another boot does not count" '[ "$(cat "$M/guard.fails")" = 1 ]'
 
+# Cut-off boots count only while they follow each other closely: a flat battery long ago is not
+# the first half of a bootloop. A clock that went backwards, or a count without a time, is kept.
+if [ "$stubs_ok" = yes ]; then
+  fresh
+  load
+  failboot boot-W1
+  echo $((1800000000 + 7200)) >"$T/now"
+  failboot boot-W2
+  check "a cut-off boot older than the window is forgotten" '! tripped'
+  check "and the new one is the first of a run" '[ "$(cat "$M/guard.fails")" = 1 ]'
+  fresh
+  load
+  failboot boot-W1
+  echo $((1800000000 + 600)) >"$T/now"
+  failboot boot-W2
+  check "cut-off boots inside the window trip" tripped
+  fresh
+  load
+  failboot boot-W1
+  echo $((1800000000 - 100000)) >"$T/now"
+  failboot boot-W2
+  check "a clock that went backwards does not forget" tripped
+  fresh
+  load
+  echo 1 >"$M/guard.fails"
+  echo $((1800000000 + 100000)) >"$T/now"
+  failboot boot-W1
+  check "a count without a time is kept" tripped
+  fresh
+  export GUARD_WINDOW=60
+  load
+  failboot boot-W1
+  echo $((1800000000 + 120)) >"$T/now"
+  failboot boot-W2
+  check "GUARD_WINDOW sets the window" '! tripped'
+  unset GUARD_WINDOW
+  echo 1800000000 >"$T/now"
+fi
 # A shutdown between two polls reaches the watcher as TERM. Any other TERM records nothing.
 term_job() {
   ( MODDIR=$M GUARD_SETTLE=300 GUARD_POLL=30; . "$M/guard.sh"; guard_settle ) >/dev/null 2>&1 &
