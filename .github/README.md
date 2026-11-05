@@ -80,7 +80,8 @@ Open it from the module's entry in the manager. It has three tabs.
 
 * **Status** shows the load stage, the kernel, the SUSFS version, the enabled features, the number
   of hidden mounts and the guard state. **Capture logs** writes one report to `/sdcard/Download`,
-  and **Copy report** copies it.
+  and **Copy report** copies it. After a guard trip, **Load now** enables what the trip disabled and
+  loads the module again without a reboot.
 * **Checks** runs the health checks: the module is loaded, every layer started, the module is
   hidden from `/proc/modules` and kallsyms, the guard is quiet, early load is set up, no other SUSFS
   kernel module is present, and the kernel log has no hook failures. Each result is `PASS`, `NOTE`,
@@ -148,6 +149,11 @@ What a trip disables is chosen at install with the volume keys, and later in the
 | All modules | Every KernelSU module. Default. |
 | This module | Only this one. |
 | None | Nothing. The boot watch is off. |
+
+After a trip, **Load now** in the WebUI loads the module without a reboot. It enables the modules
+the trip disabled, clears the trip and loads the `.ko`. It refuses while `/data/adb/susfs_skip`
+exists, in safe mode or when the module is marked for removal. The guard does not watch the boot
+that is already running and starts again at the next one.
 
 Magisk and APatch are not tested.
 

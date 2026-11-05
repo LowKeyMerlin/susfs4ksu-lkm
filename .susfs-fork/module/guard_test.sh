@@ -36,7 +36,7 @@ fresh() {
   mkdir -p "$M/bin" "$T/bin" "$T/props" "$T/pids" "$T/modules/other_a" "$T/modules/other_b" "$T/modules/with space"
   : >"$T/modules/other_b/disable"
   echo "not a module" >"$T/modules/notes.txt"
-  cp "$SRC/guard.sh" "$SRC/load.sh" "$SRC/service.sh" "$M/"
+  cp "$SRC/guard.sh" "$SRC/load.sh" "$SRC/service.sh" "$SRC/recover.sh" "$M/"
   printf 'description=initial\nsusfsBase=2.3.0\n' >"$M/module.prop"
   rm -f "$T/dmesg.out" "$T/hook"
   echo "boot-A" >"$T/boot_id"
@@ -793,6 +793,140 @@ echo 0 >"$T/probe_rc"
 load
 check "card when SUSFS already answers" 'card | sed "s/^[^A-Za-z]*//" | grep -q "^Standing by | SUSFS already answers"'
 check "cards carry nothing sed would treat specially" '! card | grep -q "[&#\\]"'
+
+# Loading again after a trip, from the WebUI, with no reboot. Stdout is the one line the page reads.
+recover() { out=$("$SH" "$M/recover.sh" 2>/dev/null); rcode=$?; }
+# A guard that has tripped: nothing loaded, this module and other_a disabled, other_b the user's.
+tripfresh() {
+  fresh
+  load
+  failboot boot-B1
+  failboot boot-B
+}
+
+tripfresh
+check "recover setup: the guard tripped" tripped
+check "recover setup: nothing is loaded" '! loaded'
+recover
+check "recover reports loaded" '[ "$out" = recovered=loaded ]'
+check "recover exits 0" '[ "$rcode" = 0 ]'
+check "recover loads the module" loaded
+check "recover clears the trip" '! tripped'
+check "recover enables this module" '! disabled'
+check "recover enables the modules the guard disabled" '[ ! -f "$T/modules/other_a/disable" ] && [ ! -f "$T/modules/with space/disable" ]'
+check "recover leaves a module the user disabled" '[ -f "$T/modules/other_b/disable" ]'
+check "recover drops the list of disabled modules" '[ ! -f "$M/guard.disabled" ]'
+check "recover does not arm the guard for the running boot" '! armed'
+check "recover leaves no counters behind" '[ ! -f "$M/guard.fails" ] && [ ! -f "$M/guard.failed_at" ]'
+check "recover shows the loaded card" 'described "Active"'
+check "recover keeps the output of the loader out of its stdout" '[ "$(printf %s "$out" | wc -l | tr -d " ")" = 0 ]'
+# The next boot starts fresh: it loads and arms as after any enable.
+failboot boot-F
+check "the boot after a recover loads" loaded
+check "the boot after a recover arms the guard" armed
+check "the boot after a recover does not trip" '! tripped'
+
+# Without a trip there is nothing to do and nothing changes.
+fresh
+load
+: >"$T/modules/other_b/disable"
+recover
+check "recover without a trip reports idle" '[ "$out" = recovered=idle ]'
+check "recover without a trip exits 0" '[ "$rcode" = 0 ]'
+check "recover without a trip keeps the module loaded" loaded
+check "recover without a trip leaves the marker" armed
+check "recover without a trip leaves other modules" '[ -f "$T/modules/other_b/disable" ]'
+
+# SUSFS already answers: the trip is cleared and nothing is loaded on top of it.
+tripfresh
+echo 0 >"$T/probe_rc"
+recover
+check "recover with SUSFS answering reports present" '[ "$out" = recovered=present ]'
+check "recover with SUSFS answering exits 0" '[ "$rcode" = 0 ]'
+check "recover with SUSFS answering clears the trip" '! tripped && ! disabled'
+check "recover with SUSFS answering loads nothing" '! loaded'
+check "recover with SUSFS answering says standing by" 'described "Standing by"'
+
+# A loader that fails still leaves the trip cleared, so the next boot tries again.
+tripfresh
+echo 7 >"$T/load_rc"
+recover
+check "recover with a failing loader reports failed" '[ "$out" = recovered=failed ]'
+check "recover with a failing loader passes the status on" '[ "$rcode" = 7 ]'
+check "recover with a failing loader loads nothing" '! loaded'
+check "recover with a failing loader still clears the trip" '! tripped && ! disabled'
+check "recover with a failing loader still enables the others" '[ ! -f "$T/modules/other_a/disable" ]'
+check "recover with a failing loader says not loaded" 'described "Not loaded"'
+
+# What a trip leaves behind, without the two boots it takes to get there.
+faketrip() {
+  fresh
+  echo "test" >"$M/guard.tripped"
+  : >"$T/modules/other_a/disable"
+  : >"$M/disable"
+  echo other_a >"$M/guard.disabled"
+}
+
+# Whatever the boot path refuses to load, the button refuses too, and the trip stays.
+for blocker in skip safemode ro_safemode remove; do
+  faketrip
+  case $blocker in
+    skip) : >"$T/skip" ;;
+    safemode) echo 1 >"$T/props/persist.sys.safemode" ;;
+    ro_safemode) echo 1 >"$T/props/ro.sys.safemode" ;;
+    remove) : >"$M/remove" ;;
+  esac
+  recover
+  check "recover with $blocker reports blocked" '[ "$out" = recovered=blocked ]'
+  check "recover with $blocker exits non-zero" '[ "$rcode" != 0 ]'
+  check "recover with $blocker loads nothing" '! loaded'
+  check "recover with $blocker keeps the trip" 'tripped && disabled && [ -f "$T/modules/other_a/disable" ]'
+done
+
+# A loader that exits 0 without loading anything (it does in safe mode) is not a success.
+faketrip
+echo 'exit 0' >"$M/load.upstream.sh"
+echo 1 >"$T/probe_rc"
+recover
+check "recover with a loader that loaded nothing reports failed" '[ "$out" = recovered=failed ]'
+check "recover with a loader that loaded nothing exits non-zero" '[ "$rcode" != 0 ]'
+
+# Two taps, or a tap during a boot load, end in one loaded module.
+faketrip
+"$SH" "$M/recover.sh" >"$T/out1" 2>/dev/null &
+"$SH" "$M/recover.sh" >"$T/out2" 2>/dev/null &
+wait
+check "two recovers leave the module loaded" loaded
+check "two recovers leave no trip" '! tripped && ! disabled'
+check "two recovers each end in loaded or present" 'grep -qE "^recovered=(loaded|present|idle)$" "$T/out1" && grep -qE "^recovered=(loaded|present|idle)$" "$T/out2"'
+
+# A kernel release no build fits is refused before anything is loaded.
+tripfresh
+echo "6.6.x-android15-8-g1" >"$T/osrelease"
+recover
+check "recover on an odd kernel reports nokernel" '[ "$out" = recovered=nokernel ]'
+check "recover on an odd kernel exits non-zero" '[ "$rcode" != 0 ]'
+check "recover on an odd kernel loads nothing" '! loaded'
+
+# A module that loads but does not answer is unloaded again, as at boot.
+if [ "$stubs_ok" = yes ]; then
+  tripfresh
+  echo 1 >"$T/probe_rc"
+  recover
+  check "recover of a silent module reports noanswer" '[ "$out" = recovered=noanswer ]'
+  check "recover of a silent module exits non-zero" '[ "$rcode" != 0 ]'
+  check "recover of a silent module unloads it" '! loaded'
+  check "recover of a silent module is not tripped again" '! tripped'
+fi
+
+# Names in guard.disabled that are not plain module directories are ignored.
+tripfresh
+printf '%s\n' ../escape "" other_a missing >"$M/guard.disabled"
+mkdir -p "$T/escape"
+: >"$T/escape/disable"
+recover
+check "recover ignores a path that leaves the modules directory" '[ -f "$T/escape/disable" ]'
+check "recover still enables the plain names" '[ ! -f "$T/modules/other_a/disable" ]'
 
 echo "guard_test ($SH): $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

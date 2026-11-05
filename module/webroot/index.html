@@ -360,13 +360,64 @@ function renderFacts() {
   kv(dl, "Module", f.disabled === "1" ? "Disabled" : "Enabled");
 }
 
+// After a bootloop-guard trip the module is a .ko that can simply be loaded again, no reboot needed.
+var RECOVER_RESULT = {
+  loaded: "Loaded. SUSFS is active again",
+  present: "SUSFS is already active. The guard was cleared",
+  idle: "The guard had not tripped",
+  blocked: "Loading is blocked by a skip file, safe mode or a pending removal",
+  nokernel: "No build for this kernel, nothing was loaded",
+  noanswer: "It loaded but SUSFS did not answer, so it was unloaded",
+  failed: "The loader failed. See guard.log and load.log in the module folder"
+};
+
+function recoverCard() {
+  var box = el("div", "finding fail");
+  var head = el("div", "head");
+  head.appendChild(el("span", "title", "Bootloop guard tripped"));
+  head.appendChild(el("span", "tag", "Disabled"));
+  box.appendChild(head);
+  box.appendChild(el("p", "", "The module is off and was not loaded this boot. Load it now without rebooting. This also enables the modules the guard turned off, and the guard watches again from the next boot."));
+  var line = el("div", "line");
+  var b = el("button", "btn solid", "Load now");
+  b.type = "button";
+  b.addEventListener("click", function () { recover(b); });
+  line.appendChild(el("span"));
+  line.appendChild(b);
+  box.appendChild(line);
+  return box;
+}
+
+function recover(button) {
+  button.disabled = true;
+  button.classList.add("busy");
+  button.textContent = "Loading";
+  run("recover.sh").then(function (r) {
+    var token = (r.out.match(/^recovered=(\w+)$/m) || [])[1];
+    var ok = r.code === 0 && (token === "loaded" || token === "present");
+    return run("status.sh").then(function (s) {
+      state.facts = pairs(s.out);
+      renderMasthead();
+      renderFacts();
+      renderAttention();
+      return loadControls();
+    }).then(function () {
+      return runChecks();
+    }).then(function () {
+      toast(ok ? RECOVER_RESULT[token] : (RECOVER_RESULT[token] || r.err.trim() || "exit " + r.code));
+    });
+  });
+}
+
 function renderAttention() {
   var box = $("attention");
   box.textContent = "";
+  var tripped = state.facts.guard_tripped === "1";
+  if (tripped) box.appendChild(recoverCard());
   var open = state.checks.filter(function (c) { return c.level === "warn" || c.level === "fail"; });
   open.sort(function (a, b) { return LEVELS[b.level].rank - LEVELS[a.level].rank; });
   open.forEach(function (c) { box.appendChild(finding(c, false)); });
-  if (!open.length) box.appendChild(el("div", "quiet", state.checks.length ? "Nothing needs attention." : "Checks have not finished."));
+  if (!open.length && !tripped) box.appendChild(el("div", "quiet", state.checks.length ? "Nothing needs attention." : "Checks have not finished."));
 }
 
 // Checks

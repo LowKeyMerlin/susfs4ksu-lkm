@@ -255,6 +255,21 @@ guard_trip() {
   sync
 }
 
+# Undo guard_trip: enable the modules it disabled (the ones listed in guard.disabled, nothing else),
+# this module too, and drop the trip record and counters. Does not load or arm anything.
+guard_untrip() {
+  if [ -f "$GUARD_DISABLED" ]; then
+    while IFS= read -r name || [ -n "$name" ]; do
+      case $name in '' | */* | . | ..) continue ;; esac
+      [ -d "$GUARD_MODULES_DIR/$name" ] || continue
+      rm -f "$GUARD_MODULES_DIR/$name/disable" && guard_log "enabled module $name"
+    done <"$GUARD_DISABLED"
+    rm -f "$GUARD_DISABLED"
+  fi
+  rm -f "$GUARD_TRIPPED" "$GUARD_ARMED" "$GUARD_UP" "$GUARD_CLEAN" "$GUARD_FAILS_FILE" "$GUARD_FAILED_AT" "$MODDIR/disable"
+  sync
+}
+
 # The boot reason, lower case and with odd characters replaced, so it is safe to log and match.
 guard_reason() {
   r=$(getprop sys.boot.reason 2>/dev/null)
