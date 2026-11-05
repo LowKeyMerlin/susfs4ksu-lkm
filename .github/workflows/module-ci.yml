@@ -3,9 +3,9 @@ name: module-ci
 
 on:
   push:
-    paths: ['module/**', 'tools/pack_module.py', 'tools/test_pack.py', 'tools/test_toggle.py', 'tools/test_load.py', 'tools/test_review_findings.py', 'tools/test_soak_check.py', 'tools/test_pack_extra.py', 'tools/test_diag.py', 'tools/susfs_propwait.c', 'tools/prop_area_parse.h', 'tools/propwait_trie_test.c', '.susfs-fork/module/**', '.susfs-fork/pack_extra.py', '.susfs-fork/VERSION', '.susfs-fork/smoke/**', 'kernel/**', '.github/workflows/module-ci.yml']
+    paths: ['module/**', 'tools/pack_module.py', 'tools/test_pack.py', 'tools/cfi_sites.py', 'tools/test_cfi_sites.py', 'tools/test_toggle.py', 'tools/test_load.py', 'tools/test_review_findings.py', 'tools/test_soak_check.py', 'tools/test_pack_extra.py', 'tools/test_diag.py', 'tools/susfs_propwait.c', 'tools/prop_area_parse.h', 'tools/propwait_trie_test.c', '.susfs-fork/module/**', '.susfs-fork/pack_extra.py', '.susfs-fork/VERSION', '.susfs-fork/smoke/**', 'kernel/**', '.github/workflows/module-ci.yml']
   pull_request:
-    paths: ['module/**', 'tools/pack_module.py', 'tools/test_pack.py', 'tools/test_toggle.py', 'tools/test_load.py', 'tools/test_review_findings.py', 'tools/test_soak_check.py', 'tools/test_pack_extra.py', 'tools/test_diag.py', 'tools/susfs_propwait.c', 'tools/prop_area_parse.h', 'tools/propwait_trie_test.c', '.susfs-fork/module/**', '.susfs-fork/pack_extra.py', '.susfs-fork/VERSION', '.susfs-fork/smoke/**', 'kernel/**', '.github/workflows/module-ci.yml']
+    paths: ['module/**', 'tools/pack_module.py', 'tools/test_pack.py', 'tools/cfi_sites.py', 'tools/test_cfi_sites.py', 'tools/test_toggle.py', 'tools/test_load.py', 'tools/test_review_findings.py', 'tools/test_soak_check.py', 'tools/test_pack_extra.py', 'tools/test_diag.py', 'tools/susfs_propwait.c', 'tools/prop_area_parse.h', 'tools/propwait_trie_test.c', '.susfs-fork/module/**', '.susfs-fork/pack_extra.py', '.susfs-fork/VERSION', '.susfs-fork/smoke/**', 'kernel/**', '.github/workflows/module-ci.yml']
   workflow_dispatch:
 
 permissions:
@@ -29,9 +29,11 @@ jobs:
       - name: Shell syntax
         run: for s in module/*.sh; do sh -n "$s"; done
       - name: Byte-compile
-        run: python -m py_compile tools/pack_module.py tools/test_pack.py tools/test_toggle.py tools/test_load.py tools/test_review_findings.py tools/test_soak_check.py
+        run: python -m py_compile tools/*.py
       - name: Pack test
         run: python tools/test_pack.py
+      - name: CFI site test
+        run: python tools/test_cfi_sites.py
       - name: Toggle test
         run: python tools/test_toggle.py
       - name: Loader outcome test
