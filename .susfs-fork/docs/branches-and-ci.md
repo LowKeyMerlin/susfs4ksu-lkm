@@ -26,7 +26,8 @@ change that `susfs-main` wants is rewritten as a patch.
 | `susfs-guard`, add-files-only check | no | runs | skipped |
 | `susfs-guard`, build and guard tests | no | runs | runs |
 | `gen_build.py` check | no | runs | runs |
-| Scheduled sync, drift, pins | sync only | yes | no |
+| Sync with the parent, by dispatch only | updated by it | rebased by it | no |
+| Scheduled drift, pins | no | yes | no |
 
 ## Workflows
 
@@ -44,7 +45,8 @@ from one workflow instead of following each other.
 | `susfs-android` | Cuttlefish guest: guard test and priority filter | called by the pipeline, dispatch |
 | `susfs-triage` | Bundles the failed steps and rejects of a failed build | called by the pipeline on a build failure |
 | `susfs-release` | Attaches the zip of the tagged commit's pipeline run | release, dispatch |
-| `susfs-sync`, `susfs-drift`, `susfs-pins`, `susfs-ksud`, `susfs-guard` | Maintenance | schedule, push, dispatch |
+| `susfs-sync` | Mirrors the parent into `main`, rebases `susfs-main` | dispatch |
+| `susfs-drift`, `susfs-pins`, `susfs-ksud`, `susfs-guard` | Maintenance | schedule, push, dispatch |
 
 `build-ddk.yml`, `module-zip.yml` and the other upstream workflows stay as they are and stay
 disabled in the repository settings.

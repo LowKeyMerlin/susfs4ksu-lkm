@@ -1,8 +1,9 @@
 name: susfs-sync
-run-name: "susfs-sync: ${{ inputs.title || (github.event_name == 'schedule' && 'scheduled') || 'manual' }}"
+run-name: "susfs-sync: ${{ inputs.title || 'manual' }}"
 
 # Keep main identical to the parent repository, rebase susfs-main onto it and regenerate
-# susfs-build.yml from the build workflow it brought in.
+# susfs-build.yml from the build workflow it brought in. Manual only: a schedule runs from the default
+# branch, which is susfs-dev, and susfs-dev is not synced.
 #
 # susfs-main only adds files, so the rebase has nothing to conflict with. On a conflict, or if the
 # generator no longer fits upstream's workflow, the job fails and uploads the sync-triage artifact.
@@ -11,8 +12,6 @@ run-name: "susfs-sync: ${{ inputs.title || (github.event_name == 'schedule' && '
 # repository. GITHUB_TOKEN cannot push upstream workflow changes and its pushes do not start the
 # build that follows a rebase.
 on:
-  schedule:
-    - cron: "17 3 * * *"
   workflow_dispatch:
     inputs:
       title:
