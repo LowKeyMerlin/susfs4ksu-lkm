@@ -238,8 +238,9 @@ long __nocfi noinline susfs_create_vfs_mkdirat(int dfd, const char __user *pathn
 		return err2;
 	}
 
-	err = create_security_mkdir(&path, dentry,
-				    create_strip_umask(d_inode(path.dentry), mode));
+	/* Before 6.3 only the caller strips the umask, vfs_mkdir() does not. */
+	mode = create_strip_umask(d_inode(path.dentry), mode);
+	err = create_security_mkdir(&path, dentry, mode);
 	if (!err)
 		err = create_vfs_mkdir(&path, dentry, mode);
 
