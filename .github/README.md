@@ -90,6 +90,11 @@ Open it from the module's entry in the manager. It has three tabs.
   mounts and hidden SELinux types. The kernel log and AVC spoof switches are marked `MANAGED` when
   another module sets them at every boot. They are then shown but not offered, since the next boot
   would override a change.
+  **Version** lists the releases on GitHub, newer and older, and installs the one you tap twice. It
+  checks the zip against the checksum GitHub publishes, installs it like a manual install and asks for
+  a reboot. Only releases that carry an `update.json` can be installed here, an older release without one
+  would leave the module with no way to update from the page again, so flash that one by hand. The
+  manager's own **Update** button, from the `updateJson` in `module.prop`, offers the newest release.
 
 Mounts under `/data/adb` are hidden without being listed. The mount list is for other bind mounts,
 such as a hosts file. `adbroot` is the one SELinux type hidden by default. Remove it if your ROM has

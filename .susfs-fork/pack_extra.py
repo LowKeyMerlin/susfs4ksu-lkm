@@ -38,7 +38,7 @@ WRAPPER = "load.sh"
 INSTALLER = "customize.sh"
 ADDED = {name: name for name in (
     "guard.sh", "service.sh", "status.sh", "check.sh", "early.sh", "hide_mounts.sh", "selinux_ctx.sh",
-    "boot-completed.sh", "scope.sh", "clients.sh", "capture.sh", "adbd_guard.sh", "recover.sh")}
+    "boot-completed.sh", "scope.sh", "clients.sh", "capture.sh", "adbd_guard.sh", "recover.sh", "update.sh")}
 LOADER = "load.upstream.sh"
 INSTALLER_UPSTREAM = "customize.upstream.sh"
 # What upstream's script of that name becomes in the zip.
@@ -126,6 +126,8 @@ def reject(problems, files, rejects):
 
 NAME = "SUSFS (LKM Edition)"
 AUTHOR = "LowKeyMerlin, inforcqb"
+# The manager's Update button reads this. The release workflow attaches the file, see update_json.py.
+UPDATE_JSON = "https://github.com/LowKeyMerlin/susfs4ksu-lkm/releases/latest/download/update.json"
 ABI_HEADER = ROOT / "kernel" / "susfs_abi.h"
 
 
@@ -158,6 +160,7 @@ def brand(prop, kmis):
         author=AUTHOR,
         susfsBase=base,
         description=f"Waiting for the first boot | {len(kmis)} kernel builds, {low} to {high} | SUSFS {base}",
+        updateJson=UPDATE_JSON,
     )
     return "".join(f"{k}={v}\n" for k, v in props.items())
 

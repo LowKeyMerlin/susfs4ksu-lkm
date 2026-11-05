@@ -96,6 +96,7 @@
   .row .text { flex: 1; min-width: 0; }
   .row .title { font-weight: 600; }
   .row .note { margin-top: 2px; color: var(--muted); font-size: 13.5px; }
+  .row .tag { margin-left: 8px; font: 600 10px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
   .row.locked .title::after { content: "MANAGED"; margin-left: 8px; font: 600 10px var(--mono); letter-spacing: .1em; padding: 2px 5px; border: 1px solid var(--line); border-radius: 3px; color: var(--muted); vertical-align: 2px; }
 
   .switch { position: relative; flex: none; width: 44px; height: 24px; }
@@ -208,6 +209,19 @@
     </form>
     <p class="help" id="ctx-help">adbroot on by default, remove it if your ROM has no such domain. Add any other type a custom ROM's sepolicy introduces, not su or ksu, which this would also hide from su tooling.</p>
 
+    <div class="label">Version</div>
+    <div class="list">
+      <div class="row">
+        <div class="text">
+          <div class="title" id="ver-title">Installed</div>
+          <div class="note" id="ver-note">Nothing is fetched until you check.</div>
+        </div>
+        <button class="btn small" id="ver-check" type="button">Check</button>
+        <button class="btn solid small" id="ver-reboot" type="button" hidden>Reboot</button>
+      </div>
+    </div>
+    <div class="list" id="versions"></div>
+    <p class="help">Lists the releases published on GitHub, newer and older. A release without an update manifest cannot be installed here, flash its zip from the manager instead. The new version takes effect after a reboot.</p>
     <div class="label">Handled elsewhere</div>
     <div class="list"><div class="row"><div class="text">
       <div class="title">SELinux hide</div>
@@ -265,7 +279,7 @@ var RAIL = { ok: "var(--on-ok)", info: "var(--on-note)", warn: "var(--on-warn)",
 // a glance, while the light head text stays legible. These are dark in both themes by design.
 var HEAD_BG = { ok: "#16241b", info: "#172230", warn: "#2a2111", fail: "#2a1613" };
 
-var state = { facts: {}, checks: [], toggles: {}, paths: [], ctxTypes: [] };
+var state = { facts: {}, checks: [], toggles: {}, paths: [], ctxTypes: [], releases: null, installing: false };
 var toastTimer = 0;
 function toast(text) {
   var t = $("toast");
@@ -728,6 +742,139 @@ $("ctx-form").addEventListener("submit", function (e) {
   input.value = "";
 });
 
+// Versions. The page makes no network call, update.sh fetches the release list and installs.
+// Both end up on a command line, so only what a release uses is passed on.
+var SAFE_TAG = /^v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.-]*$/;
+var SAFE_SHA = /^[0-9a-f]{64}$/;
+var UPDATE_STATE = { downloading: "Downloading", installing: "Installing" };
+
+function semver(s) {
+  var m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(s || "");
+  return m ? [+m[1], +m[2], +m[3]] : null;
+}
+// 1 when the tag is newer than the installed version, -1 older, 0 the same, 0 also when either
+// is no version. The suffix after the three numbers does not count.
+function compareVersion(tag, installed) {
+  var a = semver(tag), b = semver(installed);
+  if (!a || !b) return 0;
+  for (var i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] > b[i] ? 1 : -1;
+  return 0;
+}
+
+// A published release with the zip and its checksum. A release without an update.json is not offered
+// for install, since a build without update support could not be updated from the page again.
+function candidate(rel) {
+  if (rel.draft || rel.prerelease || !SAFE_TAG.test(rel.tag_name)) return null;
+  var zip = "ksu_susfs_lkm-module-" + rel.tag_name + "-arm64.zip", sha = "", manifest = false;
+  (rel.assets || []).forEach(function (a) {
+    if (a.name === "update.json") manifest = true;
+    if (a.name === zip) sha = String(a.digest || "").replace(/^sha256:/, "");
+  });
+  var why = !manifest ? "No update support, flash it from the manager." : !SAFE_SHA.test(sha) ? "No checksum published." : "";
+  return { tag: rel.tag_name, date: String(rel.published_at || "").slice(0, 10), sha: sha, why: why };
+}
+
+function renderVersions() {
+  $("ver-title").textContent = "Installed " + (state.facts.version || "unknown");
+  var box = $("versions");
+  box.textContent = "";
+  (state.releases || []).forEach(function (c) {
+    var rel = compareVersion(c.tag, state.facts.version);
+    var row = el("div", "row");
+    var text = el("div", "text");
+    var title = el("div", "title", c.tag);
+    if (rel) title.appendChild(el("span", "tag", rel > 0 ? "newer" : "older"));
+    text.appendChild(title);
+    text.appendChild(el("div", "note", c.why ? c.date + ". " + c.why : c.date));
+    row.appendChild(text);
+    var b = el("button", "btn small", c.tag === state.facts.version ? "Installed" : "Install");
+    b.type = "button";
+    b.disabled = !!c.why || state.installing || c.tag === state.facts.version;
+    b.addEventListener("click", function () { install(c, b); });
+    row.appendChild(b);
+    box.appendChild(row);
+  });
+  if (state.releases && !state.releases.length) box.appendChild(el("div", "quiet", "No published releases."));
+}
+
+function checkVersions() {
+  var btn = $("ver-check");
+  btn.disabled = true;
+  btn.classList.add("busy");
+  run("update.sh", "releases")
+    .then(function (r) {
+      if (r.code !== 0) throw new Error(r.err.trim() || "exit " + r.code);
+      var list = JSON.parse(r.out);
+      if (!Array.isArray(list)) throw new Error("unexpected answer");
+      state.releases = list.map(candidate).filter(Boolean);
+      $("ver-note").textContent = state.releases.length + " releases";
+      renderVersions();
+    })
+    .catch(function (e) { $("ver-note").textContent = "Could not get the release list: " + e.message; })
+    .then(function () {
+      btn.disabled = false;
+      btn.classList.remove("busy");
+    });
+}
+$("ver-check").addEventListener("click", checkVersions);
+
+// The second tap installs, so a stray tap cannot replace the module.
+function install(c, button) {
+  if (!button.armed) {
+    button.armed = true;
+    button.textContent = "Tap again";
+    setTimeout(function () {
+      button.armed = false;
+      button.textContent = "Install";
+    }, 4000);
+    return;
+  }
+  state.installing = true;
+  renderVersions();
+  $("ver-note").textContent = "Starting " + c.tag;
+  run("update.sh", "install " + c.tag + " " + c.sha).then(function (r) {
+    if (r.code !== 0) return updateEnded("Install did not start: " + (r.err.trim() || "exit " + r.code));
+    pollUpdate(c.tag, 0);
+  });
+}
+
+function updateEnded(note) {
+  state.installing = false;
+  $("ver-note").textContent = note;
+  renderVersions();
+}
+
+// update.sh works in the background, so its state is read until it ends.
+function pollUpdate(tag, n) {
+  run("update.sh", "status").then(function (r) {
+    var s = pairs(r.out);
+    if (s.state === "installed") {
+      updateEnded("Installed " + tag + ". Reboot to switch to it.");
+      $("ver-reboot").hidden = false;
+    } else if (s.state === "failed") {
+      updateEnded(s.message || "The install failed");
+    } else if (n > 600) {
+      updateEnded("Still running after 20 minutes. Check again later.");
+    } else {
+      $("ver-note").textContent = (UPDATE_STATE[s.state] || "Working on") + " " + tag;
+      setTimeout(function () { pollUpdate(tag, n + 1); }, 2000);
+    }
+  });
+}
+
+$("ver-reboot").addEventListener("click", function () {
+  var b = $("ver-reboot");
+  if (!b.armed) {
+    b.armed = true;
+    b.textContent = "Tap again";
+    setTimeout(function () {
+      b.armed = false;
+      b.textContent = "Reboot";
+    }, 4000);
+    return;
+  }
+  run("update.sh", "reboot");
+});
 var SELINUX_HIDE = {
   native: "Handled by your root manager's own kernel patch.",
   none: "Your root manager's kernel does not provide it and this module does not add it on its own.",
@@ -753,6 +900,7 @@ function loadControls() {
     renderToggles();
     renderPaths();
     renderCtxTypes();
+    renderVersions();
   });
 }
 

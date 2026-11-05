@@ -31,6 +31,7 @@ def pack(directory):
     # The watcher binary and its shell guard are shipped alongside the probe.
     assert "bin/susfs_propwait" in names, names
     assert "adbd_guard.sh" in names, names
+    assert "update.sh" in names, names
     return dict(line.split("=", 1) for line in lines)
 
 
@@ -42,6 +43,7 @@ def main():
     assert prop["author"] == "LowKeyMerlin, inforcqb", prop
     assert prop["version"] == "v1.2.3-dev.abc1234", prop
     assert prop["versionCode"].isdigit() and int(prop["versionCode"]) > 1_700_000_000, prop
+    assert prop["updateJson"] == "https://github.com/LowKeyMerlin/susfs4ksu-lkm/releases/latest/download/update.json", prop
     abi = (ROOT / "kernel/susfs_abi.h").read_text()
     assert f'"v{prop["susfsBase"]}"' in abi, prop
     assert prop["description"] == (

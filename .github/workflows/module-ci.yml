@@ -3,9 +3,9 @@ name: module-ci
 
 on:
   push:
-    paths: ['module/**', 'tools/pack_module.py', 'tools/test_pack.py', 'tools/cfi_sites.py', 'tools/test_cfi_sites.py', 'tools/test_toggle.py', 'tools/test_load.py', 'tools/test_review_findings.py', 'tools/test_soak_check.py', 'tools/test_pack_extra.py', 'tools/test_diag.py', 'tools/susfs_propwait.c', 'tools/prop_area_parse.h', 'tools/propwait_trie_test.c', '.susfs-fork/module/**', '.susfs-fork/pack_extra.py', '.susfs-fork/VERSION', '.susfs-fork/smoke/**', 'kernel/**', '.github/workflows/module-ci.yml']
+    paths: ['module/**', 'tools/pack_module.py', 'tools/test_pack.py', 'tools/cfi_sites.py', 'tools/test_cfi_sites.py', 'tools/test_toggle.py', 'tools/test_load.py', 'tools/test_review_findings.py', 'tools/test_soak_check.py', 'tools/test_pack_extra.py', 'tools/test_update_json.py', '.susfs-fork/update_json.py', 'tools/test_diag.py', 'tools/susfs_propwait.c', 'tools/prop_area_parse.h', 'tools/propwait_trie_test.c', '.susfs-fork/module/**', '.susfs-fork/pack_extra.py', '.susfs-fork/VERSION', '.susfs-fork/smoke/**', 'kernel/**', '.github/workflows/module-ci.yml']
   pull_request:
-    paths: ['module/**', 'tools/pack_module.py', 'tools/test_pack.py', 'tools/cfi_sites.py', 'tools/test_cfi_sites.py', 'tools/test_toggle.py', 'tools/test_load.py', 'tools/test_review_findings.py', 'tools/test_soak_check.py', 'tools/test_pack_extra.py', 'tools/test_diag.py', 'tools/susfs_propwait.c', 'tools/prop_area_parse.h', 'tools/propwait_trie_test.c', '.susfs-fork/module/**', '.susfs-fork/pack_extra.py', '.susfs-fork/VERSION', '.susfs-fork/smoke/**', 'kernel/**', '.github/workflows/module-ci.yml']
+    paths: ['module/**', 'tools/pack_module.py', 'tools/test_pack.py', 'tools/cfi_sites.py', 'tools/test_cfi_sites.py', 'tools/test_toggle.py', 'tools/test_load.py', 'tools/test_review_findings.py', 'tools/test_soak_check.py', 'tools/test_pack_extra.py', 'tools/test_update_json.py', '.susfs-fork/update_json.py', 'tools/test_diag.py', 'tools/susfs_propwait.c', 'tools/prop_area_parse.h', 'tools/propwait_trie_test.c', '.susfs-fork/module/**', '.susfs-fork/pack_extra.py', '.susfs-fork/VERSION', '.susfs-fork/smoke/**', 'kernel/**', '.github/workflows/module-ci.yml']
   workflow_dispatch:
 
 permissions:
@@ -44,6 +44,8 @@ jobs:
         run: python tools/test_soak_check.py
       - name: Module identity test
         run: python tools/test_pack_extra.py
+      - name: Update manifest test
+        run: python tools/test_update_json.py
       - name: Property-area trie reader test
         run: |
           cc -O1 -Wall -Wextra -o /tmp/propwait_trie_test tools/propwait_trie_test.c

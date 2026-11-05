@@ -3,7 +3,7 @@ run-name: "susfs-guard: ${{ inputs.title || (github.event_name == 'pull_request'
 
 # susfs-main may only add files. Editing or deleting an upstream file there would make syncing
 # conflict. susfs-dev may edit kernel/, so it skips that check. susfs-build.yml must match what the generator produces from this tree, and the
-# bootloop guard must pass its host test.
+# bootloop guard and the updater must pass their host tests.
 on:
   push:
     branches:
@@ -60,12 +60,13 @@ jobs:
         run: sudo apt-get install -y --no-install-recommends busybox-static mksh
 
       # Android's shell is mksh, so test with it as well as dash, busybox ash and bash.
-      - name: Test the guard under each shell
+      - name: Test the guard and the updater under each shell
         run: |
           mkdir /tmp/bb
           ln -s /bin/busybox /tmp/bb/sh
           rc=0
           for shell in dash /tmp/bb/sh bash mksh; do
             sh .susfs-fork/module/guard_test.sh "$shell" || rc=1
+            sh .susfs-fork/module/update_test.sh "$shell" || rc=1
           done
           exit "$rc"
