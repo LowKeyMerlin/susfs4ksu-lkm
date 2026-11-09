@@ -288,14 +288,27 @@ static bool fp_is_branch_stub(const void *fn)
  * Whether the kernel can call the wrapper the way it calls the entry it replaces. A landing pad always
  * allows it. Without BTI, a kernel with CFI jump tables has plain branch stubs for its entries, and the
  * address the module gets for its own function is such a stub too, so a stub is accepted where the
- * original entry is one: the kernel already calls that kind of entry. An entry that cannot be read, a
- * NULL one, is judged by the landing pad alone and refused later by the caller.
+ * original entry is one: the kernel already calls that kind of entry.
+ *
+ * The third case is a kernel built without CONFIG_ARM64_BTI_KERNEL and without jump tables (KCFI), such
+ * as the Pixel 6a on android14-6.1. Its entries start with the shadow call stack push, not a landing pad,
+ * and so do the module's functions. invoke_syscall() already lands on an entry without one, so a wrapper
+ * without one is equally safe. Before this case every hook that needs the table (kstat, the getdents64
+ * listing filter, opath, create) was refused there, and sus_path hid a path from stat() but left its
+ * name in directory listings.
+ *
+ * An entry that cannot be read, a NULL one, is judged by the landing pad alone and refused later by the
+ * caller.
  */
 static bool fp_entry_callable(const void *wrapper, const void *entry)
 {
 	if (fp_has_landing_pad(wrapper))
 		return true;
-	return entry && fp_is_branch_stub(wrapper) && fp_is_branch_stub(entry);
+	if (!entry)
+		return false;
+	if (fp_is_branch_stub(entry))
+		return fp_is_branch_stub(wrapper);
+	return !fp_has_landing_pad(entry);
 }
 
 int susfs_fp_install(struct susfs_fp_hook *h)
