@@ -163,14 +163,15 @@ whole mechanism. The WebUI shows this node's state and nothing else for this fea
 ## /proc/susfs_selinux_ctx
 
 Hides an admin-chosen list of SELinux context **types** (not full contexts, the third field of
-`user:role:type:level`, such as `adbroot` for a type a custom ROM's sepolicy adds) from three places
+`user:role:type:level`, such as `adbroot` for a type a custom ROM's sepolicy adds) from four places
 an app can ask "does this type exist": writing `/sys/fs/selinux/context`, writing
 `/sys/fs/selinux/access` (what `SELinux.checkSELinuxAccess()` and `selinux_check_access()` call
-into), and writing `/proc/self/attr/current` or a sibling attr. Applies only to the processes
+into), writing `/proc/self/attr/current` or a sibling attr, and setting the `security.selinux`
+attribute of a file. Applies only to the processes
 sus_path already hides from (an app uid KernelSU would umount modules for, or an isolated uid), so
 su tooling and system processes are unaffected.
 
-Empty and off at module load. The three hooks arm themselves the moment the list stops being
+Empty and off at module load. The hooks arm themselves the moment the list stops being
 empty, and disarm when it goes back to empty. There is no separate enable switch.
 
 **Read**:
@@ -178,7 +179,7 @@ empty, and disarm when it goes back to empty. There is no separate enable switch
 ```
 armed=1 types=1 txn=kprobe
 adbroot
-hits: selinuxfs=0 setprocattr=2
+hits: selinuxfs=0 setprocattr=2 setxattr=0
 ```
 
 **Write**:

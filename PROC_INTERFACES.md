@@ -176,7 +176,7 @@ WebUI 对该功能只展示此节点的状态，不提供开关。
 ```
 armed=1 types=1 txn=kprobe
 adbroot
-hits: selinuxfs=0 setprocattr=2
+hits: selinuxfs=0 setprocattr=2 setxattr=0
 ```
 
 **写入**：

@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * susfs_selinux_ctx.c hides an admin-chosen list of SELinux context TYPES (for example "adbroot",
- * a type a custom ROM's sepolicy adds) from the two write paths an app uses to ask whether a type
+ * a type a custom ROM's sepolicy adds) from the three write paths an app uses to ask whether a type
  * exists in the live policy. Those paths are writing /sys/fs/selinux/{access,context,...} (behind
- * Java SELinux.checkSELinuxAccess() and libselinux selinux_check_access()) and writing
- * /proc/<pid>/attr/current and siblings (the setprocattr probe a forked app does).
+ * Java SELinux.checkSELinuxAccess() and libselinux selinux_check_access()), writing
+ * /proc/<pid>/attr/current and siblings (the setprocattr probe a forked app does), and setting the
+ * security.selinux attribute of a file (setxattr, the label probe).
  *
  * Off by default and inert until the admin adds a type. The kernel does not know what a given ROM
  * or module calls its domains, so the hooks stay unarmed at load and arm once the list is
@@ -19,7 +20,7 @@
  * fires while selinux_setprocattr() does not. So this layer keys off stock kernel symbols, not off
  * the presence or behaviour of selinux_hide.
  *
- * Both hooks read the context the caller submits (bounded by the write size, never assuming a NUL)
+ * All hooks read the context the caller submits (bounded by the write size, never assuming a NUL)
  * and, on a hit, make the write answer -EINVAL, exactly what an app gets for a context naming a
  * type the policy lacks, so a hidden type is indistinguishable from an absent one. The two paths
  * differ in where the error is faked, because they differ in whether the real body is safe to run.
@@ -29,6 +30,12 @@
  * new task SID, so a caller told the write failed would in fact have transitioned into the context
  * it meant to hide. The body must not run, so timing cannot be matched there, but it is a
  * probe-only write and a fast reject costs nothing real.
+ *
+ * setxattr is the same kind of kprobe pre_handler (ctx_xattr_pre) on security_inode_setxattr(), for
+ * the same reason: letting the body run could relabel the file with the type the caller is told is
+ * unknown. Upstream closes this with dedicated setxattr handlers in the kernel patch. A failure to
+ * hook it leaves the other two in force, since a KMI that has inlined the function is no reason to
+ * give up the rest.
  *
  * The selinuxfs query nodes (access/context/create/user/member, all pure computes) are a kretprobe
  * (ctx_txn_entry/ctx_txn_ret). The real write_op runs first, so the reject costs what a genuine
@@ -69,6 +76,8 @@
 #include <linux/slab.h>
 #include <linux/mm.h>		/* kvmalloc_array()/kvfree() for the list snapshot */
 #include <linux/errno.h>
+#include <linux/version.h>
+#include <linux/xattr.h>	/* XATTR_NAME_SELINUX */
 
 #include "susfs_log.h"
 #include "susfs.h"
@@ -88,6 +97,7 @@ static DEFINE_SPINLOCK(ctx_hide_lock);
 
 static atomic_t n_txn_hits = ATOMIC_INIT(0);	/* selinux_transaction_write redactions */
 static atomic_t n_attr_hits = ATOMIC_INIT(0);	/* security_setprocattr redactions */
+static atomic_t n_xattr_hits = ATOMIC_INIT(0);	/* security_inode_setxattr redactions */
 
 /* The 3rd colon-separated field of a context string ("user:role:type:sensitivity[:categories]").
  * Bounds-checked against @len, which is not assumed to be NUL-terminated. The write buffers handed
@@ -164,6 +174,16 @@ static bool ctx_buf_has_hidden_type(const char *buf, size_t len)
 	return false;
 }
 
+/* The value of a security.selinux xattr is one context, usually with the NUL that setfattr and
+ * libselinux's setfilecon() send, which would otherwise end the type field of a bare three-field
+ * context. */
+static bool ctx_xattr_value_hidden(const char *buf, size_t len)
+{
+	if (len && buf[len - 1] == '\0')
+		len--;
+	return ctx_buf_has_hidden_type(buf, len);
+}
+
 /* selinux_transaction_write(file, buf, size, pos). arm64 puts the __user buffer in x1, size in x2.
  * One hook covers /sys/fs/selinux/access, /context and the other transaction nodes, since it is the
  * VFS .write for all of them, upstream of whatever handler the dispatch table currently points at. */
@@ -222,6 +242,45 @@ static int ctx_attr_pre(struct kprobe *kp, struct pt_regs *regs)
 	return 1;
 }
 
+/* security_inode_setxattr(idmap, dentry, name, value, size, flags). The name, value and size are
+ * x2, x3 and x4, or x1, x2 and x3 before 5.12, which has no idmap argument. The name is a kernel
+ * string and so is the value, copied in by setxattr(2), so both are read with the nofault copy. Only
+ * security.selinux is looked at. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+#define CTX_XATTR_ARG0	2
+#else
+#define CTX_XATTR_ARG0	1
+#endif
+static int ctx_xattr_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+	const char *uname = (const char *)regs->regs[CTX_XATTR_ARG0];
+	const void *value = (const void *)regs->regs[CTX_XATTR_ARG0 + 1];
+	size_t size = (size_t)regs->regs[CTX_XATTR_ARG0 + 2];
+	char name[sizeof(XATTR_NAME_SELINUX)];
+	char kbuf[SUSFS_CTX_BUF];
+	size_t n;
+
+	if (ctx_hide_empty() || !uname || !value || !size)
+		return 0;
+	if (!susfs_is_current_proc_umounted_app())
+		return 0;
+	if (copy_from_kernel_nofault(name, uname, sizeof(name)) ||
+	    memcmp(name, XATTR_NAME_SELINUX, sizeof(name)))
+		return 0;
+
+	n = min(size, sizeof(kbuf));
+	if (copy_from_kernel_nofault(kbuf, value, n))
+		return 0;
+	/* A value longer than the buffer is cut, and the cut can only drop the tail of the context. */
+	if (!ctx_xattr_value_hidden(kbuf, n))
+		return 0;
+
+	atomic_inc(&n_xattr_hits);
+	regs_set_return_value(regs, (unsigned long)(long)-EINVAL);
+	susfs_probe_return(regs);
+	return 1;
+}
+
 /* Fallback for the query node, used only when simple_transaction_set() cannot be resolved, so the
  * body must be skipped to avoid staging a response that no resolved helper could then drop. Its
  * pre-reject is leak-safe but returns before the real parse, which is the timing tell the kretprobe
@@ -234,6 +293,11 @@ static struct kprobe kp_ctx_txn = {
 static struct kprobe kp_ctx_attr = {
 	.symbol_name = "security_setprocattr",
 	.pre_handler = ctx_attr_pre,
+};
+
+static struct kprobe kp_ctx_xattr = {
+	.symbol_name = "security_inode_setxattr",
+	.pre_handler = ctx_xattr_pre,
 };
 
 /* simple_transaction_set(file, 0) drops the answer the real selinuxfs write_op staged for a
@@ -324,6 +388,7 @@ static struct kretprobe krp_ctx_txn = {
 };
 
 static bool ctx_probes_armed;
+static bool ctx_xattr_live;	/* kp_ctx_xattr is registered, which does not gate the other two */
 static bool ctx_txn_is_kret;	/* which of krp_ctx_txn / kp_ctx_txn is live, for disarm and the /proc report */
 
 /* Serialises arm/disarm. register_kprobe() answers -EINVAL once another task has resolved .addr,
@@ -391,9 +456,18 @@ static int ctx_probes_register(void)
 		return rc;
 	}
 
+	/* Not fatal: the other two hooks stand on their own. */
+	rc = register_kprobe(&kp_ctx_xattr);
+	if (rc) {
+		susfs_kp_forget_addr(&kp_ctx_xattr);
+		pr_warn("selinux_ctx: register_kprobe(security_inode_setxattr) failed %d, setxattr is not covered\n", rc);
+	} else {
+		ctx_xattr_live = true;
+	}
+
 	ctx_probes_armed = true;
-	SUSFS_LOGI("selinux_ctx: hooks installed (selinux_transaction_write %s, security_setprocattr)\n",
-		   ctx_txn_is_kret ? "kretprobe" : "kprobe");
+	SUSFS_LOGI("selinux_ctx: hooks installed (selinux_transaction_write %s, security_setprocattr, security_inode_setxattr %s)\n",
+		   ctx_txn_is_kret ? "kretprobe" : "kprobe", ctx_xattr_live ? "on" : "off");
 	mutex_unlock(&ctx_ctl_lock);
 	return 0;
 }
@@ -412,6 +486,11 @@ static void ctx_probes_unregister_locked(void)
 	}
 	unregister_kprobe(&kp_ctx_attr);
 	susfs_kp_forget_addr(&kp_ctx_attr);
+	if (ctx_xattr_live) {
+		unregister_kprobe(&kp_ctx_xattr);
+		susfs_kp_forget_addr(&kp_ctx_xattr);
+		ctx_xattr_live = false;
+	}
 	ctx_probes_armed = false;
 	SUSFS_LOGI("selinux_ctx: hooks removed\n");
 }
@@ -524,8 +603,8 @@ static int ctx_proc_show(struct seq_file *m, void *v)
 		   ctx_txn_is_kret ? "kretprobe" : "kprobe");
 	for (i = 0; i < n; i++)
 		seq_printf(m, "%s\n", snap[i]);
-	seq_printf(m, "hits: selinuxfs=%d setprocattr=%d\n",
-		   atomic_read(&n_txn_hits), atomic_read(&n_attr_hits));
+	seq_printf(m, "hits: selinuxfs=%d setprocattr=%d setxattr=%d\n",
+		   atomic_read(&n_txn_hits), atomic_read(&n_attr_hits), atomic_read(&n_xattr_hits));
 	kvfree(snap);
 	return 0;
 }

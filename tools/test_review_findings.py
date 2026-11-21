@@ -581,6 +581,15 @@ int main(void)
     /* a len that cuts the type short must not match the full hidden name */
     check("len_short", ctx_buf_has_hidden_type(buf, 8), 0);
 
+    /* a security.selinux value, which setfattr and setfilecon() send with the NUL: a bare three-field
+     * context ends in the type, so the NUL would hide it from the scan */
+    check("xattr_nul_hidden", ctx_xattr_value_hidden("u:object_r:adbroot", 19), 1);
+    check("xattr_nul_hidden_full", ctx_xattr_value_hidden("u:object_r:adbroot:s0", 22), 1);
+    check("xattr_no_nul_hidden", ctx_xattr_value_hidden("u:object_r:adbroot:s0", 21), 1);
+    check("xattr_nul_clean", ctx_xattr_value_hidden("u:object_r:app_data_file:s0", 28), 0);
+    check("xattr_empty", ctx_xattr_value_hidden("", 0), 0);
+    check("xattr_only_nul", ctx_xattr_value_hidden("", 1), 0);
+
     printf("fails=%d\n", fails);
     return 0;
 }
@@ -590,7 +599,7 @@ int main(void)
 def extract_ctx_fns():
     text = read("kernel/susfs_selinux_ctx.c")
     out = []
-    for name in ("ctx_extract_type", "ctx_buf_has_hidden_type"):
+    for name in ("ctx_extract_type", "ctx_buf_has_hidden_type", "ctx_xattr_value_hidden"):
         m = re.search(r"static bool %s\(.*?\n\}\n" % name, text, flags=re.S)
         if not m:
             raise AssertionError(name + "() not found in kernel/susfs_selinux_ctx.c")
@@ -745,6 +754,18 @@ class SelinuxCtxTimingDefuse(unittest.TestCase):
         # kretprobe only when the drop helper resolved, otherwise the leak-safe pre-reject kprobe.
         self.assertRegex(reg.group(0), r"if \(ctx_txn_set\) \{\s*\n\s*rc = register_kretprobe\(&krp_ctx_txn\);")
         self.assertRegex(reg.group(0), r"\} else \{\s*\n\s*rc = register_kprobe\(&kp_ctx_txn\);")
+
+    def test_setxattr_is_a_pre_reject_and_not_fatal(self):
+        text = strip_comments(read("kernel/susfs_selinux_ctx.c"))
+        xattr = re.search(r"static struct kprobe kp_ctx_xattr = \{.*?\};", text, flags=re.S)
+        self.assertIsNotNone(xattr)
+        self.assertRegex(xattr.group(0), r'\.symbol_name = "security_inode_setxattr"')
+        self.assertRegex(xattr.group(0), r"\.pre_handler = ctx_xattr_pre")
+        reg = re.search(r"static int ctx_probes_register\(void\)\n\{.*?\n\}\n", text, flags=re.S)
+        self.assertIsNotNone(reg)
+        # The other two hooks stand on their own, so a KMI without this symbol must not turn them off.
+        self.assertRegex(reg.group(0), r"rc = register_kprobe\(&kp_ctx_xattr\);\s*\n\s*if \(rc\) \{[^}]*\} else \{\s*\n\s*ctx_xattr_live = true;")
+        self.assertRegex(read("kernel/susfs_selinux_ctx.c"), r"#if LINUX_VERSION_CODE >= KERNEL_VERSION\(5, 12, 0\)\n#define CTX_XATTR_ARG0\s+2")
 
     def test_setprocattr_stays_a_pre_reject(self):
         text = strip_comments(read("kernel/susfs_selinux_ctx.c"))
