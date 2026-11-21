@@ -64,6 +64,7 @@ EXPECTED = [
     ("sus_path_create_root", "EEXIST", "root making the same directory again sees it exists"),
     ("sus_path_create_app", "EACCES",
      "an app making the same directory is refused as an absent name under an unwritable parent would be"),
+    ("sus_path_create_app_visible", "EEXIST", "with the rule gone the same app sees the directory exists, so the refusal was the rule"),
     ("or_add_rc", "0", "an open_redirect rule is accepted"),
     ("or_read_root", "ORIGINAL", "root reading the target sees the real file"),
     ("or_read_app", "FAKE", "an app reading the target is redirected"),

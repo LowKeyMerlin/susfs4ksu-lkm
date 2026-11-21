@@ -175,13 +175,21 @@ case $root_err in
 *xist*) say "sus_path_create_root=EEXIST" ;;
 *) say "sus_path_create_root=other:$root_err" ;;
 esac
-app_err=$(as_app "mkdir /data/adb/sus_path_dir 2>&1 1>/dev/null")
+# The redirections are outside the app command: /dev/null is root's here, so inside it the app's own
+# shell failed with "Permission denied" whatever the rule said. The parents are opened up for the same
+# reason, and the answer after the rule is gone shows that the refusal came from the rule.
+chmod 755 /data /data/adb
+app_err=$(as_app "mkdir /data/adb/sus_path_dir" 2>&1 1>/dev/null)
 case $app_err in
 *ermission*) say "sus_path_create_app=EACCES" ;;
 *xist*) say "sus_path_create_app=EEXIST" ;;
 *) say "sus_path_create_app=other:$app_err" ;;
 esac
 echo "del /data/adb/sus_path_dir" >/proc/susfs_path
+case $(as_app "mkdir /data/adb/sus_path_dir" 2>&1 1>/dev/null) in
+*xist*) say "sus_path_create_app_visible=EEXIST" ;;
+*) say "sus_path_create_app_visible=other" ;;
+esac
 
 # open_redirect: a rule with scheme 3 (umounted app) redirects only the app's own read. Root and
 # a cleared rule both answer with the real file.
