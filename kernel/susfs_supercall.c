@@ -170,6 +170,9 @@ static void susfs_tw_func(struct callback_head *cb)
 		/* The two commands answer a missing path differently upstream. */
 		sus_path_supercall(tw->cmd, &arg);
 		break;
+	case CMD_SUSFS_SET_SUS_PATH_UID_FILTER:
+		sus_path_uid_filter_supercall(&arg);
+		break;
 	case CMD_SUSFS_ADD_SUS_MAP:
 		susfs_sus_map_supercall(&arg);
 		break;
@@ -233,6 +236,7 @@ static int susfs_cmd_feature(unsigned int cmd)
 	switch (cmd) {
 	case CMD_SUSFS_ADD_SUS_PATH:
 	case CMD_SUSFS_ADD_SUS_PATH_LOOP:
+	case CMD_SUSFS_SET_SUS_PATH_UID_FILTER:
 		return SUSFS_FEAT_SUS_PATH;
 	case CMD_SUSFS_ADD_SUS_MAP:
 		return SUSFS_FEAT_SUS_MAP;

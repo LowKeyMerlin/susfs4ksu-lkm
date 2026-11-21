@@ -59,6 +59,7 @@
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact, for optional compat probes */
 #include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
 #include "ksu_allow_gate.h"	/* the control-node gate is su's own */
+#include "susfs_uid_filter.h"
 
 #include "lsm_hook.h"
 #include "fsnotify_lifetime.h"
@@ -511,6 +512,12 @@ static atomic_t sus_path_pend_logged_rc = ATOMIC_INIT(1);   /* rc already report
 static int hide_from_apps = 1;
 module_param(hide_from_apps, int, 0644);
 
+/* The apps CMD_SUSFS_SET_SUS_PATH_UID_FILTER names. Upstream hides added paths from every app uid
+ * that is not on the list. Here the list only ever lets an app see more: an app on it sees every
+ * hidden path, and every other app keeps the gate below, so no filter set means nothing changes and
+ * a KernelSU-allowed manager is not hidden from by a list that forgot it (issue #34). */
+static struct susfs_uid_filter sus_path_uid_set = { .name = "sus_path_uid_filter", .lenient = true };
+
 /* One identity gate for every layer.  `inode` is the object whose ownership the
  * rule is asking about; NULL means a pending rule has no inode yet and only the
  * app half can be answered. */
@@ -519,6 +526,8 @@ static inline bool sus_path_gate(struct inode *inode)
     if (!hide_from_apps)
         return true;
     if (!susfs_is_current_proc_umounted_app())
+        return false;
+    if (susfs_uid_filter_has(&sus_path_uid_set, current_uid().val % SUSFS_UID_PER_USER_RANGE))
         return false;
     return !inode || current_uid().val != inode->i_uid.val;
 }
@@ -2898,6 +2907,10 @@ int sus_path_init(void)
             pr_warn("sus_path: sus_path_probe=\"%s\" from insmod failed %d\n", sus_path_probe_pending, rc);
     }
     mutex_unlock(&sus_path_param_lock);
+
+    /* Not fatal: without the package event the command answers ENODEV and the gate above keeps
+     * its usual answer for every app. */
+    susfs_uid_filter_attach(&sus_path_uid_set);
     return 0;
 }
 
@@ -2970,6 +2983,16 @@ void sus_path_exit(void)
     sus_path_iops_free();
     susfs_sb_watch_exit();
     WRITE_ONCE(sus_path_lifetime_watch, false);
+    /* The hooks are gone, so no gate reads the list any more. */
+    susfs_uid_filter_detach(&sus_path_uid_set);
+}
+
+/* supercall: CMD_SUSFS_SET_SUS_PATH_UID_FILTER (0x55554): the apps that may see the hidden paths. */
+void sus_path_uid_filter_supercall(void __user **arg)
+{
+    struct st_susfs_sus_path_uid_filter __user *user = (void __user *)*arg;
+
+    susfs_uid_filter_supercall(&sus_path_uid_set, user->app_strings, &user->err);
 }
 
 /* supercall: CMD_SUSFS_ADD_SUS_PATH (0x55550) / CMD_SUSFS_ADD_SUS_PATH_LOOP (0x55553)

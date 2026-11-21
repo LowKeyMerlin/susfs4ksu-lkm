@@ -21,6 +21,7 @@
  *                         prints what the reboot call returned and the err the kernel wrote back, which
  *                         stays 126 when the kernel does not handle the command.
  *   prio_probe setfill    the same with a list that is not terminated inside the buffer.
+ *   prio_probe pathset NAMES  (64-bit only) the same for CMD_SUSFS_SET_SUS_PATH_UID_FILTER, which has the same payload.
  */
 
 #define PRIO_PROCESS	0
@@ -53,6 +54,7 @@
 #define KSU_INSTALL_MAGIC1		0xDEADBEEF
 #define SUSFS_MAGIC			0xFAFAFAFA
 #define CMD_SET_PRIORITY_UID_FILTER	0x60030
+#define CMD_SET_SUS_PATH_UID_FILTER	0x55554
 #define APP_STR_BUF_SIZE		65535
 /* struct st_susfs_priority_uid_filter: the string, then the int err, 4-byte aligned. */
 #define PAYLOAD_SIZE			65540
@@ -141,12 +143,12 @@ static void report(const char *key, long value)
 #if defined(__aarch64__)
 static char payload[PAYLOAD_SIZE] __attribute__((aligned(16)));
 
-static void send_filter(void)
+static void send_filter(long cmd)
 {
 	long rc;
 
 	*(int *)(payload + ERR_OFFSET) = ERR_SEED;
-	rc = sys(NR_REBOOT, KSU_INSTALL_MAGIC1, SUSFS_MAGIC, CMD_SET_PRIORITY_UID_FILTER, (long)payload);
+	rc = sys(NR_REBOOT, KSU_INSTALL_MAGIC1, SUSFS_MAGIC, cmd, (long)payload);
 	report("set_rc", rc);
 	report("set_err", *(int *)(payload + ERR_OFFSET));
 }
@@ -176,7 +178,7 @@ long probe_main(long argc, char **argv)
 		return 0;
 	}
 #if defined(__aarch64__)
-	if (same(argv[1], "set") && argc > 2) {
+	if ((same(argv[1], "set") || same(argv[1], "pathset")) && argc > 2) {
 		unsigned long n = length(argv[2]);
 		unsigned long i;
 
@@ -186,7 +188,7 @@ long probe_main(long argc, char **argv)
 		}
 		for (i = 0; i < n; i++)
 			payload[i] = argv[2][i];
-		send_filter();
+		send_filter(same(argv[1], "set") ? CMD_SET_PRIORITY_UID_FILTER : CMD_SET_SUS_PATH_UID_FILTER);
 		return 0;
 	}
 	if (same(argv[1], "setfill")) {
@@ -196,7 +198,7 @@ long probe_main(long argc, char **argv)
 			payload[i] = 'a';
 			__asm__ volatile("" ::: "memory");
 		}
-		send_filter();
+		send_filter(CMD_SET_PRIORITY_UID_FILTER);
 		return 0;
 	}
 #endif

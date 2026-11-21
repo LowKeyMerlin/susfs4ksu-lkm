@@ -389,6 +389,26 @@ for i in 1 2 3 4 5; do
 done
 sleep 3
 say "prio_refresh_removed=$(row app 10006)/$(row app 10007)"
+
+# The sus_path uid filter lets the apps it lists see every hidden path. An app that is not listed is
+# treated as before, and so is every app while no list is set. The probe is the create gate's, as in
+# sus_path_create_app above: a hidden name that exists is refused for an app, a visible one exists.
+# The directory is at the root so that no parent can refuse the app before the gate is asked, and the redirections are outside because /dev/null is root's here.
+UIDF=/uidf_dir
+mkdir -p $UIDF
+chmod 755 $UIDF
+uidf_mk() { as_user "$1" "mkdir $UIDF" 2>&1 1>/dev/null | sed -n 's/.*\(ermission\|xist\).*/\1/p'; }
+uidf_set() { "$PRIO" pathset "$1" | tr '\n' ' ' | sed 's/^set_rc=\(-*[0-9]*\) set_err=\(-*[0-9]*\) *$/\1,\2/'; }
+say "uidf_plain=$(uidf_mk app)"
+echo "add $UIDF" >/proc/susfs_path
+say "uidf_unset=$(uidf_mk app)/$(uidf_mk vis)"
+say "uidf_set_app=$(uidf_set ksuctl.uid.10000)"
+say "uidf_listed=$(uidf_mk app)/$(uidf_mk vis)"
+say "uidf_set_missing=$(uidf_set nosuch)"
+say "uidf_unlisted=$(uidf_mk app)/$(uidf_mk vis)"
+say "uidf_set_empty=$(uidf_set '')"
+say "uidf_set_by_app=$(as_user app "$PRIO pathset ksuctl.uid.10000" | tr '\n' ' ' | sed 's/^set_rc=\(-*[0-9]*\) set_err=\(-*[0-9]*\) *$/\1,\2/')"
+echo "del $UIDF" >/proc/susfs_path
 # What is hidden from whom depends on the reader's SELinux domain, which the VM has no policy
 # for, so this only has to run.
 mkdir -p /data/adb/m

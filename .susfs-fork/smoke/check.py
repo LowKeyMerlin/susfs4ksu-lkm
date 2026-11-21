@@ -257,6 +257,19 @@ PRIO_EXPECTED = [
     ("prio_refresh_removed", f"{PRIO_TRUTH}/{PRIO_TRUTH}",
      "a package that is gone is not hidden any more, and a burst of writes is harmless"),
 ]
+# The sus_path uid filter: what mkdir of a hidden, existing name answers an app, as "permission" when
+# the name is hidden and "xist" when it is not. The pair is the listed app, then an app that is not.
+UIDF_HIDDEN = "ermission/ermission"
+UIDF_EXPECTED = [
+    ("uidf_plain", "xist", "the probe tells a visible name from a hidden one"),
+    ("uidf_unset", UIDF_HIDDEN, "with no list every app is refused, as before the command existed"),
+    ("uidf_set_app", "0,0", "the list is accepted"),
+    ("uidf_listed", "xist/ermission", "a listed app sees the hidden name and one that is not listed does not"),
+    ("uidf_set_missing", "0,0", "a name that is not installed is skipped, not an error"),
+    ("uidf_unlisted", UIDF_HIDDEN, "a list that names nobody leaves every app refused"),
+    ("uidf_set_empty", "0,-22", "an empty list is refused"),
+    ("uidf_set_by_app", "-1,126", "the command is not handled for an app, which stays at the 126 sentinel"),
+]
 # Only on a boot that loaded a SELinux policy (policy_load_rc below). The status page face arms on
 # every KMI, and PID 1 is not a KernelSU-origin caller, so its policy reload still bumps the page and
 # the skip counter does not move.
@@ -423,7 +436,7 @@ def judge(lines, qemu_rc, ksu_cfg=None):
         return INCONCLUSIVE, [f"SUSFS did not read as absent before the load (probe_before="
                               f"{facts.get('probe_before', 'missing')}), so a load proves nothing"], facts
 
-    expected = list(EXPECTED) + PRIO_EXPECTED + KSTAT_EXPECTED + MAPPROC_EXPECTED
+    expected = list(EXPECTED) + PRIO_EXPECTED + UIDF_EXPECTED + KSTAT_EXPECTED + MAPPROC_EXPECTED
     if facts.get("policy_load_rc") == "0":
         expected += SELSTATUS_EXPECTED
     if ksu_cfg:
