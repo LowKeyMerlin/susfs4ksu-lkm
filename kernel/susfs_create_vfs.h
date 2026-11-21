@@ -24,6 +24,12 @@ void susfs_create_vfs_putname_after_lookup(struct filename *name);
 void susfs_create_vfs_path_put(struct path *path);
 void susfs_create_vfs_parent_permission(struct inode *dir);
 
+/* The absolute path a create names, written to buf, for a name that need not exist: the parent is
+ * resolved, so a relative path, a dfd, ".." and symlinks all come out as the path a rule was added
+ * with. -EOPNOTSUPP where the kernel symbols are missing, -EINVAL when the last component is not a
+ * plain name (".", "..", "/"). */
+int susfs_create_vfs_absent_path(int dfd, const char __user *pathname, char *buf, size_t len);
+
 long __nocfi susfs_create_vfs_mkdirat(int dfd, const char __user *pathname, umode_t mode,
                                      int (*existing)(struct inode *inode));
 

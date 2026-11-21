@@ -1393,6 +1393,32 @@ bool sus_path_user_rules_present(void)
     return READ_ONCE(sus_path_user_count) > 0;
 }
 
+/* A rule for a path that is not there yet stays pending until it resolves (upstream's _LOOP variant)
+ * and then hides what appears there from the same apps. The create family asks first, so that the
+ * app cannot make the name now and be refused it later: it is answered as the hidden name would be. */
+bool sus_path_pending_present(void)
+{
+    return atomic_read(&sus_path_n_pending) > 0;
+}
+
+bool sus_path_pending_hides(const char *path)
+{
+    struct sus_path_entry *e;
+    bool hidden = false;
+
+    spin_lock(&sus_path_lock);
+    list_for_each_entry(e, &sus_path_list, list) {
+        if (e->inode || !e->path_len || strcmp(e->path, path))
+            continue;
+        if (sus_path_entry_gate(e, NULL)) {
+            hidden = true;
+            break;
+        }
+    }
+    spin_unlock(&sus_path_lock);
+    return hidden;
+}
+
 static int sus_path_inode_getattr(const struct path *path)
 {
     struct inode *inode;

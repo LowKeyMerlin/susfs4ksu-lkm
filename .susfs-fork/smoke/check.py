@@ -270,7 +270,20 @@ UIDF_EXPECTED = [
     ("uidf_set_empty", "0,-22", "an empty list is refused"),
     ("uidf_set_by_app", "-1,126", "the command is not handled for an app, which stays at the 126 sentinel"),
 ]
-# Only on a boot that loaded a SELinux policy (policy_load_rc below). The status page face arms on
+# A pending rule: a name that does not exist yet, and that a path rule is waiting for, is refused to
+# an app like the name would be once it exists. Created is what the app gets when nothing stops it.
+PEND_EXPECTED = [
+    ("pend_add", "0", "a rule for a path that is not there is accepted as pending"),
+    ("pend_mk_hidden", "ermission", "an app is refused the name a pending rule waits for"),
+    ("pend_exists", "no", "the refused name was not created"),
+    ("pend_mk_other", "created", "another name in the same directory is created, so the refusal is the rule"),
+    ("pend_mk_dotdot", "ermission", "the same name reached through .. is refused"),
+    ("pend_mk_relative", "ermission", "the same name reached through the working directory is refused"),
+    ("pend_mknod", "ermission", "mknod is refused the same way"),
+    ("pend_symlink", "ermission", "symlink is refused the same way"),
+    ("pend_mk_root", "created", "root is not an app and creates the name"),
+    ("pend_after_del", "created", "once the rule is deleted an app creates the name"),
+]# Only on a boot that loaded a SELinux policy (policy_load_rc below). The status page face arms on
 # every KMI, and PID 1 is not a KernelSU-origin caller, so its policy reload still bumps the page and
 # the skip counter does not move.
 SELSTATUS_EXPECTED = [
@@ -436,7 +449,7 @@ def judge(lines, qemu_rc, ksu_cfg=None):
         return INCONCLUSIVE, [f"SUSFS did not read as absent before the load (probe_before="
                               f"{facts.get('probe_before', 'missing')}), so a load proves nothing"], facts
 
-    expected = list(EXPECTED) + PRIO_EXPECTED + UIDF_EXPECTED + KSTAT_EXPECTED + MAPPROC_EXPECTED
+    expected = list(EXPECTED) + PRIO_EXPECTED + UIDF_EXPECTED + PEND_EXPECTED + KSTAT_EXPECTED + MAPPROC_EXPECTED
     if facts.get("policy_load_rc") == "0":
         expected += SELSTATUS_EXPECTED
     if ksu_cfg:

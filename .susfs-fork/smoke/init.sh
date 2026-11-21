@@ -409,6 +409,34 @@ say "uidf_unlisted=$(uidf_mk app)/$(uidf_mk vis)"
 say "uidf_set_empty=$(uidf_set '')"
 say "uidf_set_by_app=$(as_user app "$PRIO pathset ksuctl.uid.10000" | tr '\n' ' ' | sed 's/^set_rc=\(-*[0-9]*\) set_err=\(-*[0-9]*\) *$/\1,\2/')"
 echo "del $UIDF" >/proc/susfs_path
+
+# A rule for a path that is not there yet stays pending, and the create family refuses that name
+# to an app as it would refuse it once it exists. The parent is writable by everyone, so a refusal
+# is the rule and not the permissions, and the other name shows that. The name is also reached
+# through "..", and through the working directory, which parentat resolves and a string would not.
+mkdir -p /pendroot
+chmod 777 /pendroot
+sus_path_loop() {
+  /bin/sc 0x55553 "$(printf '%s' "$1" | od -An -v -tx1 | tr -d ' \n')$(printf "%0$((2 * (260 - ${#1})))d" 0)" 2>&1 |
+    sed -n 's/^susfs_sc: err=\(-*[0-9]*\) .*/\1/p'
+}
+pend_mk() {
+  r=$(as_user app "$1" 2>&1 1>/dev/null | sed -n 's/.*\(ermission\|xist\).*/\1/p')
+  echo "${r:-created}"
+}
+say "pend_add=$(sus_path_loop /pendroot/hid)"
+say "pend_mk_hidden=$(pend_mk 'mkdir /pendroot/hid')"
+say "pend_exists=$(yesno [ -e /pendroot/hid ])"
+say "pend_mk_other=$(pend_mk 'mkdir /pendroot/other')"
+say "pend_mk_dotdot=$(pend_mk 'mkdir /pendroot/other/../hid')"
+say "pend_mk_relative=$(pend_mk 'cd /pendroot && mkdir hid')"
+say "pend_mknod=$(pend_mk 'mknod /pendroot/hid p')"
+say "pend_symlink=$(pend_mk 'ln -s /bin/sh /pendroot/hid')"
+say "pend_mk_root=$(mkdir /pendroot/hid 2>/dev/null && echo created || echo refused)"
+rmdir /pendroot/hid
+echo "del /pendroot/hid" >/proc/susfs_path
+say "pend_after_del=$(pend_mk 'mkdir /pendroot/hid')"
+
 # What is hidden from whom depends on the reader's SELinux domain, which the VM has no policy
 # for, so this only has to run.
 mkdir -p /data/adb/m

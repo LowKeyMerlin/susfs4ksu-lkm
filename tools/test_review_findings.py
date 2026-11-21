@@ -607,6 +607,107 @@ def extract_ctx_fns():
     return "\n".join(out)
 
 
+JOIN_HARNESS = r"""
+#include <stdio.h>
+#include <stddef.h>
+#include <string.h>
+#define ENAMETOOLONG 36
+
+#include "join_fn.inc"
+
+static int fails;
+static void check(const char *label, int rc, const char *got, int want_rc, const char *want)
+{
+    if (rc != want_rc || (!rc && strcmp(got, want))) {
+        fails++;
+        printf("FAIL %s rc=%d got=%s want_rc=%d want=%s\n", label, rc, rc ? "-" : got, want_rc, want);
+    }
+}
+
+int main(void)
+{
+    char buf[16];
+    int rc;
+
+    rc = create_join_path("/data/adb", "hid", 3, buf, sizeof(buf));
+    check("plain", rc, buf, 0, "/data/adb/hid");
+    /* d_path of the root is "/", which must not become "//hid" */
+    rc = create_join_path("/", "hid", 3, buf, sizeof(buf));
+    check("root", rc, buf, 0, "/hid");
+    /* the last component is not NUL-terminated, only its length counts */
+    rc = create_join_path("/a", "hidXXX", 3, buf, sizeof(buf));
+    check("last_len", rc, buf, 0, "/a/hid");
+    /* exactly fitting: 15 characters and the NUL in 16 bytes */
+    rc = create_join_path("/aaaaaaaaaa", "bbb", 3, buf, sizeof(buf));
+    check("fits", rc, buf, 0, "/aaaaaaaaaa/bbb");
+    rc = create_join_path("/aaaaaaaaaa", "bbbb", 4, buf, sizeof(buf));
+    check("one_over", rc, buf, -ENAMETOOLONG, "");
+    rc = create_join_path("/", "aaaaaaaaaaaaaaaa", 16, buf, sizeof(buf));
+    check("last_too_long", rc, buf, -ENAMETOOLONG, "");
+
+    printf("fails=%d\n", fails);
+    return 0;
+}
+"""
+
+
+class CreateAbsentPath(unittest.TestCase):
+    """The create family answers a name that does not exist yet when a pending sus_path rule waits for
+    it, by comparing the path the create names with the path the rule was added with.  The join of the
+    resolved parent and the last component is cut from the kernel source and run, because a slash too
+    many or too few, or a write past the buffer, would make the rule silently never match."""
+
+    result = None
+
+    @classmethod
+    def setUpClass(cls):
+        gcc = shutil.which("gcc") or shutil.which("cc")
+        if not gcc:
+            raise unittest.SkipTest("no C compiler on PATH")
+        text = read("kernel/susfs_create_vfs.c")
+        m = re.search(r"static int create_join_path\(.*?\n\}\n", text, flags=re.S)
+        if not m:
+            raise AssertionError("create_join_path() not found in kernel/susfs_create_vfs.c")
+        tmp = tempfile.mkdtemp(prefix="susfs_join_")
+        cls.addClassCleanup(shutil.rmtree, tmp, True)
+        with open(os.path.join(tmp, "join_fn.inc"), "w", encoding="utf-8") as f:
+            f.write(m.group(0))
+        with open(os.path.join(tmp, "h.c"), "w", encoding="utf-8") as f:
+            f.write(JOIN_HARNESS)
+        exe = os.path.join(tmp, "h.exe")
+        subprocess.run([gcc, "-O1", "-Wall", "-I", tmp, "-o", exe, os.path.join(tmp, "h.c")], check=True)
+        out = subprocess.run([exe], check=True, capture_output=True, text=True).stdout
+        cls.result = dict(re.findall(r"(\w+)=(-?\d+)", out))
+        cls.raw = out.strip()
+
+    def test_join_handles_root_length_and_bounds(self):
+        self.assertEqual(self.result.get("fails"), "0", self.raw)
+
+    def test_resolves_the_parent_and_not_the_string(self):
+        text = strip_comments(read("kernel/susfs_create_vfs.c"))
+        body = re.search(r"susfs_create_vfs_absent_path\(.*?\n\}\n", text, flags=re.S)
+        self.assertIsNotNone(body)
+        self.assertRegex(body.group(0), r"create_parentat\(dfd, name")
+        self.assertRegex(body.group(0), r"type != LAST_NORM")
+        # last.name lives in the filename, so the name is released after the join.
+        self.assertLess(body.group(0).index("create_join_path("), body.group(0).rindex("create_putname(name)"))
+
+    def test_pre_5_12_parentat_returns_the_filename_and_puts_it_on_error(self):
+        # 5.10 answered the int call with a pointer read as an error, and put the name twice.
+        text = strip_comments(read("kernel/susfs_create_vfs.c"))
+        self.assertRegex(text, r"#if LINUX_VERSION_CODE < KERNEL_VERSION\(5, 12, 0\)\s*\n#define CREATE_PARENTAT_PUTS_ON_ERROR 1")
+        wrap = re.search(r"static __nocfi noinline int create_parentat\(.*?\n\}\n", text, flags=re.S)
+        self.assertIsNotNone(wrap)
+        self.assertRegex(wrap.group(0), r"struct filename \*ret = \(\(struct filename \*\(\*\)\(")
+        self.assertRegex(wrap.group(0), r"IS_ERR\(ret\) \? PTR_ERR\(ret\) : 0")
+        absent = re.search(r"susfs_create_vfs_absent_path\(.*?\n\}\n", text, flags=re.S).group(0)
+        self.assertRegex(absent, r"if \(!CREATE_PARENTAT_PUTS_ON_ERROR\)\s*\n\s*create_putname\(name\);")
+
+    def test_only_a_missing_name_is_asked_about_pending_rules(self):
+        text = strip_comments(read("kernel/susfs_create_policy.c"))
+        self.assertRegex(text, r"return rc == -ENOENT && create_absent_hidden\(dfd, path\);")
+        self.assertRegex(text, r"if \(!sus_path_pending_present\(\)\)\s*\n\s*return false;")
+
 class SusPathInodeReuse(unittest.TestCase):
     """sus_path's identity-fallback match (same dev+ino, a different inode object than the one the
     rule pinned) confirms i_generation, so an inode number reclaimed by a new file in the same

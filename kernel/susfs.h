@@ -246,6 +246,11 @@ bool sus_path_rules_present(void);
  * when only those exist. */
 bool sus_path_user_rules_present(void);
 
+/* Whether a rule is waiting for its path to appear, and whether such a rule hides this absolute
+ * path from the current caller. */
+bool sus_path_pending_present(void);
+bool sus_path_pending_hides(const char *path);
+
 /* Whether a 0777 /proc/susfs_* control node may be created.  Two independent conditions, neither optional: susfs_expose_proc
  * (the operator opted in) and sus_path_lsm_active() (with 0777 DAC passes every caller, so only the LSM layer can still
  * answer ENOENT for an app).  This gates node CREATION ONLY, never hook registration: an earlier revision returned early from

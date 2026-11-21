@@ -37,6 +37,7 @@ static int (*create_filename_parentat_fn)(int dfd, struct filename *name,
 static struct dentry *(*create_lookup_one_qstr_excl_fn)(const struct qstr *name,
                                                         struct dentry *base,
                                                         unsigned int flags);
+static char *(*create_d_path_fn)(const struct path *path, char *buf, int buflen);
 static int (*create_security_path_mkdir_fn)(const struct path *path,
                                             struct dentry *dentry, umode_t mode);
 static void (*create_done_path_create_fn)(struct path *path, struct dentry *dentry);
@@ -67,6 +68,7 @@ int susfs_create_vfs_init(void)
 	if (!create_filename_parentat_fn)
 		create_filename_parentat_fn = (void *)find_kernel_symbol_exact("__filename_parentat");
 	create_lookup_one_qstr_excl_fn = (void *)find_kernel_symbol_exact("lookup_one_qstr_excl");
+	create_d_path_fn = (void *)find_kernel_symbol_exact("d_path");
 	create_security_path_mkdir_fn = (void *)find_kernel_symbol_exact("security_path_mkdir");
 	create_done_path_create_fn = (void *)find_kernel_symbol_exact("done_path_create");
 	create_vfs_mkdir_fn = (void *)find_kernel_symbol_exact("vfs_mkdir");
@@ -176,6 +178,84 @@ static __nocfi noinline void create_done_path(struct path *path, struct dentry *
 	create_done_path_create_fn(path, dentry);
 }
 
+static __nocfi noinline char *create_d_path(const struct path *path, char *buf, int buflen)
+{
+	return create_d_path_fn(path, buf, buflen);
+}
+
+/* dir, a slash if it does not end in one, and last. */
+static int create_join_path(const char *dir, const char *last, size_t last_len,
+			    char *buf, size_t len)
+{
+	size_t n = strlen(dir);
+
+	if (n + 1 + last_len + 1 > len)
+		return -ENAMETOOLONG;
+	memcpy(buf, dir, n);
+	if (!n || buf[n - 1] != '/')
+		buf[n++] = '/';
+	memcpy(buf + n, last, last_len);
+	buf[n + last_len] = '\0';
+	return 0;
+}
+
+/* Before 5.12 filename_parentat() returns the struct filename (an ERR_PTR on failure, after it has put
+ * the name itself) instead of an int, and takes no root argument. Read as an int, the pointer came out
+ * as an error and the name was put twice. */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0)
+#define CREATE_PARENTAT_PUTS_ON_ERROR 1
+#else
+#define CREATE_PARENTAT_PUTS_ON_ERROR 0
+#endif
+
+static __nocfi noinline int create_parentat(int dfd, struct filename *name, struct path *parent,
+					    struct qstr *last, int *type)
+{
+#if CREATE_PARENTAT_PUTS_ON_ERROR
+	struct filename *ret = ((struct filename *(*)(int, struct filename *, unsigned int,
+						      struct path *, struct qstr *, int *))
+				create_filename_parentat_fn)(dfd, name, 0, parent, last, type);
+
+	return IS_ERR(ret) ? PTR_ERR(ret) : 0;
+#else
+	return create_filename_parentat_fn(dfd, name, 0, parent, last, type, NULL);
+#endif
+}
+
+int __nocfi noinline susfs_create_vfs_absent_path(int dfd, const char __user *pathname,
+						  char *buf, size_t len)
+{
+	char tmp[256];
+	struct filename *name;
+	struct path parent;
+	struct qstr last;
+	int type = 0, err;
+	char *dir;
+
+	if (!create_filename_parentat_fn || !create_d_path_fn)
+		return -EOPNOTSUPP;
+
+	name = create_getname(pathname);
+	if (IS_ERR(name))
+		return PTR_ERR(name);
+
+	err = create_parentat(dfd, name, &parent, &last, &type);
+	if (err) {
+		if (!CREATE_PARENTAT_PUTS_ON_ERROR)
+			create_putname(name);
+		return err;
+	}
+	if (type != LAST_NORM) {
+		err = -EINVAL;
+	} else {
+		dir = create_d_path(&parent, tmp, sizeof(tmp));
+		err = IS_ERR(dir) ? PTR_ERR(dir) : create_join_path(dir, last.name, last.len, buf, len);
+	}
+	path_put(&parent);
+	/* last.name points into the filename, so it goes after the join. */
+	create_putname(name);
+	return err;
+}
 long __nocfi noinline susfs_create_vfs_mkdirat(int dfd, const char __user *pathname,
                                                umode_t mode,
                                                int (*existing)(struct inode *inode))
