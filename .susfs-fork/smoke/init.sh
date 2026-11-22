@@ -296,6 +296,17 @@ say "prio_hid_own_compat=$(row hid 10005 "$PRIO32")"
 say "prio_who0_app=$(row app 0)"
 say "prio_hid_root=$(row root 10005)"
 say "prio_by_pid_app=$(pidrow "$hidpid")"
+# backslashxx rescans the apps when packages.list is moved and drops a manager whose app it does not
+# find ("manager is uninstalled, invalidate it!"), here about a second after the list was written. The
+# manager is named again until a second goes by without it being dropped, so the rows below ask a
+# manager. The other forks keep the manager the debug parameter names.
+if [ "${method:-none}" = toolkit ]; then
+  for i in 1 2 3 4 5 6; do
+    /bin/ksuctl manager-toolkit 10001 >/dev/null
+    sleep 1
+    [ "$(/bin/ksuctl umount 10001 | kval)" = 0 ] && break
+  done
+fi
 if [ "${method:-none}" != none ]; then
   for u in mgr keep root_app deny; do
     say "prio_ksu_$u=$(row "$u" 10005)"
