@@ -130,6 +130,19 @@ class Owners(Scratch):
     def facts(self):
         return dict(l.split("=", 1) for l in self.run_script("status.sh").splitlines())
 
+    def test_a_search_does_not_start_a_grep_per_module(self):
+        # The WebUI waits on status.sh. A grep per module and stage made it start hundreds of
+        # processes on a phone with a few dozen modules, and that was most of the wait.
+        for n in range(12):
+            self.other(f"mod{n}", "echo nothing here\n")
+        self.other("mod_client", "ksu_susfs enable_log 1\n")
+        # The execution trace names every command the shell starts, in subshells too.
+        r = subprocess.run([self.sh, "-x", (self.mod / "status.sh").as_posix()], capture_output=True, text=True,
+                           env=self.env(), timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("owner_enable_log=mod_client", r.stdout)
+        greps = [l for l in r.stderr.splitlines() if re.match(r"\++ grep ", l)]
+        self.assertLessEqual(len(greps), 8, greps)
     def test_nothing_is_owned_without_another_module(self):
         out = self.facts()
         self.assertEqual((out["owner_enable_log"], out["owner_avc_spoof"], out["susfs_clients"]), ("", "", ""))
@@ -510,6 +523,13 @@ class Page(unittest.TestCase):
         shipped = {p.name for p in OVERLAY.glob("*.sh")} | {p.name for p in (ROOT / "module").glob("*.sh")}
         self.assertTrue({"status.sh", "check.sh", "toggle.sh", "scope.sh", "early.sh", "hide_mounts.sh"} <= called, called)
         self.assertFalse(called - shipped, called - shipped)
+
+    def test_opening_starts_the_control_reads_with_the_status_read(self):
+        # status.sh and the Controls reads do not depend on each other. Chained, the page waited for
+        # their sum before it showed the Controls.
+        boot = PAGE[PAGE.index("function boot()"):]
+        self.assertLess(boot.index("readControls()"), boot.index('run("status.sh")'))
+        self.assertNotIn("loadControls()", boot)
 
     def test_it_knows_every_level_the_checks_print(self):
         for level in LEVELS:

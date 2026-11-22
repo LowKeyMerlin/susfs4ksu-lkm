@@ -17,9 +17,35 @@ NAME=susfs_guard_lkm
 # shellcheck source=/dev/null
 . "$MODDIR/clients.sh"
 
-# Keeps the output to one line per check and free of the separator.
-clean() { printf '%s' "$1" | tr '\n|' '  '; }
-out() { printf '%s|%s|%s|%s\n' "$1" "$2" "$(clean "$3")" "$(clean "$4")"; }
+# Keeps the output to one line per check and free of the separator. It is done with parameter
+# expansion because this runs for every field of every line, and a process per field adds up.
+NL='
+'
+clean() {
+  _clean=$1
+  while :; do
+    case $_clean in
+      *"|"*) _clean=${_clean%%"|"*}" "${_clean#*"|"} ;;
+      *"$NL"*) _clean=${_clean%%"$NL"*}" "${_clean#*"$NL"} ;;
+      *) break ;;
+    esac
+  done
+}
+out() {
+  clean "$3"
+  _title=$_clean
+  clean "$4"
+  printf '%s|%s|%s|%s\n' "$1" "$2" "$_title" "$_clean"
+}
+
+# words <list>: the whitespace-separated words of the list joined by single spaces, in _words.
+words() {
+  set -f
+  # shellcheck disable=SC2086
+  set -- $1
+  set +f
+  _words=$*
+}
 
 # The full kernel log passes 2 MB with logging on, so it is scanned once into a temp file of only
 # this module's lines (small) and every check reads that, rather than piping dmesg three times. The
@@ -27,15 +53,14 @@ out() { printf '%s|%s|%s|%s\n' "$1" "$2" "$(clean "$3")" "$(clean "$4")"; }
 # device, the test's copy off it) where /data/local/tmp does not. It is never held in a variable:
 # Android's sh has no printf builtin, so a large capture breaks the arg limit.
 MODLOG="${TMPDIR:-$MODDIR}/.susfs_modlog.$$"
-"$DMESG" 2>/dev/null | grep "$NAME:" >"$MODLOG" 2>/dev/null || : >"$MODLOG"
+"$DMESG" 2>/dev/null | grep -F "$NAME:" >"$MODLOG" 2>/dev/null || : >"$MODLOG"
 trap 'rm -f "$MODLOG"' EXIT INT TERM
-modlog() { cat "$MODLOG" 2>/dev/null; }
 
 # What the module prints when a hook could not be placed and the feature is partly or wholly off.
 # Lines about an empty rule list are normal at boot, and so is "hook: NOT ours": with mount_dbg on,
 # sus_mount names each ordinary system mount its identity test did not claim.
 WARN_RE='failed|NOT |not filtered|keeps (showing|printing|returning)|did not|drifted|not found|not resolved|not installed|not recogni[sz]ed'
-problems() { modlog | grep -v -e 'that feature stays off' -e ': no rules' -e 'hook: NOT ours' | grep -E "$WARN_RE"; }
+problems() { grep -v -e 'that feature stays off' -e ': no rules' -e 'hook: NOT ours' "$MODLOG" | grep -E "$WARN_RE"; }
 
 if [ -d "$SYS_MODULE" ]; then
   out loaded ok "Module is loaded" "The kernel module is running."
@@ -45,21 +70,24 @@ else
 fi
 
 # A layer that fails to start leaves the module up with that feature off, which nothing else shows.
-off=$(modlog |
-  sed -n 's/.* \([a-z0-9_]*\) init failed -\{0,1\}[0-9]* - that feature stays off.*/\1/p' | sort -u | tr '\n' ' ')
+off=$(sed -n 's/.* \([a-z0-9_]*\) init failed -\{0,1\}[0-9]* - that feature stays off.*/\1/p' "$MODLOG" | sort -u)
+words "$off"
+off=$_words
 if [ -n "$off" ]; then
   out layers warn "Some features are off" "These layers could not start: ${off}. The rest of the module works. Check the kernel log for the reason."
 else
   out layers ok "All feature layers started" "No layer reported a failed start."
 fi
 
-if grep -q "$NAME" "$PROC/modules" 2>/dev/null; then
+if grep -q -F "$NAME" "$PROC/modules" 2>/dev/null; then
   out hide_modules fail "Module is listed in /proc/modules" "Apps can read this list. Run: echo clear > /proc/susfs_hide_modules, then echo add $NAME > /proc/susfs_hide_modules."
 else
   out hide_modules ok "Module is hidden from /proc/modules" "It does not appear in the module list."
 fi
 
-if grep -q "\[$NAME\]" "$PROC/kallsyms" 2>/dev/null; then
+# A fixed string, as the table holds well over a hundred thousand lines and a pattern engine reads
+# them slower.
+if grep -q -F "[$NAME]" "$PROC/kallsyms" 2>/dev/null; then
   out hide_symbols fail "Module symbols are in kallsyms" "Symbols tagged with the module name are readable. Reload the module, the hide runs at load."
 else
   out hide_symbols ok "Module symbols are hidden from kallsyms" "No symbol carries the module name."
@@ -67,7 +95,7 @@ fi
 
 if [ -f "$MODDIR/guard.tripped" ]; then
   out guard fail "Bootloop guard tripped" "$(cat "$MODDIR/guard.tripped" 2>/dev/null). Enable the module again in the manager to retry."
-elif [ "$(cat "$MODDIR/guard.fails" 2>/dev/null || echo 0)" -gt 0 ]; then
+elif { read -r fails <"$MODDIR/guard.fails"; } 2>/dev/null; [ "${fails:-0}" -gt 0 ] 2>/dev/null; then
   out guard warn "A recent boot ended early" "The guard counts boots that were cut off and disables the module after repeated ones."
 else
   out guard ok "Bootloop guard is quiet" "No failed boot is on record."
@@ -87,7 +115,8 @@ fi
 
 # A second SUSFS in the kernel can fight this one for the same hooks. A module that only sends
 # SUSFS commands is a client of this one, and is reported below.
-others=$(cl_providers | tr '\n' ' ')
+words "$(cl_providers)"
+others=$_words
 if [ -n "$others" ]; then
   out conflicts warn "Another SUSFS kernel module is enabled" "Found: ${others}. Two implementations that hide the same mounts can undo each other. Keep one."
 else
@@ -96,9 +125,11 @@ fi
 
 # A module that sends its SUSFS commands in post-fs-data runs before this one loads, unless early
 # load is on, and the kernel drops what it receives with nobody to answer.
-clients=$(cl_clients | tr '\n' ' ')
+words "$(cl_clients)"
+clients=$_words
 if [ -n "$clients" ]; then
-  early_clients=$(cl_early_clients | tr '\n' ' ')
+  words "$(cl_early_clients)"
+  early_clients=$_words
   if [ -n "$early_clients" ] && [ "$early_on" = 0 ]; then
     out clients warn "SUSFS commands may be sent too early" "Sent in post-fs-data by: ${early_clients}. This module loads after them, so they are lost. Turn on early load."
   else
@@ -107,9 +138,12 @@ if [ -n "$clients" ]; then
 fi
 
 # Failed layer starts are reported above, so they are not counted again here.
-bad=$(problems | grep -c '')
+PROBLEMS="$MODLOG.problems"
+trap 'rm -f "$MODLOG" "$PROBLEMS"' EXIT INT TERM
+problems >"$PROBLEMS"
+bad=$(grep -c '' "$PROBLEMS")
 if [ "${bad:-0}" -gt 0 ]; then
-  first=$(problems | head -n 2 | sed "s/^[^]]*\] *$NAME: //" | tr '\n' ';')
+  first=$(head -n 2 "$PROBLEMS" | sed "s/^[^]]*\] *$NAME: //" | tr '\n' ';')
   out kernel_log warn "The kernel log has module warnings" "$bad line(s), first: $first Filter the output of dmesg for $NAME to see all of them."
 else
   out kernel_log ok "The kernel log is clean" "No warning from the module."
@@ -127,7 +161,15 @@ if [ "$log_state" = 1 ]; then
   out log_switch info "Kernel logging is on" "The module writes to the kernel log. Turn it off for daily use, it costs a little and adds lines anyone with dmesg access can read."
 fi
 
-ctx_types=$(head -n 1 "$PROC/susfs_selinux_ctx" 2>/dev/null | sed -n 's/.*types=\([0-9]*\).*/\1/p')
+ctx_types=
+ctx_line=
+{ read -r ctx_line <"$PROC/susfs_selinux_ctx"; } 2>/dev/null
+case $ctx_line in
+  *types=*)
+    ctx_types=${ctx_line#*types=}
+    ctx_types=${ctx_types%%[!0-9]*}
+    ;;
+esac
 if [ -n "$ctx_types" ] && [ "$ctx_types" -gt 0 ] 2>/dev/null; then
   out selinux_ctx info "Hiding $ctx_types SELinux context type(s)" "See /proc/susfs_selinux_ctx for the list and hit counters."
 fi

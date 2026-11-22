@@ -888,20 +888,29 @@ function idle(fn) {
   else setTimeout(fn, 200);
 }
 
-// Load what the Controls tab needs and arm its renderers. Shared by the first open and Refresh.
+// The three reads behind the Controls tab. They do not depend on status.sh, so the first open
+// starts them together with it instead of after it.
+function readControls() {
+  return Promise.all([run("toggle.sh", "get"), run("hide_mounts.sh", "list"), run("selinux_ctx.sh", "list")]);
+}
+
+// Arm the Controls renderers from what readControls() returned.
+function applyControls(r) {
+  state.toggles = pairs(r[0].out);
+  state.paths = r[1].code === 0 ? r[1].out.split("\n").filter(Boolean) : [];
+  state.ctxTypes = r[2].code === 0 ? r[2].out.split("\n").filter(Boolean) : [];
+  $("selinux-note").textContent = SELINUX_HIDE[state.toggles.selinux_hide] || SELINUX_HIDE.unavailable;
+  renderEarly();
+  renderScope();
+  renderToggles();
+  renderPaths();
+  renderCtxTypes();
+  renderVersions();
+}
+
+// Load what the Controls tab needs and arm its renderers. Shared by Refresh and the recover flow.
 function loadControls() {
-  return Promise.all([run("toggle.sh", "get"), run("hide_mounts.sh", "list"), run("selinux_ctx.sh", "list")]).then(function (r) {
-    state.toggles = pairs(r[0].out);
-    state.paths = r[1].code === 0 ? r[1].out.split("\n").filter(Boolean) : [];
-    state.ctxTypes = r[2].code === 0 ? r[2].out.split("\n").filter(Boolean) : [];
-    $("selinux-note").textContent = SELINUX_HIDE[state.toggles.selinux_hide] || SELINUX_HIDE.unavailable;
-    renderEarly();
-    renderScope();
-    renderToggles();
-    renderPaths();
-    renderCtxTypes();
-    renderVersions();
-  });
+  return readControls().then(applyControls);
 }
 
 function refreshAll() {
@@ -946,16 +955,19 @@ function boot() {
     $("ident").textContent = "Open this page from the root manager";
     return;
   }
-  // First paint from the one cheap read, so the header stops saying "Reading" at once, and the Controls
-  // data and the kernel-log checks follow without holding it up.
+  // The Controls reads start with the status read, so the page waits for the slower of the two and
+  // not for their sum. The header paints as soon as status.sh answers, the Controls once both have,
+  // and the kernel-log checks follow when the page is idle.
+  var controls = readControls();
   run("status.sh").then(function (s) {
     state.facts = pairs(s.out);
     $("copy").disabled = false;
     renderMasthead();
     renderFacts();
     renderAttention();
-    return loadControls();
-  }).then(function () {
+    return controls;
+  }).then(function (r) {
+    applyControls(r);
     idle(function () { runChecks(); });
   });
 }
